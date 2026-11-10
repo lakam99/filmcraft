@@ -271,6 +271,17 @@ pub(super) static CATEGORIES: &[Category] = &[
         ],
     },
     Category {
+        id: "ai",
+        title: "AI Chat",
+        rows: &[
+            f("ai.model", "OpenAI model", Kind::Text, true),
+            b("ai.attachFrames", "Attach current Program and Source frames", true),
+            b("ai.rememberKey", "Remember the API key in the OS credential store", true),
+            Row::Note("Messages, requested editor data and frames are sent to OpenAI. API usage is billed to your key."),
+            Row::Custom("aiCredentials"),
+        ],
+    },
+    Category {
         id: "appearance",
         title: "Appearance",
         rows: &[
@@ -618,6 +629,12 @@ pub fn field(key: &str) -> Option<Field> {
 
 /// Check a value for `key` against the schema (choices, colours). Ranges are clamped later.
 pub fn validate(key: &str, v: &Value) -> std::result::Result<(), String> {
+    if key == "ai.model" {
+        return match v.as_str() {
+            Some(model) if !model.is_empty() && model.len() <= 128 && model.bytes().all(|c| c.is_ascii_alphanumeric() || b"-._/".contains(&c)) => Ok(()),
+            _ => Err("Enter a model ID of 1–128 ASCII letters, numbers, dots, slashes, underscores or hyphens".into()),
+        };
+    }
     if key == "appearance.favoriteThemes" {
         let items = v.as_array().ok_or("favorite themes must be a list")?;
         let mut seen = Vec::new();
@@ -662,6 +679,19 @@ pub fn is_unit_key(key: &str) -> bool {
 /// Repair a preferences value in place against the schema: unknown choices and bad colours go back
 /// to their defaults, numbers are clamped to their ranges.
 pub fn sanitize(v: &mut Value, defaults: &Value) {
+    for name in ["attachFrames", "rememberKey"] {
+        let pointer = format!("/ai/{name}");
+        if let Some(slot) = v.pointer_mut(&pointer)
+            && !slot.is_boolean()
+        {
+            *slot = defaults.pointer(&pointer).cloned().unwrap_or(Value::Bool(true));
+        }
+    }
+    if let Some(model) = v.pointer_mut("/ai/model")
+        && validate("ai.model", model).is_err()
+    {
+        *model = defaults.pointer("/ai/model").cloned().unwrap_or(json!("gpt-6.1-sol"));
+    }
     if let Some(slot) = v.pointer_mut("/appearance/favoriteThemes")
         && validate("appearance.favoriteThemes", slot).is_err()
     {

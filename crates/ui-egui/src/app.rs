@@ -46,6 +46,8 @@ impl FilmcraftApp {
             updates_rt: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             network_project: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            assistant: Default::default(),
             file_dialogs: Default::default(),
             native_dialog: None,
             overwrite_prompt: None,
@@ -416,6 +418,8 @@ impl FilmcraftApp {
         }
         if !ctx.will_discard() {
             self.drain_ui_requests(&ctx);
+            #[cfg(not(target_arch = "wasm32"))]
+            crate::assistant::poll(self, &ctx);
         }
         // Check only after this pass's control requests ran: `ui.menu.invoke`/`engine.execute`
         // may have edited the text or replaced the target. Every other pass (hidden editor, focus

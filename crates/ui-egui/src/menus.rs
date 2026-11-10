@@ -23,6 +23,24 @@ macro_rules! uic {
 
 pub const UI_COMMANDS: &[UiCommand] = &[
     #[cfg(not(target_arch = "wasm32"))]
+    uic!("ai.chat", "AI Chat", [], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    uic!("ai.settings", "AI Chat Preferences", [], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    uic!("ai.send", "Send AI Message", [], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    uic!("ai.stop", "Stop AI", [], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    uic!("ai.clear", "Clear AI Chat", [], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    uic!("ai.status", "AI Chat Status", [], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    uic!("ai.saveKey", "Save OpenAI Key Securely", [], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    uic!("ai.loadKey", "Load Saved OpenAI Key", [], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    uic!("ai.forgetKey", "Forget OpenAI Key", [], None),
+    #[cfg(not(target_arch = "wasm32"))]
     uic!("network.project", "Network Project…", ["File"], None),
     #[cfg(not(target_arch = "wasm32"))]
     uic!("network.connect", "Connect Network Project", [], None),
@@ -179,6 +197,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("app.settings.mediaAnalysis", "Media Analysis & Transcription…", ["Edit", "Preferences"], None),
     uic!("app.settings.mediaCache", "Media Cache…", ["Edit", "Preferences"], None),
     uic!("app.settings.memory", "Memory…", ["Edit", "Preferences"], None),
+    uic!("app.settings.ai", "AI Chat…", ["Edit", "Preferences"], None),
     uic!("app.settings.playback", "Playback…", ["Edit", "Preferences"], None),
     uic!("app.settings.plugins", "Plugins…", ["Edit", "Preferences"], None),
     uic!("app.settings.timeline", "Timeline…", ["Edit", "Preferences"], None),
@@ -218,6 +237,10 @@ pub(crate) fn menu_items_with_focus(app: &FilmcraftApp, ctx: &egui::Context) -> 
 
 /// Execute a UI or engine command by id.
 pub fn invoke_command(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params: Value) -> Result<Value, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(result) = crate::assistant::route(app, ctx, id) {
+        return result;
+    }
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(result) = crate::network_projects::route(app, ctx, id, &params) {
         return result;

@@ -3,6 +3,21 @@ use super::{Deserialize, FrameRate, Serialize, Tick};
 
 // ------------------------------------------------------------------ category values
 
+/// Editor-wide AI settings. Credentials and chat history are never preference fields.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AiPrefs {
+    pub model: String,
+    pub attach_frames: bool,
+    pub remember_key: bool,
+}
+
+impl Default for AiPrefs {
+    fn default() -> Self {
+        Self { model: "gpt-6.1-sol".into(), attach_frames: true, remember_key: true }
+    }
+}
+
 /// Settings ▸ General.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]

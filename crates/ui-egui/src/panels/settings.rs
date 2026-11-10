@@ -738,6 +738,13 @@ fn mb(bytes: u64) -> String {
 fn custom(app: &mut FilmcraftApp, ui: &mut Ui, d: &mut SettingsDraft, name: &str) {
     let t = app.tokens;
     match name {
+        "aiCredentials" => {
+            ui.small("Credential Save and Forget actions take effect immediately. Other preference changes use OK / Cancel.");
+            #[cfg(not(target_arch = "wasm32"))]
+            crate::assistant::credentials_ui(app, ui, true);
+            #[cfg(target_arch = "wasm32")]
+            ui.label("AI credentials are available in the desktop app.");
+        }
         "labelColors" => {
             let tt = t;
             group(ui, &tt, tl!("Label Colors"), |ui| {

@@ -40,6 +40,8 @@ macro_rules! tlf {
     };
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod assistant;
 pub mod automation;
 pub mod calc;
 pub mod capture;
@@ -213,6 +215,9 @@ pub struct FilmcraftApp {
     pub(crate) updates_rt: updates_ui::Runtime,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) network_project: network_projects::Runtime,
+    /// Credentials, chat and worker state are deliberately outside serialized UiState.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) assistant: assistant::Runtime,
     pub file_dialogs: panels::file_dialogs::FileDialogState,
     /// The native file dialog the host is showing ([`Self::pick`]).
     native_dialog: Option<native_dialogs::PendingDialog>,

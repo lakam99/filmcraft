@@ -61,7 +61,8 @@ fn background_work(prio: u32, target: Target) -> bool {
 pub struct FrameKey {
     pub target: Target,
     pub frame: i64,
-    /// Output width in pixels (thumbnails) or scale ×1000 (monitors).
+    /// Output width in pixels (thumbnails) or scale ×1000 (monitors). AI snapshots reserve the
+    /// high bit so ongoing monitor playback cannot cancel their pinned, one-shot render jobs.
     pub size: u32,
     pub revision: u64,
     /// Draft decoding (reduced-resolution playback with Settings ▸ Playback ▸ Draft decoding):

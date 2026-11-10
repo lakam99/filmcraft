@@ -106,12 +106,13 @@ fn import_png(s: &mut Session, dir: &Path, name: &str, w: u32, h: u32) -> ItemId
 }
 
 #[test]
-fn categories_follow_premiere_order() {
+fn categories_keep_existing_order_with_ai_after_general() {
     let ids: Vec<&str> = settings::categories().iter().map(|c| c.id).collect();
     assert_eq!(
         ids,
         [
             "general",
+            "ai",
             "appearance",
             "audio",
             "audioHardware",

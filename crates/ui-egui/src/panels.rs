@@ -167,6 +167,10 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, p: PanelKind, rect: Rect)
         PanelKind::EssentialSound => essential_sound::show(app, ui, rect),
         PanelKind::TextToSpeech => tts::show(app, ui, rect),
         PanelKind::ProjectNotes => notes::show(app, ui, rect),
+        #[cfg(not(target_arch = "wasm32"))]
+        PanelKind::AiChat => crate::assistant::show(app, ui, rect),
+        #[cfg(target_arch = "wasm32")]
+        PanelKind::AiChat => crate::dock::placeholder(ui, rect, &app.tokens, "AI Chat is available in the desktop app."),
         other => crate::dock::placeholder(ui, rect, &app.tokens, &tlf!("{panel} — coming in a later milestone", panel = crate::i18n::t(other.title()))),
     }
 }

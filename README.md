@@ -19,6 +19,9 @@
 > the upstream downloads and community links below refer to the original FilmCraft project.
 > Download this fork and its relay bundle from [lakam99/filmcraft releases](https://github.com/lakam99/filmcraft/releases).
 > This fork's built-in update checker uses that same release feed.
+>
+> **AI editor chat:** **Window → AI Chat** accepts your OpenAI API key, inspects current video
+> frames, and operates FilmCraft through its existing editor tools. See [AI chat setup and controls](docs/ai-chat.md).
 
 <p align="center">
   <a href="#license-and-credits"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-8b5cf6?style=flat-square"></a>
