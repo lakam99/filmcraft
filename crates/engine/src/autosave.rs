@@ -640,6 +640,7 @@ struct Snapshot {
     project: Arc<Project>,
     revision: u64,
     path: Option<String>,
+    explicit_save: bool,
 }
 
 enum Msg {
@@ -787,8 +788,8 @@ impl Persistence {
         })
     }
 
-    pub(crate) fn send_dirty(&self, project: Arc<Project>, revision: u64, path: Option<String>) {
-        self.send(Msg::Dirty(Snapshot { project, revision, path }));
+    pub(crate) fn send_dirty(&self, project: Arc<Project>, revision: u64, path: Option<String>, explicit_save: bool) {
+        self.send(Msg::Dirty(Snapshot { project, revision, path, explicit_save }));
     }
 
     pub(crate) fn send_clean(&self) {
@@ -1097,7 +1098,9 @@ impl Worker {
             Ok(path) => {
                 self.autosaved = s.revision;
                 let _ = self.events.send(WorkerEvent::AutoSaved { path: path.clone(), revision: s.revision, unix, serialize_ms, write_ms, bytes: bytes.len() });
+                // A local recovery file is not a host-acknowledged network-project save.
                 if self.prefs.save_current_project
+                    && !s.explicit_save
                     && let Some(p) = &s.path
                 {
                     match filmcraft_format::atomic_write(Path::new(p), &bytes) {

@@ -46,10 +46,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     let y = recent(app, ui, rect, 90.0 + 150.0 + 36.0);
     // Community and project links.
-    // ArtCraft wordmark (first-party trademark, docs/brand/), then the section title.
-    let logo = crate::brand::paint_wordmark(ui, rect.min + vec2(24.0, y), 15.0, app.ui.dark);
-    let tx = logo.map_or(rect.min.x + 24.0, |r| r.max.x + 12.0);
-    ui.painter().text(pos2(tx, rect.min.y + y), Align2::LEFT_CENTER, tl!("Community"), Tokens::semibold(15.0), t.text);
+    ui.painter().text(pos2(rect.min.x + 24.0, rect.min.y + y), Align2::LEFT_CENTER, tl!("Community"), Tokens::semibold(15.0), t.text);
     let mut x = rect.min.x + 24.0;
     for (i, (id, label, url)) in crate::links::ALL.iter().take(4).enumerate() {
         let primary = i == 0;

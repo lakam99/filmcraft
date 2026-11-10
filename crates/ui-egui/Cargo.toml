@@ -37,7 +37,7 @@ rayon = { workspace = true }
 web-time = "1"
 # Unicode Bidirectional Algorithm for Arabic and Hebrew captions in reading order (MIT OR Apache-2.0).
 unicode-bidi = "0.3.18"
-# ArtCraft wordmark (PNG) for the About dialog and Home screen.
+# PNG capture and clipboard image support.
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Thread/process CPU clocks for frame-job profiling (safe wrappers; see frames.rs).
@@ -68,3 +68,5 @@ toml = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 craft-update = { workspace = true }
+filmcraft-network = { workspace = true }
+filmcraft-format = { workspace = true }

@@ -1,7 +1,7 @@
 //! Community and project links (Help menu, About dialog, header Discord button, Home screen).
 //!
-//! FilmCraft is part of the ArtCraft family: the community lives on the ArtCraft Discord, every
-//! app has a page on the ArtCraft website and a public GitHub repository.
+//! This fork has its own source and issue tracker. Community and website links point to the
+//! original FilmCraft project and its ArtCraft community.
 
 /// The app's short name, used in the website and repository URLs.
 pub const APP: &str = "filmcraft";
@@ -13,9 +13,9 @@ pub const WEBSITE: &str = "https://getartcraft.com";
 /// FilmCraft's page on the ArtCraft website.
 pub const APP_PAGE: &str = "https://getartcraft.com/apps/filmcraft";
 /// FilmCraft's source repository.
-pub const GITHUB: &str = "https://github.com/storytold/filmcraft";
+pub const GITHUB: &str = "https://github.com/lakam99/filmcraft";
 /// New issue on FilmCraft's repository.
-pub const ISSUES: &str = "https://github.com/storytold/filmcraft/issues";
+pub const ISSUES: &str = "https://github.com/lakam99/filmcraft/issues";
 
 /// (command id, label, url) for every link, in menu order.
 pub const ALL: [(&str, &str, &str); 5] = [
@@ -126,9 +126,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn urls_follow_the_artcraft_scheme() {
+    fn source_and_issues_follow_the_fork_while_community_links_keep_their_destination() {
         assert_eq!(APP_PAGE, format!("{WEBSITE}/apps/{APP}"));
-        assert_eq!(GITHUB, format!("https://github.com/storytold/{APP}"));
+        assert_eq!(GITHUB, format!("https://github.com/lakam99/{APP}"));
+        assert_eq!(ISSUES, format!("{GITHUB}/issues"));
+        #[cfg(not(target_arch = "wasm32"))]
+        assert_eq!(crate::UPDATE_APP.repo_url(), GITHUB);
         assert!(ALL.iter().all(|(id, _, u)| id.starts_with("help.") && u.starts_with("https://")));
         assert_eq!(url_for("help.discord"), Some(DISCORD));
         assert_eq!(url_for("help.nope"), None);

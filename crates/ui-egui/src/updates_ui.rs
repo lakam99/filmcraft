@@ -155,6 +155,30 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn release_channel_selects_fork_downloads_and_refuses_upstream_assets() {
+        let name = format!("filmcraft-{}-windows-x64-portable.zip", env!("CARGO_PKG_VERSION"));
+        let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let fork_url = format!("https://github.com/lakam99/filmcraft/releases/download/{tag}/{name}");
+        let upstream_url = format!("https://github.com/storytold/filmcraft/releases/download/{tag}/{name}");
+        let response = serde_json::json!({
+            "tag_name":tag,
+            "assets":[
+                {"name":name,"size":12,"browser_download_url":fork_url},
+                {"name":name,"size":12,"browser_download_url":upstream_url}
+            ]
+        });
+        let release = craft_update::parse_github_release(&response.to_string(), crate::UPDATE_APP.repo).unwrap();
+        let platform = craft_update::Platform { os: craft_update::Os::Windows, arch: craft_update::Arch::X64 };
+        let stems = crate::UPDATE_APP.stems().collect::<Vec<_>>();
+        let (asset, kind) = craft_update::pick_asset(&release, &stems, platform, &[craft_update::PackageKind::PortableZip]).unwrap();
+        assert_eq!(asset.url, fork_url, "a fork build must never install an upstream release asset");
+        assert_eq!(kind, craft_update::PackageKind::PortableZip);
+        assert_eq!(release.assets.len(), 1, "other repositories cannot supply update downloads");
+        assert_eq!(crate::UPDATE_APP.releases_url(), "https://github.com/lakam99/filmcraft/releases");
+    }
+
+    #[test]
     fn default_runtime_is_idle() {
         let rt = Runtime::default();
         assert!(!rt.manual_window_open);
@@ -175,7 +199,7 @@ mod tests {
             tag: "v99.0.0".into(),
             version: craft_update::parse_version("99.0.0"),
             name: "FilmCraft 99.0.0".into(),
-            html_url: "https://github.com/storytold/filmcraft/releases/tag/v99.0.0".into(),
+            html_url: format!("{}/tag/v99.0.0", crate::UPDATE_APP.releases_url()),
             ..Default::default()
         };
         app.updates_rt.updater.offer(release);

@@ -107,6 +107,11 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 pub trait Services: Send + Sync {
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>>;
     fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()>;
+    /// A remote document must be acknowledged by its host before it is marked saved. The
+    /// local autosave worker may retain recovery copies, but cannot save that document itself.
+    fn requires_explicit_save(&self, _path: &str) -> bool {
+        false
+    }
     /// Publish a complete new file only when the final path is unoccupied. Publication must
     /// reject a concurrent collision; a prior existence check alone is insufficient.
     /// Return `ErrorKind::AlreadyExists` for an occupied final path so the importer can retry
@@ -690,7 +695,8 @@ impl Session {
             return;
         }
         if dirty {
-            p.send_dirty(self.project.clone(), self.revision, self.path.clone());
+            let explicit = self.path.as_deref().is_some_and(|path| self.services.requires_explicit_save(path));
+            p.send_dirty(self.project.clone(), self.revision, self.path.clone(), explicit);
         } else {
             p.send_clean();
         }

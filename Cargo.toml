@@ -4,11 +4,11 @@ members = ["crates/*", "apps/*", "xtask"]
 default-members = ["crates/*", "apps/*", "xtask"]
 
 [workspace.package]
-version = "0.17.0"
+version = "0.17.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
-repository = "https://github.com/storytold/filmcraft"
+repository = "https://github.com/lakam99/filmcraft"
 
 [workspace.dependencies]
 # internal
@@ -58,6 +58,7 @@ filmcraft-scopes = { path = "crates/scopes" }
 filmcraft-export = { path = "crates/export" }
 filmcraft-format = { path = "crates/format" }
 filmcraft-engine = { path = "crates/engine" }
+filmcraft-network = { path = "crates/network" }
 filmcraft-ui-egui = { path = "crates/ui-egui" }
 filmcraft-automation = { path = "crates/automation" }
 filmcraft-platform = { path = "crates/platform" }

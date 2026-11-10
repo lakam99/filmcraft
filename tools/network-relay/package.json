@@ -1,0 +1,10 @@
+{
+  "name": "filmcraft-network-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "RedWeb LAN file relay for a FilmCraft project",
+  "license": "MIT OR Apache-2.0",
+  "engines": { "node": ">=22" },
+  "scripts": { "start": "node relay.cjs", "test": "node --test relay.test.cjs" },
+  "dependencies": { "redweb": "0.16.5" }
+}

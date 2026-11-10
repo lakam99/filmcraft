@@ -22,6 +22,16 @@ macro_rules! uic {
 }
 
 pub const UI_COMMANDS: &[UiCommand] = &[
+    #[cfg(not(target_arch = "wasm32"))]
+    uic!("network.project", "Network Project…", ["File"], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    uic!("network.connect", "Connect Network Project", [], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    uic!("network.save", "Save to Host", [], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    uic!("network.status", "Network Project Status", [], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    uic!("network.disconnect", "Disconnect Network Project", [], None),
     uic!("window.dockAction", "Docking Action", [], None),
     uic!("window.dockPanel", "Dock Panel", [], None),
     uic!("window.floatPanel", "Undock Panel", [], None),
@@ -208,6 +218,10 @@ pub(crate) fn menu_items_with_focus(app: &FilmcraftApp, ctx: &egui::Context) -> 
 
 /// Execute a UI or engine command by id.
 pub fn invoke_command(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params: Value) -> Result<Value, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(result) = crate::network_projects::route(app, ctx, id, &params) {
+        return result;
+    }
     // Select All / Deselect All act on the Project panel's items when it has focus (#168), only
     // what the shown bin lists (#456). Here and not in the key handling: on macOS the native menu
     // takes Cmd+A once Select All is enabled (a sequence is open) and sends the id here (#1752).

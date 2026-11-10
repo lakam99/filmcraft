@@ -86,6 +86,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("format", 3),
     ("engine", 4),
     ("platform", 5),
+    ("network", 5),
     ("ui-egui", 5),
     ("automation", 5),
     ("filmcraft", 6),
@@ -98,6 +99,7 @@ const L0_FOUNDATION: &[&str] = &["time", "geom", "color", "bitstream", "testkit"
 
 /// Allowed same-layer edges (from, to).
 const SAME_LAYER: &[(&str, &str)] = &[
+    ("ui-egui", "network"),
     ("media", "frame"),
     ("project", "media"),
     ("project", "frame"),

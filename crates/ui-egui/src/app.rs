@@ -44,6 +44,8 @@ impl FilmcraftApp {
             // Unsaved changes left by a session that died are offered first thing.
             dialog: recovery.then_some(Dialog::Recovery),
             updates_rt: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            network_project: Default::default(),
             file_dialogs: Default::default(),
             native_dialog: None,
             overwrite_prompt: None,

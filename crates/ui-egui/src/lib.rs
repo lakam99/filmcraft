@@ -10,6 +10,8 @@
 /// prompt shows both, and an AppImage's menu entry gets the icon.
 #[cfg(not(target_arch = "wasm32"))]
 pub const UPDATE_APP: craft_update::app::App = craft_update::app::App {
+    repo: "lakam99/filmcraft",
+    developer: "lakam99",
     icon_png: Some(include_bytes!("../../../assets/app-icon/hicolor/128x128/apps/ai.storyteller.filmcraft.png")),
     accent: Some([0x8b, 0x5c, 0xf6]),
     ..craft_update::suite::FILMCRAFT
@@ -39,7 +41,6 @@ macro_rules! tlf {
 }
 
 pub mod automation;
-pub mod brand;
 pub mod calc;
 pub mod capture;
 mod cjk;
@@ -61,6 +62,8 @@ mod ime_reset;
 pub mod links;
 pub mod menus;
 pub mod native_dialogs;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod network_projects;
 pub mod panels;
 pub mod perf;
 #[cfg(not(target_arch = "wasm32"))]
@@ -208,6 +211,8 @@ pub struct FilmcraftApp {
     pub hooks: HostHooks,
     pub dialog: Option<Dialog>,
     pub(crate) updates_rt: updates_ui::Runtime,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) network_project: network_projects::Runtime,
     pub file_dialogs: panels::file_dialogs::FileDialogState,
     /// The native file dialog the host is showing ([`Self::pick`]).
     native_dialog: Option<native_dialogs::PendingDialog>,
