@@ -46,14 +46,11 @@ rustix = { version = "1", default-features = false, features = ["std", "time"] }
 # the same clocks on Windows (GetThreadTimes / GetProcessTimes behind a safe API; MIT OR Apache-2.0)
 [target.'cfg(windows)'.dependencies]
 cpu-time = "1"
-keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "=3.6.3", default-features = false, features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pure-Rust D-Bus transport and encryption; no libdbus/OpenSSL linkage.
-keyring = { version = "=3.6.3", default-features = false, features = ["async-secret-service", "async-io", "crypto-rust"] }
 
 [dev-dependencies]
 pollster = "1"
@@ -75,11 +72,9 @@ serde_json = { workspace = true }
 toml = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+craft-ai-chat-egui = { git = "https://github.com/lakam99/craft-ai-chat", rev = "cd577bc2215b41cf1e438d51bff4294408f60138", version = "=0.1.0" }
+
 craft-update = { workspace = true }
 filmcraft-network = { workspace = true }
 filmcraft-format = { workspace = true }
 # MIT OR Apache-2.0; reuse the relay's pure-Rust HTTPS stack for OpenAI Responses.
-ureq = { version = "=3.5.0", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
-rustls-rustcrypto = "0.0.2-alpha"
-sha2 = "0.10"
-keyring = { version = "=3.6.3", default-features = false }

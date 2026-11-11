@@ -1,21 +1,24 @@
 use super::*;
+use crate::control;
 use filmcraft_engine::Session;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 fn turn(app: &mut FilmcraftApp) {
     let ctx = egui::Context::default();
     let deadline = Instant::now() + Duration::from_secs(8);
-    while app.assistant.pending.is_some() && Instant::now() < deadline {
+    while app.assistant.panel.busy() && Instant::now() < deadline {
         poll(app, &ctx);
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert!(app.assistant.pending.is_none(), "AI turn did not complete");
+    assert!(!app.assistant.panel.busy(), "AI turn did not complete");
 }
 
 #[test]
 fn mock_openai_turn_uses_real_command_dispatch_and_undo() {
     let mut app = FilmcraftApp::new(Session::default());
-    app.assistant.prompt = "Set project notes to AI edit".into();
-    app.assistant.attach = false;
+    *app.assistant.panel.prompt_mut() = "Set project notes to AI edit".into();
+    app.session.prefs.ai.attach_frames = false;
     let mut count = 0;
     begin_with(&mut app, &egui::Context::default(), move |body| {
         count += 1;
@@ -30,8 +33,8 @@ fn mock_openai_turn_uses_real_command_dispatch_and_undo() {
     }).unwrap();
     turn(&mut app);
     assert_eq!(app.session.project.notes, "AI edit");
-    assert!(app.assistant.transcript.iter().any(|(role, _)| role == "Tool"));
-    assert!(app.assistant.transcript.iter().any(|(role, _)| role == "Assistant"));
+    assert!(app.assistant.panel.transcript().iter().any(|(role, _)| role == "Tool"));
+    assert!(app.assistant.panel.transcript().iter().any(|(role, _)| role == "Assistant"));
     app.session.execute("edit.undo", json!({})).unwrap();
     assert!(app.session.project.notes.is_empty());
 }
@@ -39,8 +42,8 @@ fn mock_openai_turn_uses_real_command_dispatch_and_undo() {
 #[test]
 fn project_replacement_rejects_an_awaiting_edit() {
     let mut app = FilmcraftApp::new(Session::default());
-    app.assistant.prompt = "Do work".into();
-    app.assistant.attach = false;
+    *app.assistant.panel.prompt_mut() = "Do work".into();
+    app.session.prefs.ai.attach_frames = false;
     let (start, wait) = mpsc::channel();
     begin_with(&mut app, &egui::Context::default(), move |_| {
         wait.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -51,27 +54,33 @@ fn project_replacement_rejects_an_awaiting_edit() {
     start.send(()).unwrap();
     turn(&mut app);
     assert!(app.session.project.notes.is_empty());
-    assert!(app.assistant.history.is_empty());
+    assert!(app.assistant.panel.context_items() == 0);
 }
 
 #[test]
 fn stop_rejects_queued_actions() {
     let mut app = FilmcraftApp::new(Session::default());
-    app.assistant.prompt = "Do work".into();
-    app.assistant.attach = false;
+    *app.assistant.panel.prompt_mut() = "Do work".into();
+    app.session.prefs.ai.attach_frames = false;
     begin_with(&mut app, &egui::Context::default(), |_| Ok(json!({"status":"completed","output":[]}))).unwrap();
-    stop(&mut app.assistant);
+    app.assistant.panel.stop();
     turn(&mut app);
-    assert!(app.assistant.message.contains("Stopped"));
+    assert!(app.assistant.panel.message().contains("Stopped"));
     assert!(app.session.project.notes.is_empty());
 }
 
 #[test]
 fn chat_credentials_and_messages_are_not_in_serialized_ui_or_projects() {
     let mut app = FilmcraftApp::new(Session::default());
-    app.assistant.key = "sk-private-test-credential".into();
-    app.assistant.prompt = "private draft".into();
-    record(&mut app.assistant, "You", "private conversation".into());
+    app.assistant.panel.set_session_key("sk-private-test-credential".into()).unwrap();
+    // Queue a private conversation through the shared plugin; no serializer can observe it.
+    *app.assistant.panel.prompt_mut() = "private conversation".into();
+    begin_with(&mut app, &egui::Context::default(), |_| {
+        Ok(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"private conversation"}]}]}))
+    })
+    .unwrap();
+    turn(&mut app);
+    *app.assistant.panel.prompt_mut() = "private draft".into();
     let inspected = control::inspect(&app, &egui::Context::default()).to_string();
     let project = filmcraft_format::encode_with_view(&app.session.project, Some(&app.session.project_view()), false);
     for secret in ["sk-private-test-credential", "private draft", "private conversation"] {
@@ -126,7 +135,7 @@ fn rendered_program_and_source_frames_are_attached_without_seeking() {
     app.session.execute("source.open", json!({"item":source.0})).unwrap();
     let playhead = app.session.playhead();
     let source_time = app.session.state.source_playhead;
-    app.assistant.prompt = "Look at my shot".into();
+    *app.assistant.panel.prompt_mut() = "Look at my shot".into();
     begin_with(&mut app, &egui::Context::default(), |body| {
         let content = body["input"][0]["content"].as_array().unwrap();
         let images: Vec<_> = content.iter().filter(|part| part["type"] == "input_image").collect();
@@ -136,7 +145,7 @@ fn rendered_program_and_source_frames_are_attached_without_seeking() {
     })
     .unwrap();
     turn(&mut app);
-    assert_eq!(app.assistant.message, "Ready");
+    assert_eq!(app.assistant.panel.message(), "Ready");
     assert_eq!(app.session.playhead(), playhead);
     assert_eq!(app.session.state.source_playhead, source_time);
 }
@@ -146,7 +155,7 @@ fn chat_window_has_registered_controls_without_exposing_the_key() {
     use egui_kittest::Harness;
     let mut app = FilmcraftApp::new(Session::default());
     app.show_panel(crate::dock::PanelKind::AiChat);
-    app.assistant.key = "sk-private-test-credential".into();
+    app.assistant.panel.set_session_key("sk-private-test-credential".into()).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1500.0, 1000.0)).build_eframe(move |_| app);
     h.run_steps(4);
     for id in ["ai.key", "ai.settings", "ai.prompt", "ai.send", "ai.stop", "ai.attach", "ai.clear", "ai.forgetKey", "ai.saveKey"] {
@@ -160,8 +169,8 @@ fn assistant_synthetic_key_runs_once_and_waits_for_the_ui() {
     use egui_kittest::Harness;
     let mut app = FilmcraftApp::new(Session::default());
     app.ui.tool = crate::state::Tool::Razor;
-    app.assistant.prompt = "Switch to the Selection tool".into();
-    app.assistant.attach = false;
+    *app.assistant.panel.prompt_mut() = "Switch to the Selection tool".into();
+    app.session.prefs.ai.attach_frames = false;
     let mut h = Harness::builder().with_size(egui::vec2(1500.0, 1000.0)).build_eframe(move |_| app);
     h.run_steps(4);
     let ctx = h.ctx.clone();
@@ -179,7 +188,7 @@ fn assistant_synthetic_key_runs_once_and_waits_for_the_ui() {
         }
     }).unwrap();
     let deadline = Instant::now() + Duration::from_secs(8);
-    while h.state().assistant.pending.is_some() && Instant::now() < deadline {
+    while h.state().assistant.panel.busy() && Instant::now() < deadline {
         let mut raw = std::mem::take(h.input_mut());
         eframe::App::raw_input_hook(h.state_mut(), &ctx, &mut raw);
         *h.input_mut() = raw;
@@ -187,8 +196,8 @@ fn assistant_synthetic_key_runs_once_and_waits_for_the_ui() {
         h.step();
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert!(h.state().assistant.pending.is_none());
-    assert_eq!(h.state().assistant.message, "Ready");
+    assert!(!h.state().assistant.panel.busy());
+    assert_eq!(h.state().assistant.panel.message(), "Ready");
     assert_eq!(h.state().ui.tool, crate::state::Tool::Selection);
 }
 
@@ -204,10 +213,10 @@ fn forget_key_removes_the_password_fields_undo_history() {
     ctx.memory_mut(|memory| memory.request_focus(id));
     h.input_mut().events.push(egui::Event::Text("sk-private-test-credential".into()));
     h.run_steps(3);
-    assert_eq!(h.state().assistant.key, "sk-private-test-credential");
+    assert!(h.state().assistant.panel.has_key());
     h.get_by_label("Forget key").click();
     h.run_steps(3);
-    assert!(h.state().assistant.key.is_empty());
+    assert!(!h.state().assistant.panel.has_key());
     ctx.memory_mut(|memory| memory.request_focus(id));
     h.input_mut().events.push(egui::Event::Key {
         key: egui::Key::Z,
@@ -217,7 +226,7 @@ fn forget_key_removes_the_password_fields_undo_history() {
         modifiers: egui::Modifiers { command: true, ..Default::default() },
     });
     h.run_steps(3);
-    assert!(h.state().assistant.key.is_empty(), "Undo must not restore a forgotten API key");
+    assert!(!h.state().assistant.panel.has_key(), "Undo must not restore a forgotten API key");
 }
 
 #[test]
@@ -227,7 +236,7 @@ fn ai_preferences_persist_with_the_editor_and_never_include_the_key() {
     let mut app = FilmcraftApp::new(Session::default());
     app.session.prefs_path = Some(path.clone());
     app.session.execute("prefs.set", json!({"values":{"ai.model":"gpt-4.1","ai.attachFrames":false,"ai.rememberKey":true}})).unwrap();
-    app.assistant.key = "sk-private-test-credential".into();
+    app.assistant.panel.set_session_key("sk-private-test-credential".into()).unwrap();
     let loaded = filmcraft_engine::autosave::Preferences::load(&path);
     assert_eq!(loaded.ai.model, "gpt-4.1");
     assert!(!loaded.ai.attach_frames);
@@ -235,9 +244,10 @@ fn ai_preferences_persist_with_the_editor_and_never_include_the_key() {
     let mut reopened_session = Session::default();
     reopened_session.prefs = loaded;
     let mut reopened = FilmcraftApp::new(reopened_session);
-    sync_preferences(&mut reopened);
-    assert_eq!(reopened.assistant.model, "gpt-4.1");
-    assert!(!reopened.assistant.attach);
+    poll(&mut reopened, &egui::Context::default());
+    let preferences = with_panel(&mut reopened, &egui::Context::default(), |_, host| host.preferences()).unwrap();
+    assert_eq!(preferences.model, "gpt-4.1");
+    assert!(!reopened.session.prefs.ai.attach_frames);
     assert!(!std::fs::read_to_string(&path).unwrap().contains("sk-private-test-credential"));
     assert!(app.session.execute("prefs.set", json!({"key":"ai.apiKey","value":"sk-private-test-credential"})).is_err());
     assert!(app.session.execute("prefs.set", json!({"key":"ai.model","value":"a".repeat(129)})).is_err());
@@ -271,10 +281,9 @@ fn ai_panel_floats_docks_and_round_trips_in_a_saved_workspace() {
 fn narrow_chat_panel_keeps_its_composer_and_actions_visible() {
     use egui_kittest::Harness;
     let mut app = FilmcraftApp::new(Session::default());
-    app.assistant.key = "sk-private-test-credential".into();
-    app.assistant.prompt = "Inspect this shot".into();
-    app.assistant.message = "Ready".into();
-    app.assistant.vault.message = "API key saved in the OS credential store".into();
+    app.assistant.panel.set_session_key("sk-private-test-credential".into()).unwrap();
+    *app.assistant.panel.prompt_mut() = "Inspect this shot".into();
+    app.assistant.panel.fail("A previous turn failed; review completed edits before continuing.");
     let mut h = Harness::builder().with_size(egui::vec2(220.0, 490.0)).build_ui_state(
         |ui, app| {
             app.auto.elements.clear();

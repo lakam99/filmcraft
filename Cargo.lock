@@ -1088,6 +1088,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-ai-chat-core"
+version = "0.1.0"
+source = "git+https://github.com/lakam99/craft-ai-chat?rev=cd577bc2215b41cf1e438d51bff4294408f60138#cd577bc2215b41cf1e438d51bff4294408f60138"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "craft-ai-chat-egui"
+version = "0.1.0"
+source = "git+https://github.com/lakam99/craft-ai-chat?rev=cd577bc2215b41cf1e438d51bff4294408f60138#cd577bc2215b41cf1e438d51bff4294408f60138"
+dependencies = [
+ "craft-ai-chat-core",
+ "craft-ai-chat-native",
+ "egui",
+ "serde_json",
+]
+
+[[package]]
+name = "craft-ai-chat-native"
+version = "0.1.0"
+source = "git+https://github.com/lakam99/craft-ai-chat?rev=cd577bc2215b41cf1e438d51bff4294408f60138#cd577bc2215b41cf1e438d51bff4294408f60138"
+dependencies = [
+ "craft-ai-chat-core",
+ "keyring",
+ "rustls-rustcrypto",
+ "serde_json",
+ "sha2",
+ "ureq",
+]
+
+[[package]]
 name = "craft-docpath"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=1b34eba41e62138fc2438d2734523b302840b45d#1b34eba41e62138fc2438d2734523b302840b45d"
@@ -2632,6 +2665,7 @@ name = "filmcraft-ui-egui"
 version = "0.17.2"
 dependencies = [
  "cpu-time",
+ "craft-ai-chat-egui",
  "craft-ui",
  "craft-update",
  "eframe",
@@ -2660,19 +2694,15 @@ dependencies = [
  "filmcraft-time",
  "filmcraft-tts",
  "image",
- "keyring",
  "log",
  "pollster 1.0.1",
  "rayon",
  "rustix 1.1.5",
- "rustls-rustcrypto",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "toml 1.1.6+spec-1.1.0",
  "unicode-bidi",
- "ureq",
  "web-time",
 ]
 
