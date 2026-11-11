@@ -25,6 +25,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     #[cfg(not(target_arch = "wasm32"))]
     uic!("ai.chat", "AI Chat", [], None),
     #[cfg(not(target_arch = "wasm32"))]
+    uic!("ai.connection", "OpenAI Connection", [], None),
+    #[cfg(not(target_arch = "wasm32"))]
     uic!("ai.settings", "AI Chat Preferences", [], None),
     #[cfg(not(target_arch = "wasm32"))]
     uic!("ai.send", "Send AI Message", [], None),

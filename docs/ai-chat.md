@@ -24,7 +24,7 @@ are excluded.
 
 **Stop** prevents further tool dispatch. Already completed edits remain. An in-flight OpenAI request
 may take up to 120 seconds to return; the app remains usable. Closing the panel hides it; ongoing
-work continues until it finishes or you use **Stop**. **Clear chat** discards conversation context
+work continues until it finishes or you use **Stop**. **New chat** discards conversation context
 after the current task has stopped. **Save key securely** saves the entered key in the OS credential
 store. **Load saved key** retries loading it if the store was previously locked. **Forget key**
 clears the entered key, its text-field undo history and the saved credential. Errors removing a
@@ -81,3 +81,19 @@ Other Craft products can integrate the same source plugin through the `Host`
 trait, advertising their own tools and document context. See the shared
 repository's adapter guide and compiled non-video document example. This requires
 rebuilding the host application; it is not a runtime plugin for existing binaries.
+
+## Conversation and Markdown
+
+Use the key-status button at the top of AI Chat to open connection controls.
+The composer stays at the bottom: **Enter** sends and **Shift+Enter** adds a line.
+During a request, **Stop** replaces Send. **New chat** clears the session.
+
+Messages support Markdown headings, bold and italic text, lists, quotes, links,
+fenced code blocks and tables. Use **Copy** on an assistant reply to copy its
+original Markdown. Images and HTML are omitted, and local or non-web links are
+blocked. Deeply nested Markdown falls back to plain text.
+
+Editor tool calls appear as named action cards with Working, Done, Failed or
+Stopped states. Command names come from the editor's command registry. Raw JSON
+arguments, payloads and frame encodings stay out of the chat; the model still
+receives the full tool results. Errors appear as concise messages on the card.

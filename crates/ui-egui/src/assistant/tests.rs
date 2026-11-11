@@ -33,7 +33,10 @@ fn mock_openai_turn_uses_real_command_dispatch_and_undo() {
     }).unwrap();
     turn(&mut app);
     assert_eq!(app.session.project.notes, "AI edit");
-    assert!(app.assistant.panel.transcript().iter().any(|(role, _)| role == "Tool"));
+    let label = filmcraft_engine::commands::command_specs().iter().find(|spec| spec.id == "project.setNotes").unwrap().label;
+    let activity = app.assistant.panel.transcript().iter().find(|(role, _)| role == "Tool").unwrap();
+    assert_eq!(activity.1, format!("{label} — Done"));
+    assert!(!activity.1.contains("params_json"));
     assert!(app.assistant.panel.transcript().iter().any(|(role, _)| role == "Assistant"));
     app.session.execute("edit.undo", json!({})).unwrap();
     assert!(app.session.project.notes.is_empty());
@@ -158,7 +161,11 @@ fn chat_window_has_registered_controls_without_exposing_the_key() {
     app.assistant.panel.set_session_key("sk-private-test-credential".into()).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1500.0, 1000.0)).build_eframe(move |_| app);
     h.run_steps(4);
-    for id in ["ai.key", "ai.settings", "ai.prompt", "ai.send", "ai.stop", "ai.attach", "ai.clear", "ai.forgetKey", "ai.saveKey"] {
+    assert!(h.state().auto.find("ai.key").is_none());
+    let ctx = h.ctx.clone();
+    route(h.state_mut(), &ctx, "ai.connection").unwrap().unwrap();
+    h.run_steps(3);
+    for id in ["ai.key", "ai.settings", "ai.prompt", "ai.send", "ai.attach", "ai.clear", "ai.forgetKey", "ai.saveKey"] {
         assert!(h.state().auto.find(id).is_some(), "missing {id}");
     }
     assert!(!serde_json::to_string(h.state().auto.all()).unwrap().contains("sk-private-test-credential"));
@@ -209,6 +216,8 @@ fn forget_key_removes_the_password_fields_undo_history() {
     let mut h = Harness::builder().with_size(egui::vec2(1500.0, 1000.0)).build_eframe(move |_| app);
     h.run_steps(4);
     let ctx = h.ctx.clone();
+    route(h.state_mut(), &ctx, "ai.connection").unwrap().unwrap();
+    h.run_steps(3);
     let id = h.state().auto.find("ai.key").unwrap().response_id.unwrap();
     ctx.memory_mut(|memory| memory.request_focus(id));
     h.input_mut().events.push(egui::Event::Text("sk-private-test-credential".into()));
@@ -218,6 +227,7 @@ fn forget_key_removes_the_password_fields_undo_history() {
     h.run_steps(3);
     assert!(!h.state().assistant.panel.has_key());
     ctx.memory_mut(|memory| memory.request_focus(id));
+    h.input_mut().events.push(egui::Event::ModifiersChanged(egui::Modifiers { command: true, ..Default::default() }));
     h.input_mut().events.push(egui::Event::Key {
         key: egui::Key::Z,
         physical_key: None,
@@ -292,8 +302,19 @@ fn narrow_chat_panel_keeps_its_composer_and_actions_visible() {
         app,
     );
     h.run_steps(5);
-    for id in ["ai.prompt", "ai.send", "ai.stop", "ai.clear"] {
+    for id in ["ai.prompt", "ai.send", "ai.clear"] {
         let [x, y, width, height] = h.state().auto.find(id).unwrap().rect;
         assert!(x >= 0.0 && y >= 0.0 && x + width <= 220.0 && y + height <= 490.0, "clipped {id}: {x},{y},{width},{height}");
+    }
+}
+
+#[test]
+fn activity_names_use_the_editors_command_labels() {
+    let mut app = FilmcraftApp::new(Session::default());
+    let ctx = egui::Context::default();
+    let host = Adapter { app: &mut app, ctx: &ctx };
+    for command in filmcraft_engine::commands::command_specs().iter().take(8) {
+        let call = ToolCall::new("filmcraft", json!({"method":"engine.execute","params_json":json!({"command":command.id,"params":{}}).to_string()}));
+        assert_eq!(host.tool_label(&call), command.label);
     }
 }

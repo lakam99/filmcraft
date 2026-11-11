@@ -72,6 +72,17 @@ impl Host for Adapter<'_> {
     fn credential_profile(&self) -> Option<CredentialProfile> {
         self.app.session.prefs_path.clone().map(|preferences_file| CredentialProfile { preferences_file, service: "FilmCraft Fork / OpenAI".into() })
     }
+    fn tool_label(&self, call: &ToolCall) -> String {
+        if let Some(id) = craft_ai_chat_egui::command_id(call) {
+            if let Some(command) = filmcraft_engine::commands::command_specs().iter().find(|command| command.id == id) {
+                return command.label.into();
+            }
+            if let Some(command) = crate::menus::UI_COMMANDS.iter().find(|command| command.id == id) {
+                return command.label.into();
+            }
+        }
+        craft_ai_chat_egui::tool_label(call)
+    }
     fn start_tool(&mut self, call: &ToolCall) -> Result<tools::Pending, String> {
         tools::start(call)
     }

@@ -72,7 +72,7 @@ serde_json = { workspace = true }
 toml = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-craft-ai-chat-egui = { git = "https://github.com/lakam99/craft-ai-chat", rev = "cd577bc2215b41cf1e438d51bff4294408f60138", version = "=0.1.0" }
+craft-ai-chat-egui = { git = "https://github.com/lakam99/craft-ai-chat", rev = "cb38ab373dcf7ce3876418e0a0976af8d44c39c2", version = "0.2.0" }
 
 craft-update = { workspace = true }
 filmcraft-network = { workspace = true }
