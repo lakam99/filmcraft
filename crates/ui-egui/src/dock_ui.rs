@@ -514,6 +514,10 @@ impl DockContent<PanelKind> for FilmContent<'_> {
         if self.app.ui.focused == *panel {
             ui.painter().rect_stroke(frame, 0.0, Stroke::new(1.0, t.focus), StrokeKind::Inside);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if viewport != egui::ViewportId::ROOT {
+            crate::assistant::paint_guidance(self.app, ui.ctx());
+        }
     }
 
     /// A native floating window drew its last body: its end-of-pass IME check, for the Program

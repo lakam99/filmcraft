@@ -51,7 +51,9 @@ fn editor_tools() -> craft_ai_chat_egui::core::editor::EditorTools {
 }
 fn info() -> &'static HostInfo {
     static INFO: std::sync::OnceLock<HostInfo> = std::sync::OnceLock::new();
-    INFO.get_or_init(|| editor_tools().host_info("filmcraft", "FilmCraft", INSTRUCTIONS, "Attach Program and Source frames"))
+    INFO.get_or_init(|| {
+        craft_ai_chat_egui::core::editor::with_guidance(editor_tools().host_info("filmcraft", "FilmCraft", INSTRUCTIONS, "Attach Program and Source frames"))
+    })
 }
 struct Adapter<'a> {
     app: &'a mut FilmcraftApp,
@@ -85,6 +87,15 @@ impl Host for Adapter<'_> {
     }
     fn start_tool(&mut self, call: &ToolCall) -> Result<tools::Pending, String> {
         tools::start(call)
+    }
+    fn highlight_target(&self, id: &str) -> Option<craft_ai_chat_egui::HighlightTarget> {
+        let element = self.app.auto.find(id)?;
+        let rect = element
+            .response_id
+            .and_then(|id| self.ctx.read_response(id))
+            .map(|r| r.interact_rect)
+            .unwrap_or_else(|| egui::Rect::from_min_size(egui::pos2(element.rect[0], element.rect[1]), egui::vec2(element.rect[2], element.rect[3])));
+        Some(craft_ai_chat_egui::HighlightTarget { rect, viewport: element.viewport })
     }
     fn poll_tool(&mut self, tool: &mut tools::Pending) -> Result<Option<Value>, String> {
         tools::poll(self.app, self.ctx, tool)
@@ -130,6 +141,9 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str) -> Option<Re
 }
 pub(crate) fn poll(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let _ = with_panel(app, ctx, |panel, host| panel.poll(host, ctx));
+}
+pub(crate) fn paint_guidance(app: &mut FilmcraftApp, ctx: &egui::Context) {
+    let _ = with_panel(app, ctx, |panel, host| panel.paint_guidance(host, ctx));
 }
 pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: egui::Rect) {
     let ctx = ui.ctx().clone();

@@ -1,5 +1,16 @@
 # AI chat and editor tools
 
+## Highlighted controls
+
+Ask “How do I…?” to get instructions with numbered outlines around the relevant editor
+buttons and panels. The numbers match the guidance shown in the chat. The assistant can
+open a relevant panel or menu first; highlighting leaves the actual edit for you to perform.
+Outlines follow the controls when the layout changes and disappear when a control is hidden.
+Use **Clear highlights** or **Esc** to dismiss the guide. A new question, **Stop**, or opening
+another project clears the previous guide.
+
+## Using the chat
+
 Open **Window → AI Chat** to reveal the dedicated dockable panel. It supports tabs, splits, floating
 windows and saved workspaces like the other editor panels. Enter an OpenAI API key and describe the
 work you want done. Choose a model under **Edit → Preferences → AI Chat** (also available from the

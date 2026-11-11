@@ -421,6 +421,8 @@ impl FilmcraftApp {
             #[cfg(not(target_arch = "wasm32"))]
             crate::assistant::poll(self, &ctx);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::assistant::paint_guidance(self, &ctx);
         // Check only after this pass's control requests ran: `ui.menu.invoke`/`engine.execute`
         // may have edited the text or replaced the target. Every other pass (hidden editor, focus
         // in another panel, no editor at all) turns the composer off.
