@@ -10,11 +10,12 @@ pub struct AiPrefs {
     pub model: String,
     pub attach_frames: bool,
     pub remember_key: bool,
+    pub remember_history: bool,
 }
 
 impl Default for AiPrefs {
     fn default() -> Self {
-        Self { model: "gpt-6.1-sol".into(), attach_frames: true, remember_key: true }
+        Self { model: "gpt-6.1-sol".into(), attach_frames: true, remember_key: true, remember_history: true }
     }
 }
 

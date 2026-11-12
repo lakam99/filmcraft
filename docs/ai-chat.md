@@ -1,5 +1,24 @@
 # AI chat and editor tools
 
+## Batches and saved history
+
+Bulk requests use batches of up to 64 discovered editor commands per AI tool call,
+with one progress card. Commands execute in order through the normal editor APIs;
+a failure stops later commands. Completed edits keep their ordinary Undo entries.
+A batch is not an atomic edit or one Undo step. Inspect current state before
+continuing unfinished work; completed commands must not be replayed.
+
+Tool-limit and network errors preserve the original request and completed-work
+context. Chat history is saved locally per project beside editor preferences;
+**Remember chat history locally** controls this in AI preferences. **New chat**
+clears the current project's saved conversation. Credentials and attached media
+are excluded. History discarded by an older version cannot be recovered.
+
+Older attachments are omitted from later turns. Long model context is compacted
+into a continuation summary while the readable transcript stays separate. This
+uses the selected model and counts as API usage; a failed summary preserves the
+existing context for retry.
+
 ## Highlighted controls
 
 Ask “Guide me step by step” for one highlighted control at a time. The assistant
@@ -60,14 +79,14 @@ option for a session-only key; a previously saved credential is removed. Credent
 actions are immediate, while ordinary Preferences fields use OK / Cancel.
 
 The key never enters preferences JSON, projects, recovery files, logs, or serialized UI state. Chat
-history and frame attachments stay in memory and are not persisted. Messages, frames and requested
+history is saved separately in local per-project chat archives when enabled; frame attachments are not persisted. Messages, frames and requested
 editor data are transmitted directly to OpenAI over HTTPS; the RedWeb project relay is not involved
 in AI requests. Requests use `store: false`; this does not change the account's applicable OpenAI
 data-handling policies. Do not send material you do not want processed by OpenAI.
 
-Each turn is limited to 32 model-requested tool calls, 4096 output tokens per response and bounded
+Each turn is limited to 32 model-requested tool calls, 8192 output tokens per response and bounded
 request, response and conversation sizes. When a limit or error interrupts a turn, completed edits
-remain, incomplete API context is discarded, and the next message should inspect the current state
+remain, conversation context is preserved, and the next message should inspect the current state
 before continuing. Executed tools report failures in the conversation. Authentication, quota,
 connection and unsupported-model errors are reported without logging server bodies or keys.
 

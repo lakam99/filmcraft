@@ -277,6 +277,7 @@ pub(super) static CATEGORIES: &[Category] = &[
             f("ai.model", "OpenAI model", Kind::Text, true),
             b("ai.attachFrames", "Attach current Program and Source frames", true),
             b("ai.rememberKey", "Remember the API key in the OS credential store", true),
+            b("ai.rememberHistory", "Remember chat history on this machine", true),
             Row::Note("Messages, requested editor data and frames are sent to OpenAI. API usage is billed to your key."),
             Row::Custom("aiCredentials"),
         ],
@@ -679,7 +680,7 @@ pub fn is_unit_key(key: &str) -> bool {
 /// Repair a preferences value in place against the schema: unknown choices and bad colours go back
 /// to their defaults, numbers are clamped to their ranges.
 pub fn sanitize(v: &mut Value, defaults: &Value) {
-    for name in ["attachFrames", "rememberKey"] {
+    for name in ["attachFrames", "rememberKey", "rememberHistory"] {
         let pointer = format!("/ai/{name}");
         if let Some(slot) = v.pointer_mut(&pointer)
             && !slot.is_boolean()

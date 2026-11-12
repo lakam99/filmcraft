@@ -5,6 +5,32 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 #[test]
+fn batch_renames_forty_bins_in_one_tool_call_with_normal_undo() {
+    let mut app = FilmcraftApp::new(Session::default());
+    app.session.prefs.ai.attach_frames = false;
+    let ids: Vec<u64> =
+        (0..40).map(|i| app.session.execute("file.newBin", json!({"name":format!("Original {i}")})).unwrap()["bin"].as_u64().unwrap()).collect();
+    let commands: Vec<_> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| json!({"command":"project.renameBin","params_json":json!({"bin":id,"name":format!("Take {i:02}")}).to_string()}))
+        .collect();
+    *app.assistant.panel.prompt_mut() = "Rename all forty bins".into();
+    let mut request = 0;
+    begin_with(&mut app,&egui::Context::default(),move|body|{
+        request+=1;if request==1 {Ok(json!({"status":"completed","output":[{"type":"function_call","call_id":"bulk","name":"batch_commands","arguments":json!({"editor":"filmcraft","label":"Rename 40 bins","commands":commands}).to_string()}]}))}
+        else {let output:Value=serde_json::from_str(body["input"].as_array().unwrap().last().unwrap()["output"].as_str().unwrap()).unwrap();assert_eq!(output["completed"],40);Ok(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Renamed all forty bins."}]}]}))}
+    }).unwrap();
+    turn(&mut app);
+    for (i, id) in ids.iter().enumerate() {
+        assert_eq!(app.session.project.root.find_bin(filmcraft_project::BinId(*id)).unwrap().name, format!("Take {i:02}"));
+    }
+    assert_eq!(app.assistant.panel.transcript().iter().filter(|(role, _)| role == "Tool").count(), 1);
+    app.session.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(app.session.project.root.find_bin(filmcraft_project::BinId(ids[39])).unwrap().name, "Original 39");
+}
+
+#[test]
 fn guide_observation_preserves_widget_local_value_changes() {
     let mut app = FilmcraftApp::new(Session::default());
     let ctx = egui::Context::default();
@@ -300,12 +326,15 @@ fn ai_preferences_persist_with_the_editor_and_never_include_the_key() {
     let path = root.path().join("preferences.json");
     let mut app = FilmcraftApp::new(Session::default());
     app.session.prefs_path = Some(path.clone());
-    app.session.execute("prefs.set", json!({"values":{"ai.model":"gpt-4.1","ai.attachFrames":false,"ai.rememberKey":true}})).unwrap();
+    app.session
+        .execute("prefs.set", json!({"values":{"ai.model":"gpt-4.1","ai.attachFrames":false,"ai.rememberKey":true,"ai.rememberHistory":false}}))
+        .unwrap();
     app.assistant.panel.set_session_key("sk-private-test-credential".into()).unwrap();
     let loaded = filmcraft_engine::autosave::Preferences::load(&path);
     assert_eq!(loaded.ai.model, "gpt-4.1");
     assert!(!loaded.ai.attach_frames);
     assert!(loaded.ai.remember_key);
+    assert!(!loaded.ai.remember_history);
     let mut reopened_session = Session::default();
     reopened_session.prefs = loaded;
     let mut reopened = FilmcraftApp::new(reopened_session);
@@ -316,9 +345,11 @@ fn ai_preferences_persist_with_the_editor_and_never_include_the_key() {
     assert!(!std::fs::read_to_string(&path).unwrap().contains("sk-private-test-credential"));
     assert!(app.session.execute("prefs.set", json!({"key":"ai.apiKey","value":"sk-private-test-credential"})).is_err());
     assert!(app.session.execute("prefs.set", json!({"key":"ai.model","value":"a".repeat(129)})).is_err());
-    let repaired =
-        filmcraft_engine::autosave::Preferences::from_value(json!({"ai":{"model":[],"attachFrames":"bad","rememberKey":3},"general":{"showToolTips":false}}));
+    let repaired = filmcraft_engine::autosave::Preferences::from_value(
+        json!({"ai":{"model":[],"attachFrames":"bad","rememberKey":3,"rememberHistory":[]},"general":{"showToolTips":false}}),
+    );
     assert_eq!(repaired.ai, filmcraft_engine::settings::AiPrefs::default());
+    assert!(repaired.ai.remember_history);
     assert!(!repaired.general.show_tool_tips);
 }
 

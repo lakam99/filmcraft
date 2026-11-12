@@ -66,10 +66,13 @@ impl Host for Adapter<'_> {
     }
     fn preferences(&self) -> Preferences {
         let p = &self.app.session.prefs.ai;
-        Preferences { model: p.model.clone(), attach_frames: p.attach_frames, remember_key: p.remember_key }
+        Preferences { model: p.model.clone(), attach_frames: p.attach_frames, remember_key: p.remember_key, remember_history: p.remember_history }
     }
     fn instance(&self) -> std::sync::Arc<()> {
         self.app.session.project_instance.clone()
+    }
+    fn document_key(&self) -> Option<String> {
+        self.app.session.path.clone()
     }
     fn credential_profile(&self) -> Option<CredentialProfile> {
         self.app.session.prefs_path.clone().map(|preferences_file| CredentialProfile { preferences_file, service: "FilmCraft Fork / OpenAI".into() })
