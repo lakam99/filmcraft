@@ -27,6 +27,12 @@ pub struct Element {
     pub(crate) response_id: Option<egui::Id>,
     #[serde(skip)]
     pub(crate) viewport: egui::ViewportId,
+    #[serde(skip)]
+    pub(crate) activated: bool,
+    #[serde(skip)]
+    pub(crate) changed: bool,
+    #[serde(skip)]
+    pub(crate) editing: bool,
 }
 
 #[derive(Default)]
@@ -57,6 +63,9 @@ impl Registry {
             window,
             response_id: None,
             viewport,
+            activated: false,
+            changed: false,
+            editing: false,
         });
     }
     /// Observe the widget without changing its accessibility role or input behavior.
@@ -70,6 +79,11 @@ impl Registry {
             element.enabled = Some(response.enabled());
             element.focusable = Some(response.sense.is_focusable());
             element.response_id = Some(response.id);
+            // `Context::read_response` reconstructs input, but cannot recover a widget's
+            // locally marked CHANGED flag. Capture it from the actual widget response.
+            element.activated = response.clicked();
+            element.changed = response.changed();
+            element.editing = response.has_focus() || response.dragged();
         }
     }
     pub fn begin_frame(&mut self) {

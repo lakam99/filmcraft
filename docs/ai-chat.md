@@ -2,6 +2,14 @@
 
 ## Highlighted controls
 
+Ask “Guide me step by step” for one highlighted control at a time. The assistant
+waits for your action, checks the observable result, then inspects the updated
+editor and highlights the next control. It does not perform the steps for you.
+Use **Pause guide** / **Resume guide** to control advancement, or **I've done this**
+when automatic detection is unavailable. Confirmation is reported as your
+confirmation, not automatic verification. Cancelling a file dialog does not count
+as importing a file. **Clear highlights**, **Esc** and **Stop** end the walkthrough.
+
 Ask “How do I…?” to get instructions with numbered outlines around the relevant editor
 buttons and panels. The numbers match the guidance shown in the chat. The assistant can
 open a relevant panel or menu first; highlighting leaves the actual edit for you to perform.

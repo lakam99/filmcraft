@@ -5,6 +5,21 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 #[test]
+fn guide_observation_preserves_widget_local_value_changes() {
+    let mut app = FilmcraftApp::new(Session::default());
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        let mut response = ui.button("Value editor");
+        response.mark_changed();
+        app.auto.add_response("value.editor", &response, "Value editor");
+        assert!(!ui.ctx().read_response(response.id).unwrap().changed(), "the reconstructed response cannot contain the widget-local flag");
+        let adapter = Adapter { app: &mut app, ctx: ui.ctx() };
+        assert!(adapter.guide_observation("value.editor", ui.ctx()).unwrap().changed);
+    });
+    output.textures_delta.clear();
+}
+
+#[test]
 fn how_to_guidance_highlights_a_live_panel_without_editing_the_project() {
     use egui_kittest::{Harness, kittest::Queryable};
     let mut app = FilmcraftApp::new(Session::default());
@@ -357,4 +372,55 @@ fn activity_names_use_the_editors_command_labels() {
         let call = ToolCall::new("filmcraft", json!({"method":"engine.execute","params_json":json!({"command":command.id,"params":{}}).to_string()}));
         assert_eq!(host.tool_label(&call), command.label);
     }
+}
+
+#[test]
+fn walkthrough_follows_real_menu_clicks_without_editing_the_project() {
+    use egui_kittest::{Harness, kittest::Queryable};
+    let mut app = FilmcraftApp::new(Session::default());
+    app.show_panel(crate::dock::PanelKind::AiChat);
+    app.session.prefs.ai.attach_frames = false;
+    let before = app.session.project.clone();
+    let mut h = Harness::builder().with_size(egui::vec2(1500.0, 1000.0)).build_eframe(move |_| app);
+    h.run_steps(4);
+    let ctx = h.ctx.clone();
+    *h.state_mut().assistant.panel.prompt_mut() = "Guide me through the File and Edit menus".into();
+    let mut turn = 0;
+    begin_with(h.state_mut(),&ctx,move |_|{
+        let current=turn;turn+=1;
+        if current<2 {
+            let name=if current==0 {"File"} else {"Edit"};
+            Ok(json!({"status":"completed","output":[{"type":"function_call","call_id":format!("step{current}"),"name":"guide_ui","arguments":json!({"id":format!("menu.{name}"),"label":format!("Open the {name} menu"),"instruction":format!("Click **{name}** in the menu bar."),"completion":"activate","watch_id":"","state_pointer":"","comparison":"equal","expected_json":""}).to_string()}]}))
+        }else{Ok(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Both menus are ready."}]}]}))}
+    }).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while route(h.state_mut(), &ctx, "ai.status").unwrap().unwrap()["walkthrough"]["step"] != 1 && Instant::now() < deadline {
+        h.run_steps(1);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    h.run_steps(4);
+    assert!(Arc::ptr_eq(&before, &h.state().session.project));
+    h.query_by_role_and_label(egui::accesskit::Role::Button, "File").unwrap().click();
+    h.run_steps(3);
+    while route(h.state_mut(), &ctx, "ai.status").unwrap().unwrap()["walkthrough"]["step"] != 2 && Instant::now() < deadline {
+        h.run_steps(1);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    h.run_steps(3);
+    let status = route(h.state_mut(), &ctx, "ai.status").unwrap().unwrap();
+    assert_eq!(status["highlights"][0]["id"], "menu.Edit");
+    assert_eq!(status["highlights"][0]["number"], 2);
+    if let Some(dir) = std::env::var_os("CRAFT_AI_EDITOR_FIXTURES") {
+        std::fs::create_dir_all(&dir).unwrap();
+        h.render().unwrap().save(std::path::Path::new(&dir).join("filmcraft-walkthrough.png")).unwrap();
+    }
+    h.query_by_role_and_label(egui::accesskit::Role::Button, "Edit").unwrap().click();
+    h.run_steps(3);
+    while h.state().assistant.panel.busy() && Instant::now() < deadline {
+        h.run_steps(1);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!h.state().assistant.panel.busy());
+    assert!(Arc::ptr_eq(&before, &h.state().session.project));
+    assert_eq!(route(h.state_mut(), &ctx, "ai.status").unwrap().unwrap()["highlights"], json!([]));
 }

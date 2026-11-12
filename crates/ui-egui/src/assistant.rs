@@ -100,6 +100,19 @@ impl Host for Adapter<'_> {
     fn poll_tool(&mut self, tool: &mut tools::Pending) -> Result<Option<Value>, String> {
         tools::poll(self.app, self.ctx, tool)
     }
+    fn guide_observation(&self, id: &str, ctx: &egui::Context) -> Option<craft_ai_chat_egui::Observation> {
+        let element = self.app.auto.find_current(id)?;
+        if element.viewport != ctx.viewport_id() {
+            return None;
+        }
+        element.response_id?;
+        Some(craft_ai_chat_egui::Observation { activated: element.activated, changed: element.changed, editing: element.editing })
+    }
+    fn guide_state(&self) -> Value {
+        let project = &self.app.session.project;
+        let state = &self.app.session.state;
+        json!({"itemCount":project.items.len(),"mediaCount":project.items.values().filter(|i|matches!(i.kind,filmcraft_project::ItemKind::Media(_))).count(),"selectedClipCount":state.selection.len(),"selectedProjectItemCount":state.project_selection.len(),"activeSequence":state.active_sequence,"sourceItem":state.source_item})
+    }
     fn set_preference(&mut self, key: &str, value: Value) -> Result<(), String> {
         self.app.session.execute("prefs.set", json!({"key":key,"value":value})).map(|_| ()).map_err(|e| e.to_string())
     }

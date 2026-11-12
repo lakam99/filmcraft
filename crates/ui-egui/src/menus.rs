@@ -1288,7 +1288,7 @@ pub fn menu_bar(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
                 }
                 menu_level(ui, &mine, 1, &mut clicked, &mut app.auto, &labels);
             });
-            app.auto.add(&format!("menu.{top}"), r.response.rect, top);
+            app.auto.add_response(&format!("menu.{top}"), &r.response, top);
             titles.push(r.response);
         }
         switch_on_hover(ui.ctx(), &titles);
@@ -1429,7 +1429,7 @@ fn menu_entry(ui: &mut egui::Ui, it: &MenuItem, auto: &mut crate::automation::Re
     if let Some(hint) = crate::links::menu_hint(&it.id) {
         hint_at_pointer(ui, &r, hint);
     }
-    auto.add(&format!("menu.{}", it.id), r.rect, &it.label);
+    auto.add_response(&format!("menu.{}", it.id), &r, &it.label);
     if let Some(color) = swatch {
         paint_swatch(ui, r.rect, color);
     }
