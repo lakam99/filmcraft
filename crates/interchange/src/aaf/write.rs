@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use filmcraft_time::{FrameRate, Tick};
 
-use super::ids::{META_DICTIONARY, ROOT, cls, ddef, def, path, pid};
+use super::ids::{ROOT, cls, ddef, def, path, pid};
 use super::store::{self, Auid, Obj, Value, rational, utf16z};
 use crate::comp::{CItem, CKind, CMarker, Composition, Document, Gain, Source, ticks_to_units};
 use crate::{Error, Report, Result};
@@ -418,8 +418,12 @@ pub(crate) fn write(doc: &Document, version: filmcraft_cfb::Version, report: &mu
         opdefs.push(o);
     }
     let pdefs = vec![
-        definition(cls::PARAMETER_DEFINITION, def::PARAM_LEVEL, "Level").data_prop(pid::PARAMDEF_DISPLAY_UNITS, utf16z("")),
-        definition(cls::PARAMETER_DEFINITION, def::PARAM_AMPLITUDE, "Amplitude").data_prop(pid::PARAMDEF_DISPLAY_UNITS, utf16z("")),
+        definition(cls::PARAMETER_DEFINITION, def::PARAM_LEVEL, "Level")
+            .with(pid::PARAMDEF_TYPE, Value::Weak(path::META_TYPES.to_vec(), pid::META_IDENTIFICATION, def::TYPE_RATIONAL.to_vec()))
+            .data_prop(pid::PARAMDEF_DISPLAY_UNITS, utf16z("")),
+        definition(cls::PARAMETER_DEFINITION, def::PARAM_AMPLITUDE, "Amplitude")
+            .with(pid::PARAMDEF_TYPE, Value::Weak(path::META_TYPES.to_vec(), pid::META_IDENTIFICATION, def::TYPE_RATIONAL.to_vec()))
+            .data_prop(pid::PARAMDEF_DISPLAY_UNITS, utf16z("")),
     ];
     let idefs = if uses_varying || !used_ops.is_empty() {
         vec![
@@ -465,13 +469,9 @@ pub(crate) fn write(doc: &Document, version: filmcraft_cfb::Version, report: &mu
         .with(pid::CONTENT, Value::Strong(Box::new(content)))
         .with(pid::DICTIONARY, Value::Strong(Box::new(dict)))
         .with(pid::IDENTIFICATION_LIST, Value::StrongVec(vec![ident]));
-    // The meta-dictionary holds only extensions to the baseline object model, and everything written
-    // here is baseline, so its class and type definition sets are empty; readers that load them
-    // (pyaaf2) still need the sets to be there (#323).
-    let meta = Obj::new(META_DICTIONARY)
-        .with(pid::META_CLASS_DEFINITIONS, Value::StrongSet(Vec::new(), pid::META_IDENTIFICATION))
-        .with(pid::META_TYPE_DEFINITIONS, Value::StrongSet(Vec::new(), pid::META_IDENTIFICATION));
-    let root = Obj::new(ROOT).with(pid::ROOT_META_DICTIONARY, Value::Strong(Box::new(meta))).with(pid::ROOT_HEADER, Value::Strong(Box::new(header)));
+    let root = Obj::new(ROOT)
+        .with(pid::ROOT_META_DICTIONARY, Value::Strong(Box::new(super::meta::dictionary())))
+        .with(pid::ROOT_HEADER, Value::Strong(Box::new(header)));
     store::write(&root, version).map_err(Error::Other)
 }
 
@@ -762,13 +762,9 @@ fn descriptor(w: &mut W, s: &Source) -> Obj {
             .data_prop(pid::STORED_HEIGHT, s.height.to_le_bytes().to_vec())
             .data_prop(pid::FRAME_LAYOUT, vec![0])
             .data_prop(pid::IMAGE_ASPECT_RATIO, rational(s.width.max(1) as i64, s.height.max(1) as i64))
-            .data_prop(pid::VIDEO_LINE_MAP, {
-                let mut v = 2u32.to_le_bytes().to_vec();
-                v.extend_from_slice(&4u32.to_le_bytes());
-                v.extend_from_slice(&0i32.to_le_bytes());
-                v.extend_from_slice(&0i32.to_le_bytes());
-                v
-            })
+            // FullFrame has one scan-line entry (MS-01 §10.3). An Int32Array is
+            // packed elements, without a count or an element-size prefix.
+            .data_prop(pid::VIDEO_LINE_MAP, 0i32.to_le_bytes().to_vec())
             .data_prop(pid::COMPONENT_WIDTH, 8u32.to_le_bytes().to_vec())
             .data_prop(pid::HORIZONTAL_SUBSAMPLING, 2u32.to_le_bytes().to_vec()),
         CKind::Sound => {
