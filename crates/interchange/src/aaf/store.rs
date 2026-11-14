@@ -174,6 +174,8 @@ fn prop_name(pid: u16) -> &'static str {
         0x0002 => "Header",
         0x0003 => "ClassDefinitions",
         0x0004 => "TypeDefinitions",
+        0x0009 => "Properties",
+        0x001C => "MemberTypes",
         0x3B03 => "Content",
         0x3B04 => "Dictionary",
         0x3B06 => "IdentificationList",
@@ -326,7 +328,9 @@ impl W {
                 Value::Stream(data) => {
                     let name = storage_name(pid);
                     self.cfb.stream(node, &name, data.clone()).map_err(|e| e.to_string())?;
-                    let mut d = vec![BYTE_ORDER_LE];
+                    // Essence is opaque to the object store. Its descriptor defines PCM byte
+                    // order; 'U' avoids readers trying to byte-swap an opaque stream.
+                    let mut d = vec![0x55];
                     d.extend_from_slice(&utf16z(&name));
                     (SF_DATA_STREAM, d)
                 }
