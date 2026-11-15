@@ -65,7 +65,7 @@ const MAX_FILE: u64 = 4096;
 /// How the window's graphics device is created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// The platform default: Vulkan or DirectX 12 on Windows (no OpenGL, see [`apply`]), Metal on
+    /// The platform default: Vulkan first on Windows (then DirectX 12, see [`apply`]), Metal on
     /// macOS, Vulkan or OpenGL elsewhere.
     Default,
     /// DirectX 12 only (Windows), for Vulkan drivers that crash at start-up.
@@ -444,17 +444,24 @@ fn apply_for(options: &mut NativeOptions, mode: Mode, backend_override: Option<B
         // includes GL. Creating that backend can crash inside AMD's atio6axx.dll before adapter
         // selection or any Rust error handling runs, so the window never appears. Choosing an
         // adapter afterwards is too late: only leaving GL out of the instance avoids it. Keep
-        // Vulkan and DX12 both: forcing DX12 alone leaves machines without DX12 with no backend
-        // at all.
+        // Vulkan separate from DX12: NVIDIA's D3D12 driver can execute a null function pointer
+        // during adapter enumeration, before a working Vulkan adapter can be picked. The
+        // existing next rung tries DX12 if Vulkan cannot start; builds without Vulkan keep
+        // their previous native backends. Explicit backend overrides stay in charge.
         Mode::Default if windows => {
-            create.instance_descriptor.backends = backend_override.unwrap_or(Backends::PRIMARY);
+            let backends = backend_override.unwrap_or_else(|| windows_auto_backends(wgpu::Instance::enabled_backend_features()));
+            create.instance_descriptor.backends = backends;
+            let automatic_vulkan = backend_override.is_none() && backends == Backends::VULKAN;
             // wgpu's own choice of adapter, except for a GPU that Windows lists through two
             // versions of one driver: the first entry can be a stale one that crashes inside the
             // driver (`filmcraft_gpu::adapter`). A selector replaces `power_preference`
             // (`WGPU_POWER_PREF`), so it takes that along.
             let power = create.power_preference;
-            create.native_adapter_selector =
-                Some(Arc::new(move |adapters: &[wgpu::Adapter], surface: Option<&wgpu::Surface<'_>>| filmcraft_gpu::adapter::pick(adapters, surface, power)));
+            create.native_adapter_selector = Some(Arc::new(move |adapters: &[wgpu::Adapter], surface: Option<&wgpu::Surface<'_>>| {
+                let adapter = filmcraft_gpu::adapter::pick(adapters, surface, power)?;
+                check_default_vulkan_adapter(automatic_vulkan, &adapter.get_info())?;
+                Ok(adapter)
+            }));
         }
         Mode::Default => {}
         // Without Vulkan, whose driver is what crashes.
@@ -464,6 +471,25 @@ fn apply_for(options: &mut NativeOptions, mode: Mode, backend_override: Option<B
             create.native_adapter_selector = Some(Arc::new(pick_software));
         }
     }
+}
+
+fn windows_auto_backends(enabled: Backends) -> Backends {
+    if enabled.contains(Backends::VULKAN) { Backends::VULKAN } else { Backends::PRIMARY }
+}
+
+/// The selector normally switches these Intel GPUs to their DX12 entry. A Vulkan-only
+/// attempt has no such entry: refuse before device creation so the existing fallback tries
+/// DX12 in-process, rather than reintroducing the known Intel Vulkan driver crash.
+fn check_default_vulkan_adapter(automatic: bool, info: &wgpu::AdapterInfo) -> Result<(), String> {
+    if automatic
+        && info.backend == wgpu::Backend::Vulkan
+        && info.device_type == wgpu::DeviceType::IntegratedGpu
+        && info.vendor == 0x8086
+        && filmcraft_gpu::adapter::intel_gen9_to_gen11(info.device)
+    {
+        return Err("This Intel Vulkan adapter cannot safely create a device; trying DirectX 12 instead".into());
+    }
+    Ok(())
 }
 
 /// The backends a software adapter is looked for in: WARP is a DX12 adapter, and GL stays out on

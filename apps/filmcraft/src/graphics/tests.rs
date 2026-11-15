@@ -37,11 +37,48 @@ fn windows_default_leaves_out_gl() {
     };
     assert!(eframe_default.instance_descriptor.backends.contains(Backends::GL));
     let (backends, selector) = configured(Mode::Default, None, true);
-    assert_eq!(backends, Backends::PRIMARY);
+    assert_eq!(backends, windows_auto_backends(wgpu::Instance::enabled_backend_features()));
     assert!(!backends.contains(Backends::GL));
-    assert!(backends.contains(Backends::DX12) && backends.contains(Backends::VULKAN));
     // and chooses the adapter itself: a GPU listed through two versions of one driver
     assert!(selector);
+}
+
+#[test]
+fn windows_default_does_not_probe_dx12_when_vulkan_is_available() {
+    if !wgpu::Instance::enabled_backend_features().contains(Backends::VULKAN) {
+        return;
+    }
+    // A DX12 driver can crash while adapters are listed, before a working Vulkan
+    // adapter is selected. The later DX12 rung must remain a separate attempt.
+    assert_eq!(configured(Mode::Default, None, true).0, Backends::VULKAN);
+    assert_eq!(configured(Mode::Dx12, None, true).0, Backends::DX12);
+}
+
+#[test]
+fn windows_default_keeps_existing_backends_in_builds_without_vulkan() {
+    assert_eq!(windows_auto_backends(Backends::VULKAN | Backends::DX12), Backends::VULKAN);
+    assert_eq!(windows_auto_backends(Backends::DX12), Backends::PRIMARY);
+}
+
+#[test]
+fn automatic_vulkan_rejects_unsafe_intel_before_device_creation() {
+    let mut info = wgpu::AdapterInfo::new(wgpu::DeviceType::IntegratedGpu, wgpu::Backend::Vulkan);
+    info.vendor = 0x8086;
+    info.device = 0x3e91;
+    assert!(check_default_vulkan_adapter(true, &info).is_err());
+    // An explicit override retains its existing selection policy.
+    assert!(check_default_vulkan_adapter(false, &info).is_ok());
+    info.backend = wgpu::Backend::Dx12;
+    assert!(check_default_vulkan_adapter(true, &info).is_ok());
+    info.backend = wgpu::Backend::Vulkan;
+    info.device = 0x4680; // A newer Intel integrated GPU is not in the affected family.
+    assert!(check_default_vulkan_adapter(true, &info).is_ok());
+    info.device = 0x3e91;
+    info.device_type = wgpu::DeviceType::DiscreteGpu;
+    assert!(check_default_vulkan_adapter(true, &info).is_ok());
+    info.device_type = wgpu::DeviceType::IntegratedGpu;
+    info.vendor = 0x10de;
+    assert!(check_default_vulkan_adapter(true, &info).is_ok());
 }
 
 #[test]
