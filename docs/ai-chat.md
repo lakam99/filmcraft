@@ -1,5 +1,14 @@
 # AI chat and editor tools
 
+## Command knowledge
+
+The assistant reuses learned command parameters across questions and keeps a bounded
+reference through context compression and remembered chat history. Workflow hints
+help it choose the right tools; missing related commands can be discovered together
+in one call. Current project IDs, selection and command availability are still read
+from the editor. Starting a new chat clears its learned reference. This uses the
+existing chat settings and requires no MCP configuration.
+
 ## Batches and saved history
 
 Bulk requests use batches of up to 64 discovered editor commands per AI tool call,

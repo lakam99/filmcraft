@@ -9,10 +9,10 @@ pub(crate) struct Runtime {
     pub(crate) panel: Panel<tools::Pending>,
 }
 const INSTRUCTIONS: &str = "You are FilmCraft's editing assistant. Use the editor tools to fulfill the user's request. \
-    First discover commands and inspect the current project/state; never invent command IDs, parameters or item IDs. \
+    Reuse command schemas already learned in this conversation; inspect the current project/state for live IDs. Discover only missing schemas in one targeted engine.commands query with filters:[related IDs/topics]; never enumerate the editor for each question. Never invent command IDs, parameters or item IDs. \
     All edits must use existing commands, and undo is available. Use video_frame to see the current Program or Source video; \
     it returns an actual rendered frame and its exact time, without moving the playhead. You see still frames, not live video or audio. \
-    Use filmcraft with engine.commands to discover commands and parameter descriptions; ui.menu.list lists frontend commands. \
+    Workflow map: project/sequence inspection and media/bin organization use project.*, sequence.* and file.import; timeline edits use timeline.* and sequence.*; looks use effects.* and color.*; graphics/text use graphics.*; captions use captions.*; delivery uses export.*. This map identifies command families, not executable parameter schemas. Reuse known schemas or discover the relevant family once. ui.menu.list lists frontend commands. \
     engine.execute takes {command,params}; query commands include project.inspect, sequence.inspect, state.inspect and history.list. \
     ui.inspect and ui.elements expose widget IDs; ui.click, ui.drag, ui.key, ui.type, ui.focus and ui.set operate the editor UI. \
     ui.panel.show/close, ui.timeline.hit/locate and ui.playback are also available. Params are JSON encoded in params_json. \
