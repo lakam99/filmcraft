@@ -1,4 +1,4 @@
-//! AAF and OMF: export → import round trips (no external oracle exists for these formats).
+//! AAF and OMF: export → import round trips. Native application acceptance is checked separately.
 
 use crate::support;
 
@@ -100,6 +100,45 @@ fn aaf_rt(p: &Project, s: ItemId, opts: &AafOptions) -> (Imported, Vec<filmcraft
 }
 
 #[test]
+fn trimmed_retimed_audio_covers_the_declared_clip() {
+    let rate = FrameRate::FPS_24;
+    for (speed, reverse) in [(0.5, false), (2.0, false), (-0.5, false), (1.0, true)] {
+        let mut p = Project::new("retimed");
+        let a = media(&mut p, "/media/sound.wav", false, true, rate);
+        let s = sequence(&mut p, "Audio", rate, false);
+        clip(&mut p, s, TrackKind::Audio, 0, a, 0..48, 100);
+        let c = &mut p.sequence_mut(s).unwrap().audio_tracks[0].items[0];
+        c.speed = speed;
+        c.reverse = reverse;
+        let needs = audio_needs(&p, s, &NeedOptions { handles: rate.tick_of(6), ..Default::default() });
+        let n = &needs[0];
+        let frames = (n.end - n.start).to_units_floor(48_000) as u64;
+        let essence = AudioEssence {
+            key: n.key,
+            channel: None,
+            start: n.start,
+            frames,
+            sample_rate: 48_000,
+            bits: 16,
+            channels: 2,
+            data: EssenceData::Embedded(vec![0; frames as usize * 4]),
+            effects_rendered: false,
+        };
+        let opts = AafOptions { media: MediaOptions { essence: vec![essence], ..Default::default() }, ..Default::default() };
+        let (bytes, report) = aaf::export(&p, s, &opts).unwrap();
+        assert!(report.mentions("clips play at 100%"));
+        let (got, extracted, _) = aaf::import(&bytes, &ImportOptions::default()).unwrap();
+        let c = &got.project.sequence(got.sequences[0]).unwrap().audio_tracks[0].items[0];
+        let wav = &extracted.iter().find(|e| e.item == c.item).unwrap().wav;
+        let (pcm, channels, sample_rate, bits) = filmcraft_interchange::wav::parse_wav(wav).unwrap();
+        let frames = pcm.len() / (usize::from(channels) * usize::from(bits / 8));
+        let duration = Tick::from_units(frames as i64, i64::from(sample_rate));
+        assert!(c.source_in + c.duration <= duration, "a receiving DAW must not have to truncate the declared clip: speed {speed}, reverse {reverse}");
+        assert_eq!((c.source_in, c.duration), (rate.tick_of(6), rate.tick_of(48)));
+    }
+}
+
+#[test]
 fn aaf_round_trip_preserves_the_edit() {
     for (rate, df) in [(FrameRate::FPS_25, false), (FrameRate::FPS_29_97, true), (FrameRate::FPS_23_976, false), (FrameRate::FPS_59_94, true)] {
         let (p, s) = sample(rate, df);
@@ -123,12 +162,18 @@ fn aaf_round_trip_preserves_the_edit() {
         assert!(close(level(&imp.project, n, 0, 1).value.as_f64().unwrap(), -6.0));
         let k = level(&imp.project, n, 1, 0);
         let want = level(&p, s, 1, 0);
-        assert_eq!(k.keyframes.len(), 3);
+        // The explicit end point holds the last value through the rest of the clip,
+        // before a receiving DAW resets its track automation for the next event.
+        assert_eq!(k.keyframes.len(), want.keyframes.len() + 1);
         for (a, b) in k.keyframes.iter().zip(&want.keyframes) {
             // control points are stored in samples: keyframes not on a sample move to the nearest one
             assert!((a.time - b.time).abs() <= Tick(filmcraft_time::TICKS_PER_SECOND / 48_000 / 2), "{rate:?}: {a:?} {b:?}");
             assert!(close(a.value.as_f64().unwrap(), b.value.as_f64().unwrap()), "{a:?} {b:?}");
         }
+        let end = k.keyframes.last().unwrap();
+        let clip = &q.audio_tracks[1].items[0];
+        assert!((end.time - (clip.source_in + clip.duration)).abs() <= Tick(filmcraft_time::TICKS_PER_SECOND / 48_000 / 2));
+        assert!(close(end.value.as_f64().unwrap(), want.keyframes.last().unwrap().value.as_f64().unwrap()));
         // media: paths, timecode, markers
         let a = imp
             .project

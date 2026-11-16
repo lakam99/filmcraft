@@ -5,6 +5,8 @@
 
 use super::store::Auid;
 
+pub(crate) const SOURCE_GROUP_TAG: &str = "FilmCraft Source Group";
+
 /// AUID of a SMPTE universal label: the label's last 8 bytes become Data1–Data3 (stored
 /// little-endian), its first 8 bytes Data4.
 pub(crate) const fn ul(b: [u8; 16]) -> Auid {
@@ -26,6 +28,9 @@ pub(crate) const fn class(xx: u8) -> Auid {
 
 /// The root object's class (the storage class of the file's root).
 pub(crate) const ROOT: Auid = guid(0xB3B398A5, 0x1C90, 0x11D4, [0x80, 0x53, 0x08, 0x00, 0x36, 0x21, 0x08, 0x04]);
+/// AAF Stored Format v1.0.1 §1.6 file-kind signatures. These identify the file, not its Root object.
+pub(crate) const FILE_SIGNATURE_V3: Auid = guid(0x42464141, 0x000D, 0x4D4F, [0x06, 0x0E, 0x2B, 0x34, 0x01, 0x01, 0x01, 0xFF]);
+pub(crate) const FILE_SIGNATURE_V4: Auid = guid(0x0D010201, 0x0200, 0, [0x06, 0x0E, 0x2B, 0x34, 0x03, 0x02, 0x01, 0x01]);
 /// The meta-dictionary (class 0x25 of the meta-model, 06.0E.2B.34.02.06.01.01.0D.01.01.01.02.25.00.00).
 pub(crate) const META_DICTIONARY: Auid = meta_class(0x25);
 
@@ -77,6 +82,7 @@ pub(crate) mod cls {
     pub const DATA_DEFINITION: Auid = class(0x1B);
     pub const OPERATION_DEFINITION: Auid = class(0x1C);
     pub const PARAMETER_DEFINITION: Auid = class(0x1D);
+    pub const CODEC_DEFINITION: Auid = class(0x1F);
     pub const CONTAINER_DEFINITION: Auid = class(0x20);
     pub const INTERPOLATION_DEFINITION: Auid = class(0x21);
     pub const DICTIONARY: Auid = class(0x22);
@@ -167,6 +173,11 @@ pub(crate) mod pid {
     pub const OPERATION_DEFINITIONS: u16 = 0x2603;
     pub const PARAMETER_DEFINITIONS: u16 = 0x2604;
     pub const DATA_DEFINITIONS: u16 = 0x2605;
+    pub const CODEC_DEFINITIONS: u16 = 0x2607;
+    pub const CODEC_DESCRIPTOR_CLASS: u16 = 0x2301;
+    pub const CODEC_DATA_DEFINITIONS: u16 = 0x2302;
+    pub const CODEC: u16 = 0x3005;
+    pub const WAVE_SUMMARY: u16 = 0x3801;
     pub const CONTAINER_DEFINITIONS: u16 = 0x2608;
     pub const INTERPOLATION_DEFINITIONS: u16 = 0x2609;
     // DefinitionObject
@@ -287,7 +298,8 @@ pub(crate) mod def {
     pub const SMPTE_VIDEO_WIPE: Auid = guid(0x0C3BEA43, 0xFC05, 0x11D2, AV);
     pub const MONO_AUDIO_DISSOLVE: Auid = guid(0x0C3BEA44, 0xFC05, 0x11D2, AV);
     const AG: [u8; 8] = [0x8A, 0x38, 0x00, 0x50, 0x04, 0x0E, 0xF7, 0xD2];
-    pub const MONO_AUDIO_GAIN: Auid = guid(0x9D2EA893, 0x0968, 0x11D3, AG);
+    pub const MONO_AUDIO_GAIN: Auid = guid(0x9D2EA894, 0x0968, 0x11D3, AG);
+    pub const MONO_AUDIO_PAN: Auid = guid(0x9D2EA893, 0x0968, 0x11D3, AG);
     const PD: [u8; 8] = [0x8A, 0x4C, 0x00, 0x50, 0x04, 0x0E, 0xF7, 0xD2];
     pub const PARAM_LEVEL: Auid = guid(0xE4962320, 0x2267, 0x11D3, PD);
     pub const PARAM_AMPLITUDE: Auid = guid(0xE4962321, 0x2267, 0x11D3, PD);
@@ -297,6 +309,7 @@ pub(crate) mod def {
     const CD: [u8; 8] = [0x80, 0x9B, 0x00, 0x60, 0x08, 0x14, 0x3E, 0x6F];
     pub const CONTAINER_AAF: Auid = guid(0x4313B571, 0xD8BA, 0x11D2, CD);
     pub const CONTAINER_EXTERNAL: Auid = guid(0x4313B572, 0xD8BA, 0x11D2, CD);
+    pub const CODEC_WAVE: Auid = guid(0x820F09B1, 0xEB9B, 0x11D2, [0x80, 0x9F, 0x00, 0x60, 0x08, 0x14, 0x3E, 0x6F]);
     /// Type ids of indirect values (SMPTE RP 210 type labels).
     pub const TYPE_RATIONAL: Auid = super::ul([0x06, 0x0E, 0x2B, 0x34, 0x01, 0x04, 0x01, 0x01, 0x03, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
     pub const TYPE_STRING: Auid = super::ul([0x06, 0x0E, 0x2B, 0x34, 0x01, 0x04, 0x01, 0x01, 0x01, 0x10, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00]);
@@ -317,6 +330,7 @@ pub(crate) mod path {
     pub const PARAMETER_DEFS: [u16; 3] = [pid::ROOT_HEADER, pid::DICTIONARY, pid::PARAMETER_DEFINITIONS];
     pub const INTERPOLATION_DEFS: [u16; 3] = [pid::ROOT_HEADER, pid::DICTIONARY, pid::INTERPOLATION_DEFINITIONS];
     pub const CONTAINER_DEFS: [u16; 3] = [pid::ROOT_HEADER, pid::DICTIONARY, pid::CONTAINER_DEFINITIONS];
+    pub const CODEC_DEFS: [u16; 3] = [pid::ROOT_HEADER, pid::DICTIONARY, pid::CODEC_DEFINITIONS];
     pub const META_CLASSES: [u16; 2] = [pid::ROOT_META_DICTIONARY, pid::META_CLASS_DEFINITIONS];
     pub const META_TYPES: [u16; 2] = [pid::ROOT_META_DICTIONARY, pid::META_TYPE_DEFINITIONS];
 }

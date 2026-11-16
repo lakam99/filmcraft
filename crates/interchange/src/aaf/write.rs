@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use filmcraft_time::{FrameRate, Tick};
 
-use super::ids::{ROOT, cls, ddef, def, path, pid};
+use super::ids::{ROOT, SOURCE_GROUP_TAG, cls, ddef, def, path, pid};
 use super::store::{self, Auid, Obj, Value, rational, utf16z};
 use crate::comp::{CItem, CKind, CMarker, Composition, Document, Gain, Source, ticks_to_units};
 use crate::{Error, Report, Result};
@@ -45,6 +45,12 @@ fn weak(path: [u16; 3], key: Auid) -> Value {
     Value::Weak(path.to_vec(), pid::IDENTIFICATION, key.to_vec())
 }
 
+fn parameters(values: Vec<Obj>) -> Value {
+    // The SDK enumerates a stored set even though the baseline model declares a
+    // vector. Writing a vector silently hides all gain/transition parameters.
+    Value::StrongSet(values, pid::PARAMETER_DEFINITION)
+}
+
 fn data_def(kind: CKind) -> Auid {
     match kind {
         CKind::Picture => ddef::PICTURE,
@@ -65,11 +71,126 @@ fn tagged(name: &str, value: &str) -> Obj {
 }
 
 fn gain_rational(g: f64) -> Vec<u8> {
-    rational((g.max(0.0) * 65536.0).round().min(i32::MAX as f64) as i64, 65536)
+    rational(i64::from(gain_numerator(g)), 65536)
 }
 
 fn definition(class: Auid, id: Auid, name: &str) -> Obj {
     Obj::new(class).data_prop(pid::IDENTIFICATION, id.to_vec()).data_prop(pid::NAME, utf16z(name)).data_prop(pid::DESCRIPTION, utf16z(""))
+}
+
+struct GainTiming {
+    cursor: Tick,
+    length: Tick,
+    units: i64,
+    rate: (i64, i64),
+    track_curve: bool,
+}
+
+fn gain_numerator(gain: f64) -> u32 {
+    (gain.max(0.0) * 65536.0).round().min(i32::MAX as f64) as u32
+}
+
+fn scaled_gain_rational(gain: f64, scale: u32) -> Vec<u8> {
+    // Bound the denominator to Int32 while retaining the original Q16 numerator.
+    // A factor of 16384 keeps even the largest representable gain curve below +6.1 dB.
+    rational(i64::from(gain_numerator(gain)), 65536 * i64::from(scale.clamp(1, 16384)))
+}
+
+fn gain_at(points: &[(Tick, f64)], linear: bool, time: Tick) -> f64 {
+    let Some(&(first_time, first_value)) = points.first() else { return 1.0 };
+    if time < first_time {
+        return first_value;
+    }
+    let mut previous = (first_time, first_value);
+    for &(next_time, next_value) in points.iter().skip(1) {
+        if time < next_time {
+            if !linear || next_time <= previous.0 {
+                return previous.1;
+            }
+            let numerator = i128::from(time.0) - i128::from(previous.0.0);
+            let denominator = i128::from(next_time.0) - i128::from(previous.0.0);
+            return previous.1 + (next_value - previous.1) * (numerator as f64 / denominator as f64);
+        }
+        previous = (next_time, next_value);
+    }
+    previous.1
+}
+
+fn visible_gain_points(points: &[(Tick, f64)], linear: bool, length: Tick) -> Vec<(Tick, f64)> {
+    let mut sorted: Vec<_> = points.iter().map(|(t, a)| (*t, f64::from(gain_numerator(*a)) / 65536.0)).collect();
+    sorted.sort_by_key(|p| p.0);
+    let end = length.max(Tick::ZERO);
+    let mut visible = vec![(Tick::ZERO, gain_at(&sorted, linear, Tick::ZERO))];
+    visible.extend(sorted.iter().copied().filter(|p| p.0 > Tick::ZERO && p.0 < end));
+    if end > Tick::ZERO {
+        visible.push((end, gain_at(&sorted, linear, end)));
+    }
+    visible
+}
+
+fn gain_group(input: Obj, parameter: Obj, length: i64) -> Obj {
+    Obj::new(cls::OPERATION_GROUP)
+        .with(pid::DATA_DEFINITION, weak(path::DATA_DEFS, ddef::SOUND))
+        .data_prop(pid::LENGTH, length.to_le_bytes().to_vec())
+        .with(pid::OPERATION, weak(path::OPERATION_DEFS, def::MONO_AUDIO_GAIN))
+        .with(pid::INPUT_SEGMENTS, Value::StrongVec(vec![input]))
+        .with(pid::PARAMETERS, parameters(vec![parameter]))
+}
+
+fn constant_gain_parameter(gain: f64) -> Obj {
+    Obj::new(cls::CONSTANT_VALUE)
+        .data_prop(pid::PARAMETER_DEFINITION, def::PARAM_AMPLITUDE.to_vec())
+        .data_prop(pid::CONSTANT_VALUE, indirect(def::TYPE_RATIONAL, &gain_rational(gain)))
+}
+
+fn audio_gain(input: Obj, gain: Option<&Gain>, timing: GainTiming, w: &mut W<'_>) -> (Obj, bool) {
+    let (mut base, linear, mut points) = match gain {
+        Some(Gain::Constant(value)) => (*value, true, None),
+        Some(Gain::Varying { linear, points }) => (1.0, *linear, Some(visible_gain_points(points, *linear, timing.length))),
+        None => (1.0, true, None),
+    };
+    if let Some(curve) = &points
+        && let Some(first) = curve.first()
+        && curve.iter().all(|p| gain_numerator(p.1) == gain_numerator(first.1))
+    {
+        base = first.1;
+        points = None;
+    }
+    if points.is_none() && !timing.track_curve {
+        return (gain_group(input, constant_gain_parameter(base), timing.units), false);
+    }
+    let scale = points.as_ref().map(|p| p.iter().map(|p| gain_numerator(p.1)).max().unwrap_or(65536).div_ceil(65536).clamp(1, 16384)).unwrap_or(1);
+    let curve = match points {
+        Some(points) => {
+            base = f64::from(scale);
+            points
+        }
+        None => vec![(Tick::ZERO, 1.0), (timing.length.max(Tick::ZERO), 1.0)],
+    };
+    let origin = w.u(timing.cursor, timing.rate);
+    let control_points = curve
+        .into_iter()
+        .map(|(offset, amplitude)| {
+            let time = w.u(timing.cursor + offset, timing.rate) - origin;
+            // Hosts may sum floating-point clip durations differently from their starts.
+            // Keep the held final value just inside this clip so it cannot sort after
+            // the next clip's start and overwrite that clip's automation.
+            let point_time =
+                if time >= timing.units.max(1) { rational(i64::from(i32::MAX) - 1, i64::from(i32::MAX)) } else { rational(time.max(0), timing.units.max(1)) };
+            Obj::new(cls::CONTROL_POINT)
+                .data_prop(pid::CP_TIME, point_time)
+                .data_prop(pid::CP_VALUE, indirect(def::TYPE_RATIONAL, &scaled_gain_rational(amplitude, scale)))
+                .data_prop(pid::CP_EDIT_HINT, vec![0])
+        })
+        .collect();
+    let parameter = Obj::new(cls::VARYING_VALUE)
+        .data_prop(pid::PARAMETER_DEFINITION, def::PARAM_AMPLITUDE.to_vec())
+        .with(pid::INTERPOLATION, weak(path::INTERPOLATION_DEFS, if linear { def::INTERP_LINEAR } else { def::INTERP_CONSTANT }))
+        .with(pid::POINT_LIST, Value::StrongVec(control_points));
+    let segment = gain_group(input, parameter, timing.units);
+    // The product is the original clip gain. Normalizing the curve prevents native
+    // track-fader clipping; unity curves on static neighbors prevent automation leaking.
+    (if base == 1.0 { segment } else { gain_group(segment, constant_gain_parameter(base), timing.units) }, true)
 }
 
 struct W<'a> {
@@ -104,7 +225,7 @@ struct MediaOutput {
     master_ref: HashMap<usize, ([u8; 32], u32)>,
 }
 
-type FileMob = ((Option<String>, usize, CKind), [u8; 32], Vec<Obj>, usize);
+type FileMob = ((String, Option<String>, usize, CKind), [u8; 32], Vec<Obj>, usize);
 
 struct GroupSlots {
     master_id: [u8; 32],
@@ -112,7 +233,6 @@ struct GroupSlots {
     timecode: Option<(i64, filmcraft_time::FrameRate)>,
     master_slots: Vec<Obj>,
     tape_slots: Vec<Obj>,
-    files: Vec<FileMob>,
     master_ref: HashMap<usize, ([u8; 32], u32)>,
 }
 
@@ -156,47 +276,56 @@ fn source_rate(s: &Source) -> (i64, i64) {
     }
 }
 
-fn write_media(doc: &Document, w: &mut W<'_>, ids: &mut IdGen) -> MediaOutput {
-    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+fn write_media(doc: &Document, w: &mut W<'_>, ids: &mut IdGen) -> Result<MediaOutput> {
+    type MasterKey = (String, CKind, Option<String>, Option<u32>);
+    let mut groups: Vec<(MasterKey, Vec<usize>)> = Vec::new();
     for (index, source) in doc.sources.iter().enumerate() {
         if source.nested.is_some() {
             continue;
         }
-        match groups.iter_mut().find(|(key, _)| *key == source.key) {
+        // Some importers resolve the first source in a master, ignoring the requested
+        // slot. Isolate essence files and exposed channels as well as media kinds,
+        // so split audio never resolves to a picture or to the first audio channel.
+        let key = (source.key.clone(), source.kind, source.path.clone(), source.channel);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, members)) => members.push(index),
-            None => groups.push((source.key.clone(), vec![index])),
+            None => groups.push((key, vec![index])),
         }
     }
 
     let mut output = MediaOutput { mobs: Vec::new(), essence: Vec::new(), master_ref: HashMap::new() };
+    let mut files = Vec::new();
     for (_, members) in groups {
-        write_source_group(doc, &members, w, ids, &mut output);
+        write_source_group(doc, &members, w, ids, &mut files, &mut output);
     }
-    output
+    add_file_mobs(doc, files, w, &mut output)?;
+    Ok(output)
 }
 
-fn write_source_group(doc: &Document, members: &[usize], w: &mut W<'_>, ids: &mut IdGen, output: &mut MediaOutput) {
+fn write_source_group(doc: &Document, members: &[usize], w: &mut W<'_>, ids: &mut IdGen, files: &mut Vec<FileMob>, output: &mut MediaOutput) {
     let first = &doc.sources[members[0]];
-    let slots = build_group_slots(doc, members, w, ids);
+    let slots = build_group_slots(doc, members, w, ids, files);
     output.master_ref.extend(slots.master_ref);
     let mut master_slots = slots.master_slots;
     add_master_markers(doc, members, w, &mut master_slots);
-    output.mobs.push(
-        Obj::new(cls::MASTER_MOB)
-            .data_prop(pid::MOB_ID, slots.master_id.to_vec())
-            .data_prop(pid::MOB_NAME, utf16z(&first.name))
-            .data_prop(pid::MOB_LAST_MODIFIED, timestamp())
-            .data_prop(pid::MOB_CREATION_TIME, timestamp())
-            .with(pid::SLOTS, Value::StrongVec(master_slots)),
-    );
+    let mut master = Obj::new(cls::MASTER_MOB)
+        .data_prop(pid::MOB_ID, slots.master_id.to_vec())
+        .data_prop(pid::MOB_NAME, utf16z(&first.name))
+        .data_prop(pid::MOB_LAST_MODIFIED, timestamp())
+        .data_prop(pid::MOB_CREATION_TIME, timestamp())
+        .with(pid::SLOTS, Value::StrongVec(master_slots));
+    if doc.sources.iter().any(|s| s.nested.is_none() && s.key == first.key && (s.kind != first.kind || s.path != first.path || s.channel != first.channel)) {
+        // Rejoin the original media identity when FilmCraft imports the split masters.
+        master.set(pid::MOB_USER_COMMENTS, Value::StrongVec(vec![tagged(SOURCE_GROUP_TAG, &first.key)]));
+    }
+    output.mobs.push(master);
     let tape_id = slots.tape_id;
     let timecode = slots.timecode;
     let tape_slots = slots.tape_slots;
-    add_file_mobs(doc, slots.files, w, output);
     add_tape_mob(first, tape_id, timecode, tape_slots, output);
 }
 
-fn build_group_slots(doc: &Document, members: &[usize], w: &mut W<'_>, ids: &mut IdGen) -> GroupSlots {
+fn build_group_slots(doc: &Document, members: &[usize], w: &mut W<'_>, ids: &mut IdGen, files: &mut Vec<FileMob>) -> GroupSlots {
     let master_id = ids.next();
     let tape_id = ids.next();
     let timecode = members.iter().find_map(|&i| doc.sources[i].start_tc.map(|t| (t, doc.sources[i].tc_rate)));
@@ -204,23 +333,14 @@ fn build_group_slots(doc: &Document, members: &[usize], w: &mut W<'_>, ids: &mut
     if let Some((start, rate)) = timecode {
         tape_slots.push(timecode_slot(members, doc, w, start, rate));
     }
-    let mut files: Vec<FileMob> = Vec::new();
     let mut master_slots = Vec::new();
     let mut master_ref = HashMap::new();
-    let mut builder = GroupSlotBuilder {
-        doc,
-        master_id,
-        tape_id,
-        ids,
-        files: &mut files,
-        master_slots: &mut master_slots,
-        tape_slots: &mut tape_slots,
-        master_ref: &mut master_ref,
-    };
+    let mut builder =
+        GroupSlotBuilder { doc, master_id, tape_id, ids, files, master_slots: &mut master_slots, tape_slots: &mut tape_slots, master_ref: &mut master_ref };
     for (member_index, &source_index) in members.iter().enumerate() {
         builder.add_source(source_index, member_index, timecode.is_some(), w);
     }
-    GroupSlots { master_id, tape_id, timecode, master_slots, tape_slots, files, master_ref }
+    GroupSlots { master_id, tape_id, timecode, master_slots, tape_slots, master_ref }
 }
 
 fn timecode_slot(members: &[usize], doc: &Document, w: &mut W<'_>, start: i64, rate: FrameRate) -> Obj {
@@ -246,7 +366,7 @@ impl GroupSlotBuilder<'_, '_> {
         let source = &self.doc.sources[source_index];
         let rate = source_rate(source);
         let embedded_key = if source.embedded.is_some() { source_index } else { usize::MAX };
-        let file_key = (source.path.clone(), embedded_key, source.kind);
+        let file_key = (source.key.clone(), source.path.clone(), embedded_key, source.kind);
         let file_slot = source.channel.map_or(1, |channel| channel + 1);
         let len_units = w.u(source.length, rate);
         let file_index = match self.files.iter().position(|file| file.0 == file_key) {
@@ -314,10 +434,10 @@ fn add_master_markers(doc: &Document, members: &[usize], w: &mut W<'_>, master_s
     master_slots.push(event_slot(w, members.len() as u32 + 1, marker_rate, &unique));
 }
 
-fn add_file_mobs(doc: &Document, files: Vec<FileMob>, w: &mut W<'_>, output: &mut MediaOutput) {
+fn add_file_mobs(doc: &Document, files: Vec<FileMob>, w: &mut W<'_>, output: &mut MediaOutput) -> Result<()> {
     for (_, file_id, slots, source_index) in files {
         let source = &doc.sources[source_index];
-        let desc = descriptor(w, source);
+        let desc = descriptor(w, source)?;
         output.mobs.push(
             Obj::new(cls::SOURCE_MOB)
                 .data_prop(pid::MOB_ID, file_id.to_vec())
@@ -333,6 +453,7 @@ fn add_file_mobs(doc: &Document, files: Vec<FileMob>, w: &mut W<'_>, output: &mu
                 .push(Obj::new(cls::ESSENCE_DATA).data_prop(pid::ESSENCE_MOB_ID, file_id.to_vec()).with(pid::ESSENCE_STREAM, Value::Stream(data.clone())));
         }
     }
+    Ok(())
 }
 
 fn add_tape_mob(first: &Source, tape_id: [u8; 32], timecode: Option<(i64, FrameRate)>, tape_slots: Vec<Obj>, output: &mut MediaOutput) {
@@ -354,7 +475,7 @@ pub(crate) fn write(doc: &Document, version: filmcraft_cfb::Version, report: &mu
     let comp = doc.compositions.first().ok_or(Error::Empty)?;
     let mut w = W { report, inexact: false };
     let mut ids = IdGen::for_document(doc, comp);
-    let MediaOutput { mut mobs, essence, master_ref } = write_media(doc, &mut w, &mut ids);
+    let MediaOutput { mut mobs, essence, master_ref } = write_media(doc, &mut w, &mut ids)?;
     let mut used_ops: Vec<Auid> = Vec::new();
     let mut uses_varying = false;
 
@@ -441,6 +562,12 @@ pub(crate) fn write(doc: &Document, version: filmcraft_cfb::Version, report: &mu
         .with(pid::DATA_DEFINITIONS, Value::StrongSet(ddefs, pid::IDENTIFICATION))
         .with(pid::PARAMETER_DEFINITIONS, Value::StrongSet(pdefs, pid::IDENTIFICATION))
         .with(pid::CONTAINER_DEFINITIONS, Value::StrongSet(cdefs, pid::IDENTIFICATION));
+    if doc.sources.iter().any(is_wave_file) {
+        let codec = definition(cls::CODEC_DEFINITION, def::CODEC_WAVE, "WAVE")
+            .with(pid::CODEC_DESCRIPTOR_CLASS, Value::Weak(path::META_CLASSES.to_vec(), pid::META_IDENTIFICATION, cls::WAVE_DESCRIPTOR.to_vec()))
+            .with(pid::CODEC_DATA_DEFINITIONS, Value::WeakVec(path::DATA_DEFS.to_vec(), pid::IDENTIFICATION, vec![ddef::SOUND.to_vec()]));
+        dict.set(pid::CODEC_DEFINITIONS, Value::StrongSet(vec![codec], pid::IDENTIFICATION));
+    }
     if !opdefs.is_empty() {
         dict.set(pid::OPERATION_DEFINITIONS, Value::StrongSet(opdefs, pid::IDENTIFICATION));
     }
@@ -536,6 +663,8 @@ impl CompositionWriter<'_, '_, '_> {
                 CKind::Sound => (comp.sample_rate.max(1) as i64, 1),
             };
             let dd = data_def(t.kind);
+            let track_curve =
+                t.kind == CKind::Sound && t.items.iter().any(|item| matches!(item, CItem::Clip(c) if matches!(c.gain, Some(Gain::Varying { .. }))));
             let mut comps = Vec::new();
             let mut cursor = Tick::ZERO;
             for it in &t.items {
@@ -556,44 +685,16 @@ impl CompositionWriter<'_, '_, '_> {
                         if !c.name.is_empty() && c.name != s.name {
                             sc.set(pid::COMPONENT_USER_COMMENTS, Value::StrongVec(vec![tagged("Clip Name", &c.name)]));
                         }
-                        let seg = match (&c.gain, t.kind) {
-                            (Some(g), CKind::Sound) => {
-                                if !used_ops.contains(&def::MONO_AUDIO_GAIN) {
-                                    used_ops.push(def::MONO_AUDIO_GAIN);
-                                }
-                                let param = match g {
-                                    Gain::Constant(a) => Obj::new(cls::CONSTANT_VALUE)
-                                        .data_prop(pid::PARAMETER_DEFINITION, def::PARAM_AMPLITUDE.to_vec())
-                                        .data_prop(pid::CONSTANT_VALUE, indirect(def::TYPE_RATIONAL, &gain_rational(*a))),
-                                    Gain::Varying { linear, points } => {
-                                        *uses_varying = true;
-                                        let pts = points
-                                            .iter()
-                                            .map(|(off, a)| {
-                                                let o = w.u(cursor + *off, rate) - w.u(cursor, rate);
-                                                Obj::new(cls::CONTROL_POINT)
-                                                    .data_prop(pid::CP_TIME, rational(o, n.max(1)))
-                                                    .data_prop(pid::CP_VALUE, indirect(def::TYPE_RATIONAL, &gain_rational(*a)))
-                                                    .data_prop(pid::CP_EDIT_HINT, vec![0])
-                                            })
-                                            .collect();
-                                        Obj::new(cls::VARYING_VALUE)
-                                            .data_prop(pid::PARAMETER_DEFINITION, def::PARAM_AMPLITUDE.to_vec())
-                                            .with(
-                                                pid::INTERPOLATION,
-                                                weak(path::INTERPOLATION_DEFS, if *linear { def::INTERP_LINEAR } else { def::INTERP_CONSTANT }),
-                                            )
-                                            .with(pid::POINT_LIST, Value::StrongVec(pts))
-                                    }
-                                };
-                                Obj::new(cls::OPERATION_GROUP)
-                                    .with(pid::DATA_DEFINITION, weak(path::DATA_DEFS, dd))
-                                    .data_prop(pid::LENGTH, n.to_le_bytes().to_vec())
-                                    .with(pid::OPERATION, weak(path::OPERATION_DEFS, def::MONO_AUDIO_GAIN))
-                                    .with(pid::INPUT_SEGMENTS, Value::StrongVec(vec![sc]))
-                                    .with(pid::PARAMETERS, Value::StrongVec(vec![param]))
+                        let seg = if t.kind == CKind::Sound && (c.gain.is_some() || track_curve) {
+                            if !used_ops.contains(&def::MONO_AUDIO_GAIN) {
+                                used_ops.push(def::MONO_AUDIO_GAIN);
                             }
-                            _ => sc,
+                            let timing = GainTiming { cursor, length: c.len, units: n, rate, track_curve };
+                            let (segment, varying) = audio_gain(sc, c.gain.as_ref(), timing, w);
+                            *uses_varying |= varying;
+                            segment
+                        } else {
+                            sc
                         };
                         comps.push(seg);
                         cursor += c.len;
@@ -625,7 +726,7 @@ impl CompositionWriter<'_, '_, '_> {
                                 .collect();
                             og.set(
                                 pid::PARAMETERS,
-                                Value::StrongVec(vec![
+                                parameters(vec![
                                     Obj::new(cls::VARYING_VALUE)
                                         .data_prop(pid::PARAMETER_DEFINITION, def::PARAM_LEVEL.to_vec())
                                         .with(pid::INTERPOLATION, weak(path::INTERPOLATION_DEFS, def::INTERP_LINEAR))
@@ -752,7 +853,13 @@ fn transition_op(kind: CKind, effect: &str) -> Auid {
     }
 }
 
-fn descriptor(w: &mut W, s: &Source) -> Obj {
+fn is_wave_file(s: &Source) -> bool {
+    s.kind == CKind::Sound
+        && s.wave_format.is_some()
+        && s.path.as_deref().is_some_and(|p| p.rsplit('.').next().is_some_and(|ext| ext.eq_ignore_ascii_case("wav")))
+}
+
+fn descriptor(w: &mut W, s: &Source) -> Result<Obj> {
     let rate = source_rate(s);
     let len = w.u(s.length, rate);
     let container = if s.embedded.is_some() { def::CONTAINER_AAF } else { def::CONTAINER_EXTERNAL };
@@ -767,6 +874,27 @@ fn descriptor(w: &mut W, s: &Source) -> Obj {
             .data_prop(pid::VIDEO_LINE_MAP, 0i32.to_le_bytes().to_vec())
             .data_prop(pid::COMPONENT_WIDTH, 8u32.to_le_bytes().to_vec())
             .data_prop(pid::HORIZONTAL_SUBSAMPLING, 2u32.to_le_bytes().to_vec()),
+        CKind::Sound if is_wave_file(s) => {
+            let channels = u16::try_from(s.file_channels.max(1)).map_err(|_| Error::Other("too many WAVE channels".into()))?;
+            let valid_bits = if s.wave_format == Some(3) { matches!(s.bits, 32 | 64) } else { matches!(s.bits, 8 | 16 | 24 | 32) };
+            if !valid_bits || channels.checked_mul(s.bits.div_ceil(8)).and_then(|b| u32::from(b).checked_mul(s.sample_rate)).is_none() {
+                return Err(Error::Other("WAVE sample format exceeds the container's limits".into()));
+            }
+            let bytes = u64::try_from(len)
+                .ok()
+                .and_then(|n| n.checked_mul(u64::from(channels)))
+                .and_then(|n| n.checked_mul(u64::from(s.bits.div_ceil(8))))
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n <= u32::MAX - 37)
+                .ok_or_else(|| Error::Other("WAVE essence exceeds the RIFF size limit".into()))?;
+            let mut summary = crate::wav::wav_header(bytes, channels, s.sample_rate, s.bits);
+            if s.wave_format == Some(3)
+                && let Some(tag) = summary.get_mut(20..22)
+            {
+                tag.copy_from_slice(&3u16.to_le_bytes());
+            }
+            Obj::new(cls::WAVE_DESCRIPTOR).data_prop(pid::WAVE_SUMMARY, summary).with(pid::CODEC, weak(path::CODEC_DEFS, def::CODEC_WAVE))
+        }
         CKind::Sound => {
             // Channel counts and rates come from the project: saturate, as these fields can't
             // hold more anyway.
@@ -787,5 +915,5 @@ fn descriptor(w: &mut W, s: &Source) -> Obj {
         let url = if crate::common::is_absolute(p) { crate::common::path_to_file_url(p, false) } else { p.clone() };
         d.set(pid::LOCATOR, Value::StrongVec(vec![Obj::new(cls::NETWORK_LOCATOR).data_prop(pid::URL_STRING, utf16z(&url))]));
     }
-    d
+    Ok(d)
 }

@@ -155,6 +155,8 @@ pub(crate) struct Source {
     pub frame_rate: FrameRate,
     pub sample_rate: u32,
     pub bits: u16,
+    /// WAVE format tag when the source encoding is known (1: integer PCM, 3: float).
+    pub wave_format: Option<u16>,
     pub length: Tick,
     /// Media time of the essence's time 0 (trimmed / consolidated essence).
     pub offset: Tick,
@@ -255,6 +257,7 @@ impl Exporter<'_> {
                     frame_rate: rate,
                     sample_rate: 0,
                     bits: 0,
+                    wave_format: None,
                     length: mix.duration,
                     offset: Tick::ZERO,
                     start_tc: Some(seq.start_timecode + rate.frame_at(mix.start)),
@@ -329,6 +332,7 @@ impl Exporter<'_> {
                 frame_rate: self.seq_rate,
                 sample_rate: e.sample_rate.max(1),
                 bits: e.bits,
+                wave_format: Some(1),
                 length: Tick::from_units(e.frames as i64, e.sample_rate.max(1) as i64),
                 offset: e.start,
                 start_tc: None,
@@ -385,6 +389,7 @@ impl Exporter<'_> {
             frame_rate: comp.rate,
             sample_rate: comp.sample_rate.max(1),
             bits: 16,
+            wave_format: None,
             length: nested.duration(),
             offset: Tick::ZERO,
             start_tc: None,
@@ -474,7 +479,18 @@ impl Exporter<'_> {
             height: video.map_or(0, |v| v.height),
             frame_rate,
             sample_rate: audio.map_or(48_000, |a| a.sample_rate.max(1)),
-            bits: audio.and_then(|a| a.bits_per_sample).unwrap_or(16).clamp(8, 32) as u16,
+            bits: audio.and_then(|a| a.bits_per_sample).unwrap_or(16).clamp(8, 64) as u16,
+            wave_format: audio.and_then(|a| {
+                // Native probes use display labels; older projects may contain codec IDs.
+                let codec = a.codec.to_ascii_lowercase();
+                if codec == "pcm float" || codec.starts_with("pcm_f") || (codec.starts_with("pcm ") && codec.ends_with("-bit float")) {
+                    Some(3)
+                } else if codec == "pcm" || codec.starts_with("pcm_") || (codec.starts_with("pcm ") && codec.ends_with("-bit")) {
+                    Some(1)
+                } else {
+                    None
+                }
+            }),
             length: if still { Tick::ZERO } else { m.info.duration },
             offset: Tick::ZERO,
             start_tc: m.info.start_timecode,
@@ -489,6 +505,7 @@ impl Exporter<'_> {
             if let Some(e) = ess {
                 s.sample_rate = e.sample_rate.max(1);
                 s.bits = e.bits;
+                s.wave_format = Some(1);
                 s.file_channels = e.channels.max(1);
                 // per-channel essence is a mono file: its only channel
                 if e.channel.is_some() {

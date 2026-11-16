@@ -149,7 +149,7 @@ fn assert_required_properties(o: &Obj, classes: &HashMap<Vec<u8>, &Obj>) {
         for prop in class.objs(pid::CLASS_PROPERTIES) {
             if prop.u8(pid::PROPERTY_IS_OPTIONAL) == Some(0) {
                 let local = prop.u16(pid::PROPERTY_LOCAL_ID).unwrap();
-                assert!(o.get(local).is_some(), "required property {local:#06x} of {:?}", class.string(pid::META_NAME));
+                assert!(local == 0x0101 || o.get(local).is_some(), "required property {local:#06x} of {:?}", class.string(pid::META_NAME));
             }
         }
         let parent = weak_target(class.get(pid::CLASS_PARENT), path::META_CLASSES);
@@ -194,7 +194,7 @@ fn the_meta_dictionary_holds_the_class_model_of_the_file() {
                 at = weak_target(classes[&at].get(pid::CLASS_PARENT), path::META_CLASSES);
                 assert!(classes.contains_key(&at), "parent of {id:02x?}");
             }
-            assert!(at == interchange_object || at == meta_definition);
+            assert!(at == interchange_object || at == meta_definition || at == ids::META_DICTIONARY);
             for prop in c.objs(pid::CLASS_PROPERTIES) {
                 assert_eq!(prop.class, ids::meta::PROPERTY_DEFINITION);
                 assert!(types.contains_key(prop.data(pid::PROPERTY_TYPE).unwrap()), "type of {:?}", prop.string(pid::META_NAME));
@@ -217,6 +217,7 @@ fn the_meta_dictionary_holds_the_class_model_of_the_file() {
         let header = root.strong(pid::ROOT_HEADER).unwrap();
         let mut all = Vec::new();
         walk(header, &mut all);
+        walk(meta, &mut all);
         let mut used = HashSet::new();
         for o in all {
             used.insert(o.class);
@@ -235,6 +236,35 @@ fn the_meta_dictionary_holds_the_class_model_of_the_file() {
             }
         }
     }
+}
+
+/// AAF Stored Format §1.6 defines a file-kind signature for each sector size. This is not
+/// the Root object's CLSID: generic compound-file readers can open files without this marker,
+/// masking the defect from a round trip while an AAF file-type recognizer rejects the file.
+fn assert_file_kind_signature(small_sectors: bool) {
+    let (p, s) = project();
+    let bytes = export(&p, s, &AafOptions { small_sectors, ..Default::default() }).unwrap().0;
+    let expected = if small_sectors {
+        ids::guid(0x42464141, 0x000D, 0x4D4F, [6, 14, 43, 52, 1, 1, 1, 255])
+    } else {
+        ids::guid(0x0D010201, 0x0200, 0, [6, 14, 43, 52, 3, 2, 1, 1])
+    };
+    assert_eq!(bytes.get(8..24).unwrap(), expected, "AAF file-kind signature, small sectors = {small_sectors}");
+    let cf = filmcraft_cfb::CompoundFile::open(&bytes).unwrap();
+    assert_eq!(cf.version, if small_sectors { 3 } else { 4 });
+    assert_eq!(cf.root().clsid, ids::ROOT, "the object root retains its own class");
+    assert_ne!(expected, ids::ROOT);
+    assert!(sniff(&bytes));
+}
+
+#[test]
+fn file_kind_signature_for_512_byte_sectors() {
+    assert_file_kind_signature(true);
+}
+
+#[test]
+fn file_kind_signature_for_4096_byte_sectors() {
+    assert_file_kind_signature(false);
 }
 
 #[test]
@@ -279,6 +309,310 @@ fn embedded_essence_is_stored_as_an_opaque_stream() {
             assert!(found);
             assert_eq!(cf.read_path(&format!("{path}/Data-2702")).unwrap(), e.stream(pid::ESSENCE_STREAM).unwrap());
         }
+    }
+}
+
+#[test]
+fn audio_and_picture_use_distinct_masters_without_losing_source_identity() {
+    let (p, s) = project();
+    let bytes = export(&p, s, &AafOptions::default()).unwrap().0;
+    let root = store::read(&bytes).unwrap();
+    let content = root.strong(pid::ROOT_HEADER).unwrap().strong(pid::CONTENT).unwrap();
+    let masters: Vec<_> = content.objs(pid::MOBS).iter().filter(|m| m.class == cls::MASTER_MOB).collect();
+    assert_eq!(masters.len(), 2, "a first-slot reader must resolve the right media kind");
+    for master in masters {
+        let kinds: HashSet<_> = master
+            .objs(pid::SLOTS)
+            .iter()
+            .filter_map(|s| s.strong(pid::SEGMENT))
+            .filter_map(|s| s.weak_key(pid::DATA_DEFINITION))
+            .filter(|k| *k == ddef::PICTURE || *k == ddef::SOUND)
+            .collect();
+        assert_eq!(kinds.len(), 1);
+    }
+    let document = read::read(&bytes, &mut Report::default()).unwrap();
+    let picture = document.sources.iter().find(|s| s.kind == crate::comp::CKind::Picture).unwrap();
+    let sound = document.sources.iter().find(|s| s.kind == crate::comp::CKind::Sound).unwrap();
+    assert_eq!(picture.key, sound.key, "FilmCraft rejoins the original source group on import");
+}
+
+#[test]
+fn operation_parameters_use_the_native_sdk_stored_set_form() {
+    // The AAF baseline declares a vector, but the SDK's GetParameters enumerates
+    // its legacy stored set. Native testing read zero parameters from vectors.
+    for small in [false, true] {
+        let root = store::read(&rich_export(small)).unwrap();
+        let mut objects = Vec::new();
+        walk(&root, &mut objects);
+        let groups: Vec<_> = objects.into_iter().filter(|o| o.class == cls::OPERATION_GROUP && o.get(pid::PARAMETERS).is_some()).collect();
+        assert!(!groups.is_empty());
+        for group in groups {
+            let Some(Value::StrongSet(parameters, key)) = group.get(pid::PARAMETERS) else {
+                panic!("OperationGroup::Parameters must use the SDK's stored strong-reference set");
+            };
+            assert_eq!(*key, pid::PARAMETER_DEFINITION);
+            assert!(!parameters.is_empty());
+            assert!(parameters.iter().all(|p| p.auid(*key).is_some()));
+        }
+    }
+}
+
+#[test]
+fn split_audio_channels_have_unambiguous_master_sources() {
+    let (p, s) = project();
+    let opts = AafOptions { media: crate::essence::MediaOptions { breakout_to_mono: true, ..Default::default() }, ..Default::default() };
+    let bytes = export(&p, s, &opts).unwrap().0;
+    let root = store::read(&bytes).unwrap();
+    let content = root.strong(pid::ROOT_HEADER).unwrap().strong(pid::CONTENT).unwrap();
+    let masters: Vec<_> = content
+        .objs(pid::MOBS)
+        .iter()
+        .filter(|m| m.class == cls::MASTER_MOB)
+        .filter(|m| m.objs(pid::SLOTS).iter().any(|s| s.strong(pid::SEGMENT).is_some_and(|g| g.weak_key(pid::DATA_DEFINITION) == Some(ddef::SOUND.as_slice()))))
+        .collect();
+    assert_eq!(masters.len(), 2, "each exposed channel has its own first source");
+    assert!(masters.iter().all(|m| m.objs(pid::SLOTS).iter().filter(|s| s.strong(pid::SEGMENT).is_some_and(|g| g.class == cls::SOURCE_CLIP)).count() == 1));
+    let doc = read::read(&bytes, &mut Report::default()).unwrap();
+    let sources: Vec<_> = doc.sources.iter().filter(|s| s.kind == crate::comp::CKind::Sound).collect();
+    assert_eq!(sources.iter().map(|s| s.channel).collect::<HashSet<_>>(), HashSet::from([Some(0), Some(1)]));
+    assert_eq!(sources.iter().map(|s| &s.key).collect::<HashSet<_>>().len(), 1, "source identity survives the split");
+}
+
+#[test]
+fn clip_gain_curves_are_bounded_scaled_and_reset_for_the_next_clip() {
+    use crate::comp::{CItem, CKind, Gain, Nests};
+    let (p, s) = project();
+    let mut report = Report::default();
+    let mut doc = crate::comp::from_project(&p, s, "gain", &Default::default(), Nests::Compositions, &mut report).unwrap();
+    doc.compositions[0].tracks.retain(|t| t.kind == CKind::Sound);
+    let track = &mut doc.compositions[0].tracks[0];
+    track.items.retain(|i| matches!(i, CItem::Clip(_)));
+    let CItem::Clip(first) = &mut track.items[0] else { panic!("first clip") };
+    first.len = Tick::from_units(4, 1);
+    first.gain = Some(Gain::Varying {
+        linear: true,
+        points: vec![(Tick::from_units(-1, 1), 1.0), (Tick::ZERO, 4.0), (Tick::from_units(1, 1), 8.0), (Tick::from_units(8, 1), 2.0)],
+    });
+    let CItem::Clip(second) = &mut track.items[1] else { panic!("second clip") };
+    second.len = Tick::from_units(2, 1);
+    second.gain = Some(Gain::Constant(0.5));
+    let bytes = write::write(&doc, filmcraft_cfb::Version::V4, &mut report).unwrap();
+    let root = store::read(&bytes).unwrap();
+    let mut objects = Vec::new();
+    walk(&root, &mut objects);
+    let curves: Vec<_> = objects.iter().filter(|o| o.class == cls::VARYING_VALUE).collect();
+    assert_eq!(curves.len(), 2, "the static neighbor resets host track automation to unity");
+    for curve in &curves {
+        let points = curve.objs(pid::POINT_LIST);
+        assert_eq!(points.first().unwrap().rational(pid::CP_TIME).map(|(n, d)| n as f64 / d as f64), Some(0.0));
+        let (n, d) = points.last().unwrap().rational(pid::CP_TIME).unwrap();
+        let end = n as f64 / d as f64;
+        assert!((1.0 - 1e-9..1.0).contains(&end), "adjacent clips need strictly ordered curve boundaries after floating-point time conversion");
+        for point in points {
+            let (n, d) = point.rational(pid::CP_TIME).unwrap();
+            assert!(d > 0 && n >= 0 && n <= d, "keyframes outside the visible clip must be sampled at its boundaries");
+            let value = point.data(pid::CP_VALUE).unwrap();
+            let (n, d) = store::rational_of(&value[17..]).unwrap();
+            assert!((0.0..=1.0).contains(&(n as f64 / d as f64)), "high boosts are carried by a constant gain factor");
+        }
+    }
+    let imported = read::read(&bytes, &mut report).unwrap();
+    let items = &imported.compositions[0].tracks[0].items;
+    let CItem::Clip(first) = &items[0] else { panic!("first clip") };
+    let Some(Gain::Varying { linear, points }) = &first.gain else { panic!("nested scalar and curve must be multiplied on import") };
+    assert!(*linear);
+    assert_eq!(points.iter().take(2).map(|p| p.0).collect::<Vec<_>>(), [Tick::ZERO, Tick::from_units(1, 1)]);
+    assert!((points.last().unwrap().0 - Tick::from_units(4, 1)).abs() <= Tick(filmcraft_time::TICKS_PER_SECOND / 48_000 / 2));
+    for (point, expected) in points.iter().zip([4.0, 8.0, 38.0 / 7.0]) {
+        assert!((point.1 - expected).abs() <= 1.0 / 65536.0);
+    }
+    let CItem::Clip(second) = &items[1] else { panic!("second clip") };
+    assert_eq!(second.gain, Some(Gain::Constant(0.5)));
+}
+
+#[test]
+fn audio_gain_uses_the_registered_gain_id_instead_of_pan() {
+    let root = store::read(&rich_export(false)).unwrap();
+    let mut objects = Vec::new();
+    walk(&root, &mut objects);
+    let amplitude = ids::guid(0xE4962321, 0x2267, 0x11D3, [0x8A, 0x4C, 0x00, 0x50, 0x04, 0x0E, 0xF7, 0xD2]);
+    let gain = ids::guid(0x9D2EA894, 0x0968, 0x11D3, [0x8A, 0x38, 0x00, 0x50, 0x04, 0x0E, 0xF7, 0xD2]);
+    let groups: Vec<_> = objects
+        .iter()
+        .filter(|o| o.class == cls::OPERATION_GROUP && o.objs(pid::PARAMETERS).iter().any(|p| p.auid(pid::PARAMETER_DEFINITION) == Some(amplitude)))
+        .collect();
+    assert!(!groups.is_empty());
+    for group in groups {
+        assert_eq!(group.weak_key(pid::OPERATION), Some(gain.as_slice()));
+    }
+}
+
+#[test]
+fn audio_gain_import_distinguishes_legacy_gain_from_real_pan() {
+    fn replace_id(o: &mut Obj, old: &[u8], new: &[u8]) {
+        for (_, value) in &mut o.props {
+            match value {
+                Value::Data(bytes) | Value::Weak(_, _, bytes) if bytes == old => *bytes = new.to_vec(),
+                Value::WeakVec(_, _, keys) => {
+                    for key in keys {
+                        if key == old {
+                            *key = new.to_vec();
+                        }
+                    }
+                }
+                Value::Strong(child) => replace_id(child, old, new),
+                Value::StrongVec(children) | Value::StrongSet(children, _) => {
+                    for child in children {
+                        replace_id(child, old, new);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let bytes = rich_export(false);
+    let expected = read::read(&bytes, &mut Report::default()).unwrap();
+    let mut legacy = store::read(&bytes).unwrap();
+    replace_id(&mut legacy, &def::MONO_AUDIO_GAIN, &def::MONO_AUDIO_PAN);
+    let legacy_bytes = store::write(&legacy, filmcraft_cfb::Version::V4).unwrap();
+    let got = read::read(&legacy_bytes, &mut Report::default()).unwrap();
+    assert_eq!(got.compositions[0].tracks, expected.compositions[0].tracks, "old FilmCraft gain is preserved");
+    let pan = ids::guid(0xE4962322, 0x2267, 0x11D3, [0x8A, 0x4C, 0x00, 0x50, 0x04, 0x0E, 0xF7, 0xD2]);
+    replace_id(&mut legacy, &def::PARAM_AMPLITUDE, &pan);
+    let pan_bytes = store::write(&legacy, filmcraft_cfb::Version::V4).unwrap();
+    let got = read::read(&pan_bytes, &mut Report::default()).unwrap();
+    let clips: Vec<_> =
+        got.compositions[0].tracks.iter().flat_map(|t| &t.items).filter_map(|i| if let crate::comp::CItem::Clip(c) = i { Some(c) } else { None }).collect();
+    assert!(!clips.is_empty());
+    assert!(clips.iter().all(|c| c.gain.is_none()), "real pan never becomes clip gain");
+}
+
+#[test]
+fn original_wave_sources_use_the_probed_wave_format() {
+    use filmcraft_media::MediaSource;
+    for (float, bits) in [(false, 16u16), (true, 32)] {
+        let mut bytes = crate::wav::wav_header(4 * u32::from(bits / 8), 1, 48_000, bits);
+        bytes.extend(vec![0; 4 * usize::from(bits / 8)]);
+        if float {
+            bytes[20..22].copy_from_slice(&3u16.to_le_bytes());
+        }
+        let wave = filmcraft_media::wav::WavSource::parse("source.wav", bytes.into()).unwrap();
+        let mut p = Project::new("wave");
+        let a = p.add_item(
+            "source.wav",
+            filmcraft_project::Label::Iris,
+            filmcraft_project::ItemKind::Media(Box::new(filmcraft_project::MediaClip {
+                media: filmcraft_project::MediaRef::File { path: "/audio/source.wav".into() },
+                info: wave.info().clone(),
+                interpret: Default::default(),
+                mark_in: None,
+                mark_out: None,
+                markers: vec![],
+                offline: false,
+                proxy: None,
+                identity: None,
+            })),
+            None,
+        );
+        let s = p.new_sequence("S", SequenceSettings::default(), 0, 1, None);
+        let clip = p.make_track_item(a, TrackKind::Audio, Tick::ZERO, TimeRange::new(Tick::ZERO, Tick::from_units(4, 48_000)), FrameRate::FPS_24).unwrap();
+        p.sequence_mut(s).unwrap().audio_tracks[0].items.push(clip);
+        let bytes = export(&p, s, &AafOptions::default()).unwrap().0;
+        let root = store::read(&bytes).unwrap();
+        let mut objects = Vec::new();
+        walk(&root, &mut objects);
+        let descriptor = objects.iter().find(|o| o.class == cls::WAVE_DESCRIPTOR).expect("original WAV keeps its WAVE descriptor");
+        let summary = descriptor.data(pid::WAVE_SUMMARY).unwrap();
+        assert_eq!(u16::from_le_bytes(summary[20..22].try_into().unwrap()), if float { 3 } else { 1 });
+        assert_eq!(u16::from_le_bytes(summary[34..36].try_into().unwrap()), bits);
+    }
+}
+
+#[test]
+fn separate_wave_essence_declares_its_wave_codec() {
+    use crate::essence::{AudioEssence, EssenceData, MediaOptions, NeedOptions, audio_needs};
+    let (p, s) = project();
+    let essence = audio_needs(&p, s, &NeedOptions::default())
+        .iter()
+        .map(|n| AudioEssence {
+            key: n.key,
+            channel: None,
+            start: n.start,
+            frames: ((n.end - n.start).0 / (filmcraft_time::TICKS_PER_SECOND / 48_000)) as u64,
+            sample_rate: 48_000,
+            bits: 24,
+            channels: 2,
+            data: EssenceData::File { path: "/audio/consolidated.wav".into() },
+            effects_rendered: false,
+        })
+        .collect();
+    let opts = AafOptions { media: MediaOptions { essence, ..Default::default() }, ..Default::default() };
+    let root = store::read(&export(&p, s, &opts).unwrap().0).unwrap();
+    let header = root.strong(pid::ROOT_HEADER).unwrap();
+    let content = header.strong(pid::CONTENT).unwrap();
+    let descriptors: Vec<_> = content
+        .objs(pid::MOBS)
+        .iter()
+        .filter_map(|m| m.strong(pid::ESSENCE_DESCRIPTION))
+        .filter(|d| d.objs(pid::LOCATOR).iter().any(|l| l.string(pid::URL_STRING).is_some_and(|url| url.ends_with("consolidated.wav"))))
+        .collect();
+    assert!(!descriptors.is_empty());
+    // MS-01 §11.1: WAVE files use WAVEDescriptor. Native Studio Pro testing also
+    // isolates the WAVE codec reference: removing only it leaves the track empty.
+    let wave_codec = ids::guid(0x820F09B1, 0xEB9B, 0x11D2, [0x80, 0x9F, 0x00, 0x60, 0x08, 0x14, 0x3E, 0x6F]);
+    for descriptor in descriptors {
+        assert_eq!(descriptor.weak_key(0x3005), Some(wave_codec.as_slice()), "FileDescriptor::CodecDefinition");
+        assert_eq!(descriptor.class, cls::WAVE_DESCRIPTOR);
+        let codec = header
+            .strong(pid::DICTIONARY)
+            .unwrap()
+            .objs(0x2607)
+            .iter()
+            .find(|c| c.auid(pid::IDENTIFICATION) == Some(wave_codec))
+            .expect("referenced WAVE codec is in the dictionary");
+        assert_eq!(codec.weak_key(0x2301), Some(cls::WAVE_DESCRIPTOR.as_slice()));
+        let (_, channels, rate, bits) = crate::wav::parse_wav(descriptor.data(pid::WAVE_SUMMARY).unwrap()).unwrap();
+        assert_eq!((channels, rate, bits), (2, 48_000, 24));
+    }
+    let bytes = export(&p, s, &opts).unwrap().0;
+    let doc = read::read(&bytes, &mut Report::default()).unwrap();
+    for source in doc.sources.iter().filter(|s| s.kind == crate::comp::CKind::Sound) {
+        assert_eq!((source.file_channels, source.sample_rate, source.bits), (2, 48_000, 24));
+    }
+    let opts = AafOptions { media: MediaOptions { breakout_to_mono: true, ..opts.media }, ..opts };
+    let bytes = export(&p, s, &opts).unwrap().0;
+    let doc = read::read(&bytes, &mut Report::default()).unwrap();
+    let channels: HashSet<_> = doc.sources.iter().filter(|s| s.kind == crate::comp::CKind::Sound).map(|s| s.channel).collect();
+    assert_eq!(channels, HashSet::from([Some(0), Some(1)]), "WAVE summary channels are resolved before selecting mono slots");
+}
+
+#[test]
+fn oversized_wave_summary_returns_an_error_without_allocating_audio() {
+    let (p, s) = project();
+    let mut report = Report::default();
+    let mut doc = crate::comp::from_project(&p, s, "wave", &Default::default(), crate::comp::Nests::Compositions, &mut report).unwrap();
+    for source in doc.sources.iter_mut().filter(|s| s.kind == crate::comp::CKind::Sound) {
+        source.path = Some("/audio/huge.wav".into());
+        source.wave_format = Some(1);
+        source.length = Tick::from_units(86_400, 1);
+    }
+    assert!(write::write(&doc, filmcraft_cfb::Version::V4, &mut report).unwrap_err().to_string().contains("RIFF size limit"));
+}
+
+#[test]
+fn storage_names_match_the_sdk_property_names() {
+    let bytes = rich_export(false);
+    let cf = filmcraft_cfb::CompoundFile::open(&bytes).unwrap();
+    for expected in [
+        "Identifi-ionList-3b06 index",
+        "Operatio-nitions-2603 index",
+        "Paramete-nitions-2604 index",
+        "Containe-nitions-2608 index",
+        "Interpol-nitions-2609 index",
+        "UserComments-204 index",
+        "Paramete-Defined-1e09 index",
+    ] {
+        assert!(cf.entries.iter().any(|e| e.name == expected), "native SDK storage {expected} is missing");
     }
 }
 
@@ -428,8 +762,8 @@ fn assert_mob_set<'a>(content: &Obj, mobs: &'a [Obj]) -> &'a Obj {
     let compositions: Vec<&Obj> = mobs.iter().filter(|m| m.class == cls::COMPOSITION_MOB).collect();
     assert_eq!(compositions.len(), 1);
     assert_eq!(compositions[0].auid(pid::USAGE_CODE), Some(def::USAGE_TOP_LEVEL));
-    assert_eq!(mobs.iter().filter(|m| m.class == cls::MASTER_MOB).count(), 1);
-    assert_eq!(mobs.iter().filter(|m| m.class == cls::SOURCE_MOB).count(), 3, "picture file, sound file, tape");
+    assert_eq!(mobs.iter().filter(|m| m.class == cls::MASTER_MOB).count(), 2);
+    assert_eq!(mobs.iter().filter(|m| m.class == cls::SOURCE_MOB).count(), 4, "picture and sound each have a file and tape source");
     compositions[0]
 }
 
@@ -711,5 +1045,33 @@ fn audio_tracks_keep_their_names() {
     for name in ["é", "音声", "🎤 Dialogue", "Ä1"] {
         p.sequence_mut(s).unwrap().audio_tracks[0].name = name.into();
         assert_eq!(names(&p, &AafOptions::default()), [name]);
+    }
+}
+
+/// MS-01 §6.1 requires ObjClass in the class model even though the stored-format mapping
+/// carries each instance's value in its storage CLSID rather than its properties stream.
+#[test]
+fn class_model_declares_required_object_class_and_its_reference_type() {
+    let (p, s) = project();
+    for small_sectors in [false, true] {
+        let bytes = export(&p, s, &AafOptions { small_sectors, ..Default::default() }).unwrap().0;
+        let root = store::read(&bytes).unwrap();
+        let model = root.strong(pid::ROOT_META_DICTIONARY).unwrap();
+        let base = model.objs(pid::META_CLASS_DEFINITIONS).iter().find(|c| c.auid(pid::META_IDENTIFICATION) == Some(ids::class(1))).unwrap();
+        let prop = base
+            .objs(pid::CLASS_PROPERTIES)
+            .iter()
+            .find(|p| p.u16(pid::PROPERTY_LOCAL_ID) == Some(0x0101))
+            .expect("the required InterchangeObject.ObjClass definition is missing");
+        assert_eq!(prop.u8(pid::PROPERTY_IS_OPTIONAL), Some(0));
+        assert_eq!(prop.auid(pid::META_IDENTIFICATION), Some(ids::guid(0x06010104, 0x0101, 0, [6, 14, 43, 52, 1, 1, 1, 2])));
+        let ty_id = ids::guid(0x05010100, 0, 0, [6, 14, 43, 52, 1, 4, 1, 1]);
+        assert_eq!(prop.auid(pid::PROPERTY_TYPE), Some(ty_id));
+        let ty = model.objs(pid::META_TYPE_DEFINITIONS).iter().find(|t| t.auid(pid::META_IDENTIFICATION) == Some(ty_id)).unwrap();
+        assert_eq!(ty.class, ids::meta::TYPE_WEAK_REFERENCE);
+        assert_eq!(weak_target(ty.get(pid::WEAK_REFERENCED_TYPE), path::META_CLASSES), ids::meta::CLASS_DEFINITION);
+        let header = root.strong(pid::ROOT_HEADER).unwrap();
+        assert_eq!(header.class, cls::HEADER);
+        assert!(header.get(0x0101).is_none(), "ObjClass stays in the storage CLSID, not a duplicate physical property");
     }
 }

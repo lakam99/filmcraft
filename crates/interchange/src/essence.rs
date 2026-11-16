@@ -169,8 +169,10 @@ fn collect_needs(
     for t in seq.tracks(TrackKind::Audio) {
         for c in &t.items {
             let item = crate::common::base_item(project, c.item);
-            let (lo, hi) = if c.speed < 0.0 || c.reverse { (c.source_out(), c.source_in) } else { (c.source_in, c.source_out()) };
-            let (lo, hi) = (lo.min(hi), lo.max(hi));
+            // Interchange currently exports these clips at 100% (and reports retiming).
+            // Preparing only the retimed source span can leave the declared clip past
+            // the end of its trimmed file, causing a receiving DAW to shorten it.
+            let (lo, hi) = (c.source_in, c.source_in + c.duration.max(Tick::ZERO));
             let (mut start, mut end) = ((lo - opts.handles).max(Tick::ZERO), hi + opts.handles);
             match project.item(item).map(|i| &i.kind) {
                 Some(ItemKind::Media(m)) => {

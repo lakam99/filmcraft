@@ -4,12 +4,63 @@ use std::collections::{HashMap, HashSet};
 
 use filmcraft_time::{FrameRate, Tick};
 
-use super::ids::{cls, ddef, def, pid};
+use super::ids::{SOURCE_GROUP_TAG, cls, ddef, def, pid};
 use super::store::{self, Auid, Obj, Value, rational_of, utf16_of};
 use crate::comp::{CClip, CItem, CKind, CMarker, CTrack, CTransition, Composition, Document, Gain, Source, units_to_ticks};
 use crate::{Error, Report, Result};
 
 type MobId = [u8; 32];
+
+fn multiply_gains(outer: &Gain, inner: &Gain) -> Option<Gain> {
+    match (outer, inner) {
+        (Gain::Constant(a), Gain::Constant(b)) => {
+            let value = a * b;
+            value.is_finite().then_some(Gain::Constant(value))
+        }
+        (Gain::Constant(scale), Gain::Varying { linear, points }) | (Gain::Varying { linear, points }, Gain::Constant(scale)) => {
+            let points: Option<Vec<_>> = points
+                .iter()
+                .map(|(time, value)| {
+                    let value = value * scale;
+                    value.is_finite().then_some((*time, value))
+                })
+                .collect();
+            Some(Gain::Varying { linear: *linear, points: points? })
+        }
+        _ => None,
+    }
+}
+
+/// Read only the WAVE format header; a descriptor summary need not contain audio data.
+fn wave_summary_info(d: &Obj) -> Option<(u16, u32, u32, u16)> {
+    let b = d.data(pid::WAVE_SUMMARY)?;
+    if b.get(..4)? != b"RIFF" || b.get(8..12)? != b"WAVE" {
+        return None;
+    }
+    let mut at = 12usize;
+    for _ in 0..256 {
+        let header = b.get(at..at.checked_add(8)?)?;
+        let size = u32::from_le_bytes(header.get(4..8)?.try_into().ok()?) as usize;
+        let body = at.checked_add(8)?;
+        if header.get(..4)? == b"fmt " {
+            let fmt = b.get(body..body.checked_add(size)?)?;
+            let u16_at = |at: usize| -> Option<u16> { Some(u16::from_le_bytes(fmt.get(at..at.checked_add(2)?)?.try_into().ok()?)) };
+            let tag = match u16_at(0)? {
+                0xFFFE => u16_at(24)?,
+                tag => tag,
+            };
+            if tag != 1 && tag != 3 {
+                return None;
+            }
+            let channels = u32::from(u16_at(2)?);
+            let rate = u32::from_le_bytes(fmt.get(4..8)?.try_into().ok()?);
+            let bits = u16_at(14)?;
+            return (channels > 0 && rate > 0 && bits > 0 && bits <= 64).then_some((tag, channels, rate, bits));
+        }
+        at = body.checked_add(size)?.checked_add(size & 1)?;
+    }
+    None
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DataKind {
@@ -303,7 +354,11 @@ impl R<'_> {
                     self.report.info("an effect without input was imported as a gap");
                     return vec![CItem::Filler(len)];
                 };
-                let gain = if op == Some(def::MONO_AUDIO_GAIN) {
+                // Older FilmCraft files used Pan's ID for gain. Only accept that legacy
+                // encoding with an amplitude parameter; real pan must not change volume.
+                let legacy_gain =
+                    op == Some(def::MONO_AUDIO_PAN) && c.objs(pid::PARAMETERS).iter().any(|p| p.auid(pid::PARAMETER_DEFINITION) == Some(def::PARAM_AMPLITUDE));
+                let gain = if op == Some(def::MONO_AUDIO_GAIN) || legacy_gain {
                     self.gain(c, len, rate)
                 } else {
                     self.report.warn("effects other than audio gain are not imported (their first input is used)");
@@ -314,7 +369,15 @@ impl R<'_> {
                 fit(&mut items, len);
                 if let Some(g) = gain {
                     match items.as_mut_slice() {
-                        [CItem::Clip(cl)] => cl.gain = Some(g),
+                        [CItem::Clip(cl)] => {
+                            cl.gain = Some(match cl.gain.take() {
+                                None => g,
+                                Some(inner) => multiply_gains(&g, &inner).unwrap_or_else(|| {
+                                    self.report.warn("nested audio gain curves could not be combined; the outer gain was retained");
+                                    g
+                                }),
+                            });
+                        }
                         _ => self.report.warn("audio gain around several clips was not imported"),
                     }
                 }
@@ -363,6 +426,11 @@ impl R<'_> {
                     Some((Tick((len.0 as i128 * n as i128 / d as i128).clamp(-(1i128 << 56), 1i128 << 56) as i64), v))
                 })
                 .collect();
+            if let Some(first) = points.first()
+                && points.iter().all(|p| p.1 == first.1)
+            {
+                return Some(Gain::Constant(first.1));
+            }
             return (!points.is_empty()).then_some(Gain::Varying { linear, points });
         }
         None
@@ -439,6 +507,7 @@ impl R<'_> {
                         frame_rate: comp.rate,
                         sample_rate: comp.sample_rate,
                         bits: 16,
+                        wave_format: None,
                         length,
                         offset: Tick::ZERO,
                         start_tc: None,
@@ -473,7 +542,12 @@ impl R<'_> {
             return None;
         }
         if mob.class == cls::MASTER_MOB {
-            let key = master_key.unwrap_or_else(|| hex(&id));
+            let key = master_key.unwrap_or_else(|| {
+                tagged_values(mob, pid::MOB_USER_COMMENTS)
+                    .into_iter()
+                    .find_map(|(name, value)| (name == SOURCE_GROUP_TAG && !value.is_empty()).then_some(value))
+                    .unwrap_or_else(|| hex(&id))
+            });
             let clip = first_clip(seg)?;
             let inner = units_to_ticks(clip.i64(pid::START_TIME).unwrap_or(0), rate.0, rate.1);
             let next = clip.mob_id(pid::SOURCE_ID)?;
@@ -521,7 +595,8 @@ impl R<'_> {
         let length =
             d.i64(pid::FILE_LENGTH).map(|l| units_to_ticks(l, file_rate.0, file_rate.1)).unwrap_or_else(|| units_to_ticks(len_of(seg), rate.0, rate.1));
         let sound_slots = mob.objs(pid::SLOTS).iter().filter(|s| s.strong(pid::SEGMENT).is_some_and(|g| data_kind(g) == DataKind::Sound)).count();
-        let file_channels = d.u32(pid::CHANNELS).unwrap_or(1).max(1);
+        let wave_info = wave_summary_info(d);
+        let file_channels = wave_info.map(|w| w.1).or_else(|| d.u32(pid::CHANNELS)).unwrap_or(1).max(1);
         let channel = (seg_kind == CKind::Sound && file_channels > 1 && sound_slots > 1)
             .then(|| slot.u32(pid::PHYSICAL_TRACK_NUMBER).unwrap_or(slot_id).saturating_sub(1).min(file_channels - 1));
         let mut layout = d.u8(pid::FRAME_LAYOUT).unwrap_or(0);
@@ -554,8 +629,11 @@ impl R<'_> {
             width: d.u32(pid::STORED_WIDTH).unwrap_or(0),
             height: if matches!(layout, 1 | 3) { stored_h.saturating_mul(2) } else { stored_h },
             frame_rate: if seg_kind == CKind::Picture { fr } else { FrameRate::FPS_25 },
-            sample_rate: d.rational(pid::AUDIO_SAMPLING_RATE).filter(|r| r.1 > 0 && r.0 > 0).map(|r| (r.0 / r.1) as u32).unwrap_or(file_rate.0 as u32),
-            bits: d.u32(pid::QUANTIZATION_BITS).unwrap_or(16).clamp(8, 32) as u16,
+            sample_rate: wave_info.map(|w| w.2).unwrap_or_else(|| {
+                d.rational(pid::AUDIO_SAMPLING_RATE).filter(|r| r.1 > 0 && r.0 > 0).map(|r| (r.0 / r.1) as u32).unwrap_or(file_rate.0 as u32)
+            }),
+            bits: wave_info.map(|w| w.3).unwrap_or_else(|| d.u32(pid::QUANTIZATION_BITS).unwrap_or(16).clamp(8, 32) as u16),
+            wave_format: wave_info.map(|w| w.0).or_else(|| (d.class == cls::PCM_DESCRIPTOR).then_some(1)),
             length,
             offset: Tick::ZERO,
             start_tc: tc.map(|t| t.0),
@@ -702,4 +780,31 @@ fn markers_of(seg: &Obj, rate: (i64, i64)) -> Vec<CMarker> {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    #[test]
+    fn wave_summaries_accept_header_only_pcm_and_float_and_bound_corrupt_chunks() {
+        let header = crate::wav::wav_header(480_000, 2, 48_000, 24);
+        let descriptor = |bytes| Obj::new(cls::WAVE_DESCRIPTOR).data_prop(pid::WAVE_SUMMARY, bytes);
+        assert_eq!(wave_summary_info(&descriptor(header.clone())), Some((1, 2, 48_000, 24)));
+        let mut float = crate::wav::wav_header(768_000, 2, 48_000, 64);
+        float[20..22].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(wave_summary_info(&descriptor(float)), Some((3, 2, 48_000, 64)));
+        for end in 0..36 {
+            assert!(std::panic::catch_unwind(|| wave_summary_info(&descriptor(header[..end].to_vec()))).unwrap().is_none());
+        }
+        for size in [0, 1, u32::MAX] {
+            let mut broken = header.clone();
+            broken[16..20].copy_from_slice(&size.to_le_bytes());
+            assert!(std::panic::catch_unwind(|| wave_summary_info(&descriptor(broken))).unwrap().is_none());
+        }
+        let mut padded = header[..12].to_vec();
+        padded.extend_from_slice(b"JUNK\x01\0\0\0\0\0");
+        padded.extend_from_slice(&header[12..]);
+        assert_eq!(wave_summary_info(&descriptor(padded)), Some((1, 2, 48_000, 24)));
+    }
 }

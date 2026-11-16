@@ -166,8 +166,8 @@ pub(crate) fn utf16_of(d: &[u8]) -> String {
     String::from_utf16_lossy(&u)
 }
 
-/// Short property names used to name storages and streams (any name is valid: readers follow
-/// the names stored in the property values).
+/// Baseline property names. SDK readers derive storage names from these, even when the
+/// property value contains a different name; aliases accepted by our reader do not interoperate.
 fn prop_name(pid: u16) -> &'static str {
     match pid {
         0x0001 => "MetaDictionary",
@@ -183,10 +183,10 @@ fn prop_name(pid: u16) -> &'static str {
         0x1902 => "EssenceData",
         0x2603 => "OperationDefinitions",
         0x2604 => "ParameterDefinitions",
-        0x2605 => "DataDefinitions",
+        0x2605 | 0x2302 => "DataDefinitions",
         0x2607 => "CodecDefinitions",
         0x2608 => "ContainerDefinitions",
-        0x2609 => "InterpolationDefs",
+        0x2609 => "InterpolationDefinitions",
         0x4403 => "Slots",
         0x4406 => "UserComments",
         0x4803 => "Segment",
@@ -198,7 +198,7 @@ fn prop_name(pid: u16) -> &'static str {
         0x4701 => "EssenceDescription",
         0x2F01 => "Locator",
         0x2702 => "Data",
-        0x0204 => "ComponentComments",
+        0x0204 => "UserComments",
         0x1E09 => "ParametersDefined",
         _ => "Property",
     }
@@ -215,9 +215,18 @@ fn set_key_size(key_pid: u16) -> usize {
 }
 
 fn storage_name(pid: u16) -> String {
-    let suffix = format!("-{pid:x}");
-    let name: String = prop_name(pid).chars().take(22 - suffix.len()).collect();
-    format!("{name}{suffix}")
+    // The standard SDK shortens collection names in the middle, reserving room for
+    // local keys and the " index" suffix. Preserve these spellings for native readers.
+    let name = match pid {
+        0x3B06 => "Identifi-ionList",
+        0x2603 => "Operatio-nitions",
+        0x2604 => "Paramete-nitions",
+        0x2608 => "Containe-nitions",
+        0x2609 => "Interpol-nitions",
+        0x1E09 => "Paramete-Defined",
+        _ => prop_name(pid),
+    };
+    format!("{name}-{pid:x}")
 }
 
 /// Errors while reading the object tree.
@@ -249,7 +258,16 @@ pub(crate) fn write(root: &Obj, version: Version) -> Result<Vec<u8>, String> {
         rp.extend_from_slice(&0u16.to_le_bytes());
     }
     w.cfb.stream(Writer::ROOT, "referenced properties", rp).map_err(|e| e.to_string())?;
-    Ok(w.cfb.finish())
+    let mut bytes = w.cfb.finish();
+    // AAF's file-kind marker occupies the compound header's CLSID field. It is distinct from
+    // the Root object's storage CLSID; leaving this generic-CFB field zero defeats AAF sniffers.
+    // Keep this extension here so non-AAF compound-file writers retain their normal header.
+    let signature = match version {
+        Version::V3 => super::ids::FILE_SIGNATURE_V3,
+        Version::V4 => super::ids::FILE_SIGNATURE_V4,
+    };
+    bytes.get_mut(8..24).ok_or_else(|| bad("compound header is too short for the AAF file signature"))?.copy_from_slice(&signature);
+    Ok(bytes)
 }
 
 impl W {

@@ -21,8 +21,9 @@
 //! the clip's kind, with its start in that slot's edit units; Premiere Pro writes nested sequences
 //! this way);
 //!
-//! and for every media item a **MasterMob**, a file **SourceMob** per essence (a CDCI or PCM
-//! descriptor with a network locator to the file, or `EssenceData` holding embedded PCM) and a
+//! and for every media item separate picture and sound **MasterMob**s, a file **SourceMob** per
+//! essence (a CDCI, PCM, or WAVE descriptor with a network locator to the file, or `EssenceData`
+//! holding embedded PCM) and a
 //! tape **SourceMob** carrying the media's start timecode. Clip and media markers become comment
 //! markers on the master mob.
 //!
