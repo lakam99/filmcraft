@@ -394,6 +394,7 @@ impl R<'_, '_> {
                     frame_rate: FrameRate::FPS_25,
                     sample_rate,
                     bits,
+                    wave_format: None,
                     length,
                     offset: Tick::ZERO,
                     start_tc: tc.map(|t| t.0),

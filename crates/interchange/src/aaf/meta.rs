@@ -99,7 +99,70 @@ pub(crate) const CLASSES: &[Class] = &[
         p("Name", 0x0006, 0x060E2B34_01010102_03020401_02010000, T_STRING, Req),
     ]},
     Class { name: "TypeDefinition", id: meta::TYPE_DEFINITION, parent: meta::META_DEFINITION, concrete: false, props: &[] },
-    c("InterchangeObject", 0x01, 0x01, false, &[]),
+    Class { name: "ClassDefinition", id: meta::CLASS_DEFINITION, parent: meta::META_DEFINITION, concrete: true, props: &[
+        p("ParentClass", 0x0008, 0x060E2B34_01010102_06010107_01000000, T_CLASS_DEFINITION_WEAK_REFERENCE, Req),
+        p("Properties", 0x0009, 0x060E2B34_01010102_06010107_02000000, T_PROPERTY_DEFINITION_STRONG_REFERENCE_SET, Opt),
+        p("IsConcrete", 0x000A, 0x060E2B34_01010102_06010107_03000000, T_BOOLEAN, Req),
+    ]},
+    Class { name: "PropertyDefinition", id: meta::PROPERTY_DEFINITION, parent: meta::META_DEFINITION, concrete: true, props: &[
+        p("Type", 0x000B, 0x060E2B34_01010102_06010107_04000000, T_AUID, Req),
+        p("IsOptional", 0x000C, 0x060E2B34_01010102_03010202_01000000, T_BOOLEAN, Req),
+        p("LocalIdentification", 0x000D, 0x060E2B34_01010102_06010107_05000000, T_UINT16, Req),
+        p("IsUniqueIdentifier", 0x000E, 0x060E2B34_01010102_06010107_06000000, T_BOOLEAN, Opt),
+    ]},
+    Class { name: "TypeDefinitionInteger", id: super::ids::meta_class(0x04), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+        p("Size", 0x000F, 0x060E2B34_01010102_03010203_01000000, T_UINT8, Req),
+        p("IsSigned", 0x0010, 0x060E2B34_01010102_03010203_02000000, T_BOOLEAN, Req),
+    ]},
+    Class { name: "TypeDefinitionStrongObjectReference", id: super::ids::meta_class(0x05), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+        p("ReferencedType", 0x0011, 0x060E2B34_01010102_06010107_09000000, T_CLASS_DEFINITION_WEAK_REFERENCE, Req),
+    ]},
+    Class { name: "TypeDefinitionWeakObjectReference", id: super::ids::meta_class(0x06), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+        p("ReferencedType", 0x0012, 0x060E2B34_01010102_06010107_0A000000, T_CLASS_DEFINITION_WEAK_REFERENCE, Req),
+        p("TargetSet", 0x0013, 0x060E2B34_01010102_03010203_0B000000, T_AUID_ARRAY, Req),
+    ]},
+    Class { name: "TypeDefinitionEnumeration", id: super::ids::meta_class(0x07), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+        p("ElementType", 0x0014, 0x060E2B34_01010102_06010107_0B000000, T_TYPE_DEFINITION_WEAK_REFERENCE, Req),
+        p("ElementNames", 0x0015, 0x060E2B34_01010102_03010203_04000000, T_STRING_ARRAY, Req),
+        p("ElementValues", 0x0016, 0x060E2B34_01010102_03010203_05000000, T_INT64_ARRAY, Req),
+    ]},
+    Class { name: "TypeDefinitionFixedArray", id: super::ids::meta_class(0x08), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+        p("ElementType", 0x0017, 0x060E2B34_01010102_06010107_0C000000, T_TYPE_DEFINITION_WEAK_REFERENCE, Req),
+        p("ElementCount", 0x0018, 0x060E2B34_01010102_03010203_03000000, T_UINT32, Req),
+    ]},
+    Class { name: "TypeDefinitionVariableArray", id: super::ids::meta_class(0x09), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+        p("ElementType", 0x0019, 0x060E2B34_01010102_06010107_0D000000, T_TYPE_DEFINITION_WEAK_REFERENCE, Req),
+    ]},
+    Class { name: "TypeDefinitionSet", id: super::ids::meta_class(0x0A), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+        p("ElementType", 0x001A, 0x060E2B34_01010102_06010107_0E000000, T_TYPE_DEFINITION_WEAK_REFERENCE, Req),
+    ]},
+    Class { name: "TypeDefinitionString", id: super::ids::meta_class(0x0B), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+        p("ElementType", 0x001B, 0x060E2B34_01010102_06010107_0F000000, T_TYPE_DEFINITION_WEAK_REFERENCE, Req),
+    ]},
+    Class { name: "TypeDefinitionStream", id: super::ids::meta_class(0x0C), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+    ]},
+    Class { name: "TypeDefinitionRecord", id: super::ids::meta_class(0x0D), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+        p("MemberTypes", 0x001C, 0x060E2B34_01010102_06010107_11000000, T_TYPE_DEFINITION_WEAK_REFERENCE_VECTOR, Req),
+        p("MemberNames", 0x001D, 0x060E2B34_01010102_03010203_06000000, T_STRING_ARRAY, Req),
+    ]},
+    Class { name: "TypeDefinitionRename", id: super::ids::meta_class(0x0E), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+        p("RenamedType", 0x001E, 0x060E2B34_01010102_06010107_12000000, T_TYPE_DEFINITION_WEAK_REFERENCE, Req),
+    ]},
+    Class { name: "TypeDefinitionExtendibleEnumeration", id: super::ids::meta_class(0x20), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+        p("ElementNames", 0x001F, 0x060E2B34_01010102_03010203_07000000, T_STRING_ARRAY, Req),
+        p("ElementValues", 0x0020, 0x060E2B34_01010102_03010203_08000000, T_AUID_ARRAY, Req),
+    ]},
+    Class { name: "TypeDefinitionIndirect", id: super::ids::meta_class(0x21), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+    ]},
+    Class { name: "TypeDefinitionCharacter", id: super::ids::meta_class(0x23), parent: super::ids::meta_class(0x03), concrete: true, props: &[
+    ]},
+    Class { name: "MetaDictionary", id: super::ids::meta_class(0x25), parent: super::ids::meta_class(0x25), concrete: true, props: &[
+        p("ClassDefinitions", 0x0003, 0x060E2B34_01010102_06010107_07000000, T_CLASS_DEFINITION_STRONG_REFERENCE_SET, Opt),
+        p("TypeDefinitions", 0x0004, 0x060E2B34_01010102_06010107_08000000, T_TYPE_DEFINITION_STRONG_REFERENCE_SET, Opt),
+    ]},
+    c("InterchangeObject", 0x01, 0x01, false, &[
+        p("ObjClass", 0x0101, 0x060E2B34_01010102_06010104_01010000, T_CLASS_DEFINITION_WEAK_REFERENCE, Req),
+    ]),
     c("EssenceDescriptor", 0x24, 0x01, false, &[
         p("Locator", 0x2F01, 0x060E2B34_01010102_06010104_06030000, T_LOCATOR_STRONG_REFERENCE_VECTOR, Opt),
     ]),
@@ -107,6 +170,10 @@ pub(crate) const CLASSES: &[Class] = &[
         p("SampleRate", 0x3001, 0x060E2B34_01010101_04060101_00000000, T_RATIONAL, Req),
         p("Length", 0x3002, 0x060E2B34_01010101_04060102_00000000, T_LENGTH_TYPE, Req),
         p("ContainerFormat", 0x3004, 0x060E2B34_01010102_06010104_01020000, T_CONTAINER_DEFINITION_WEAK_REFERENCE, Opt),
+        p("CodecDefinition", 0x3005, 0x060E2B34_01010102_06010104_01030000, T_CODEC_DEFINITION_WEAK_REFERENCE, Opt),
+    ]),
+    c("WAVEDescriptor", 0x2C, 0x25, true, &[
+        p("Summary", 0x3801, 0x060E2B34_01010102_03030302_01000000, T_DATA_VALUE, Req),
     ]),
     c("DigitalImageDescriptor", 0x27, 0x25, false, &[
         p("StoredHeight", 0x3202, 0x060E2B34_01010101_04010502_01000000, T_UINT32, Req),
@@ -152,6 +219,10 @@ pub(crate) const CLASSES: &[Class] = &[
         p("Description", 0x1B03, 0x060E2B34_01010102_03020301_02010000, T_STRING, Opt),
     ]),
     c("ContainerDefinition", 0x20, 0x1A, true, &[]),
+    c("CodecDefinition", 0x1F, 0x1A, true, &[
+        p("FileDescriptorClass", 0x2301, 0x060E2B34_01010102_06010104_01070000, T_CLASS_DEFINITION_WEAK_REFERENCE, Req),
+        p("DataDefinitions", 0x2302, 0x060E2B34_01010102_06010104_03010000, T_DATA_DEFINITION_WEAK_REFERENCE_VECTOR, Req),
+    ]),
     c("ContentStorage", 0x18, 0x01, true, &[
         p("Mobs", 0x1901, 0x060E2B34_01010102_06010104_05010000, T_PACKAGE_STRONG_REFERENCE_SET, Req),
         p("EssenceData", 0x1902, 0x060E2B34_01010102_06010104_05020000, T_ESSENCE_DATA_STRONG_REFERENCE_SET, Opt),
@@ -166,6 +237,7 @@ pub(crate) const CLASSES: &[Class] = &[
         p("OperationDefinitions", 0x2603, 0x060E2B34_01010102_06010104_05030000, T_OPERATION_DEFINITION_STRONG_REFERENCE_SET, Opt),
         p("ParameterDefinitions", 0x2604, 0x060E2B34_01010102_06010104_05040000, T_PARAMETER_DEFINITION_STRONG_REFERENCE_SET, Opt),
         p("DataDefinitions", 0x2605, 0x060E2B34_01010102_06010104_05050000, T_DATA_DEFINITION_STRONG_REFERENCE_SET, Opt),
+        p("CodecDefinitions", 0x2607, 0x060E2B34_01010102_06010104_05070000, T_CODEC_DEFINITION_STRONG_REFERENCE_SET, Opt),
         p("ContainerDefinitions", 0x2608, 0x060E2B34_01010102_06010104_05080000, T_CONTAINER_DEFINITION_STRONG_REFERENCE_SET, Opt),
         p("InterpolationDefinitions", 0x2609, 0x060E2B34_01010102_06010104_05090000, T_INTERPOLATION_DEFINITION_STRONG_REFERENCE_SET, Opt),
     ]),
@@ -344,10 +416,43 @@ const T_LOCATOR_STRONG_REFERENCE_VECTOR: Auid = u(0x060E2B34_01040101_05060400_0
 const T_IDENTIFICATION_STRONG_REFERENCE_VECTOR: Auid = u(0x060E2B34_01040101_05060300_00000000);
 const T_TRACK_STRONG_REFERENCE_VECTOR: Auid = u(0x060E2B34_01040101_05060500_00000000);
 const T_CONTROL_POINT_STRONG_REFERENCE_VECTOR: Auid = u(0x060E2B34_01040101_05060200_00000000);
+const T_DATA_VALUE: Auid = u(0x060E2B34_01040101_04100100_00000000);
+const T_CLASS_DEFINITION_WEAK_REFERENCE: Auid = u(0x060E2B34_01040101_05010100_00000000);
+const T_PROPERTY_DEFINITION_STRONG_REFERENCE: Auid = u(0x060E2B34_01040101_05021900_00000000);
+const T_PROPERTY_DEFINITION_STRONG_REFERENCE_SET: Auid = u(0x060E2B34_01040101_05050B00_00000000);
+const T_CODEC_DEFINITION_WEAK_REFERENCE: Auid = u(0x060E2B34_01040101_05010B00_00000000);
+const T_CODEC_DEFINITION_STRONG_REFERENCE: Auid = u(0x060E2B34_01040101_05020A00_00000000);
+const T_CODEC_DEFINITION_STRONG_REFERENCE_SET: Auid = u(0x060E2B34_01040101_05050200_00000000);
+const T_DATA_DEFINITION_WEAK_REFERENCE_VECTOR: Auid = u(0x060E2B34_01040101_05040300_00000000);
+
+const T_AUID_ARRAY: Auid = u(0x060E2B34_01040101_04010600_00000000);
+const T_STRING_ARRAY: Auid = u(0x060E2B34_01040101_04010500_00000000);
+const T_INT64_ARRAY: Auid = u(0x060E2B34_01040101_04010400_00000000);
+const T_TYPE_DEFINITION_WEAK_REFERENCE_VECTOR: Auid = u(0x060E2B34_01040101_05040200_00000000);
+const T_CLASS_DEFINITION_STRONG_REFERENCE: Auid = u(0x060E2B34_01040101_05020900_00000000);
+const T_CLASS_DEFINITION_STRONG_REFERENCE_SET: Auid = u(0x060E2B34_01040101_05050100_00000000);
+const T_TYPE_DEFINITION_STRONG_REFERENCE: Auid = u(0x060E2B34_01040101_05021B00_00000000);
+const T_TYPE_DEFINITION_STRONG_REFERENCE_SET: Auid = u(0x060E2B34_01040101_05050C00_00000000);
 
 /// Every type the properties above use, and the types those are made of.
 #[rustfmt::skip]
 pub(crate) const TYPES: &[Type] = &[
+    t("AuidArray", T_AUID_ARRAY, VariableArray(T_AUID)),
+    t("StringArray", T_STRING_ARRAY, VariableArray(T_CHARACTER)),
+    t("Int64Array", T_INT64_ARRAY, VariableArray(T_INT64)),
+    t("TypeDefinitionWeakReferenceVector", T_TYPE_DEFINITION_WEAK_REFERENCE_VECTOR, VariableArray(T_TYPE_DEFINITION_WEAK_REFERENCE)),
+    t("ClassDefinitionStrongReference", T_CLASS_DEFINITION_STRONG_REFERENCE, StrongReference(meta::CLASS_DEFINITION)),
+    t("ClassDefinitionStrongReferenceSet", T_CLASS_DEFINITION_STRONG_REFERENCE_SET, Set(T_CLASS_DEFINITION_STRONG_REFERENCE)),
+    t("TypeDefinitionStrongReference", T_TYPE_DEFINITION_STRONG_REFERENCE, StrongReference(meta::TYPE_DEFINITION)),
+    t("TypeDefinitionStrongReferenceSet", T_TYPE_DEFINITION_STRONG_REFERENCE_SET, Set(T_TYPE_DEFINITION_STRONG_REFERENCE)),
+    t("DataValue", T_DATA_VALUE, VariableArray(T_UINT8)),
+    t("ClassDefinitionWeakReference", T_CLASS_DEFINITION_WEAK_REFERENCE, WeakReference(meta::CLASS_DEFINITION, &[ROOT_META_DICTIONARY, u(0x060E2B34_01010102_06010107_07000000)])),
+    t("PropertyDefinitionStrongReference", T_PROPERTY_DEFINITION_STRONG_REFERENCE, StrongReference(meta::PROPERTY_DEFINITION)),
+    t("PropertyDefinitionStrongReferenceSet", T_PROPERTY_DEFINITION_STRONG_REFERENCE_SET, Set(T_PROPERTY_DEFINITION_STRONG_REFERENCE)),
+    t("CodecDefinitionWeakReference", T_CODEC_DEFINITION_WEAK_REFERENCE, WeakReference(class(0x1F), &[ROOT_HEADER, u(0x060E2B34_01010102_06010104_02020000), u(0x060E2B34_01010102_06010104_05070000)])),
+    t("CodecDefinitionStrongReference", T_CODEC_DEFINITION_STRONG_REFERENCE, StrongReference(class(0x1F))),
+    t("CodecDefinitionStrongReferenceSet", T_CODEC_DEFINITION_STRONG_REFERENCE_SET, Set(T_CODEC_DEFINITION_STRONG_REFERENCE)),
+    t("DataDefinitionWeakReferenceVector", T_DATA_DEFINITION_WEAK_REFERENCE_VECTOR, VariableArray(T_DATA_DEFINITION_WEAK_REFERENCE)),
     t("Int64", T_INT64, Integer(8, true)),
     t("UInt8", T_UINT8, Integer(1, false)),
     t("UInt32", T_UINT32, Integer(4, false)),
@@ -548,6 +653,20 @@ mod tests {
         }
     }
 
+    fn assert_weak_targets(class: Auid, targets: &[Auid]) {
+        match class {
+            c if c == meta::TYPE_DEFINITION => assert_eq!(targets, &[ROOT_META_DICTIONARY, u(0x060E2B34_01010102_06010107_08000000)]),
+            c if c == meta::CLASS_DEFINITION => assert_eq!(targets, &[ROOT_META_DICTIONARY, u(0x060E2B34_01010102_06010107_07000000)]),
+            _ => {
+                assert_eq!(targets.len(), 3);
+                assert_eq!(targets[0], ROOT_HEADER, "root property, not Header's class id");
+                assert_eq!(targets[1], u(0x060E2B34_01010102_06010104_02020000));
+                let dict = CLASSES.iter().find(|c| c.id == super::class(0x22)).unwrap();
+                assert!(dict.props.iter().any(|p| p.id == targets[2]), "target collection of {class:02x?}");
+            }
+        }
+    }
+
     #[test]
     fn model_identifiers_are_unique_and_references_resolve() {
         let classes: HashSet<_> = CLASSES.iter().map(|c| c.id).collect();
@@ -573,15 +692,7 @@ mod tests {
                 StrongReference(class) => assert!(classes.contains(&class), "target of {}", t.name),
                 WeakReference(class, targets) => {
                     assert!(classes.contains(&class), "target of {}", t.name);
-                    if class == meta::TYPE_DEFINITION {
-                        assert_eq!(targets, &[ROOT_META_DICTIONARY, u(0x060E2B34_01010102_06010107_08000000)]);
-                    } else {
-                        assert_eq!(targets.len(), 3);
-                        assert_eq!(targets[0], ROOT_HEADER, "root property, not Header's class id");
-                        assert_eq!(targets[1], u(0x060E2B34_01010102_06010104_02020000));
-                        let dict = CLASSES.iter().find(|c| c.id == super::class(0x22)).unwrap();
-                        assert!(dict.props.iter().any(|p| p.id == targets[2]), "target collection of {}", t.name);
-                    }
+                    assert_weak_targets(class, targets);
                 }
                 Record(members) => {
                     let mut names = HashSet::new();

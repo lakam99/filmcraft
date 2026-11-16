@@ -6,8 +6,9 @@ references are strings and audio essence is supplied by the caller (the engine).
 
 ## Specifications
 
-Clean-room: written from public specifications only. The AAF SDK, pyaaf2, the OMF Toolkit and
-other implementations were not consulted. Where a specification leaves a layout open (how a
+Implemented from public specifications, with original Rust code. AAF interoperability is also
+checked against native SDK behaviour and the public [pyaaf2 schema](https://github.com/markreidvfx/pyaaf2)
+as independent references. Native applications are compatibility oracles. Where a specification leaves a layout open (how a
 nested sequence is written, how several video tracks share a slot), what Premiere Pro does was
 read off files it exports, never from the application itself.
 
@@ -69,6 +70,37 @@ Effect-backed generators and video sources other than the default `srcID="1"` ar
 warning.
 
 ## AAF structure
+
+The compound header contains AAF's file-kind signature, separately from the Root storage's
+class identifier (Stored Format v1.0.1 §1.6). Collection streams use the baseline property names
+and the SDK's shortened names; a reader following arbitrary names in property values alone
+does not catch native SDK failures to find those streams.
+
+Picture, sound, and exposed audio channels have separate master mobs. File source mobs still
+describe all referenced channels in a shared essence file. This avoids importers selecting a
+master's first source regardless of the requested slot. A tagged source-group identifier lets
+FilmCraft restore the original media identity on import.
+
+Separate PCM WAVE files use a WAVEDescriptor, a header-only Summary and the registered WAVE
+CodecDefinition (Object Specification v1.1 §§8.7, 11.1). Embedded raw PCM keeps its PCMDescriptor.
+WAVE summaries preserve channel/rate/bit-depth metadata and reject sizes beyond RIFF's limits.
+Audio gain uses the registered MonoAudioGain identifier, distinct from MonoAudioPan. Operation
+parameters use the SDK-compatible stored set form even though the baseline type is a vector.
+
+Volume curves are sampled at the visible clip boundaries and their control-point times stay
+within the clip. A constant gain factor and a normalized curve preserve high boosts without
+overrunning a receiving DAW's track fader. On tracks with volume curves, static clips also
+carry an explicit unity curve so track automation resets at each clip boundary. Import multiplies
+nested constant gains and curves back together.
+Final curve points sit just inside the clip end to retain their ordering against the next
+clip's start when a receiving application converts rational times to floating point.
+Trimmed audio covers the declared 100% playback range, including clips with retiming warnings.
+Retiming itself is still not carried. For Studio Pro, use embedded or separate PCM audio;
+direct references to compressed originals depend on the receiving application's support.
+
+Regression tests cover these representations, legacy FilmCraft gain imports, channel identity,
+and malformed summaries. Native acceptance additionally checks session creation and media
+loading in the receiving application: SDK parsing alone does not prove its playback behaviour.
 
 AAF exports include the class and type model in the MetaDictionary (MS-01 §5), including
 the type references required by effect parameters. Weak-reference target lists use property
