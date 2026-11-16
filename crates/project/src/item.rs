@@ -16,6 +16,10 @@ pub enum MediaRef {
 /// Overrides applied when interpreting footage (Modify ▸ Interpret Footage).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Interpretation {
+    /// Stable composition selector for an EffectCraft project source. The file path remains a
+    /// normal media reference so collection, path resolution and relinking retain its identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_composition: Option<u64>,
     pub frame_rate: Option<FrameRate>,
     pub par: Option<(u32, u32)>,
     pub ignore_alpha: bool,

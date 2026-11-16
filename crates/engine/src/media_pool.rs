@@ -49,9 +49,20 @@ pub struct OfflineMedia {
     pub error: String,
 }
 
+struct CachedSource {
+    key: String,
+    source: SharedSource,
+    link: Option<Arc<LinkDiagnostic>>,
+}
+
+struct LinkDiagnostic {
+    path: String,
+    error: Mutex<Option<String>>,
+}
+
 pub struct MediaPool {
     /// item → (reference key, source)
-    sources: RwLock<HashMap<ItemId, (String, SharedSource)>>,
+    sources: RwLock<HashMap<ItemId, CachedSource>>,
     proxies: RwLock<HashMap<ItemId, (String, SharedSource)>>,
     offline: Arc<RwLock<HashMap<ItemId, OfflineStatus>>>,
     use_proxies: AtomicBool,
@@ -59,6 +70,7 @@ pub struct MediaPool {
     failures: Arc<Mutex<HashMap<ItemId, u32>>>,
     /// Openers tried before the built-in ones (MP4/MOV + codecs register here).
     pub openers: RwLock<Vec<Opener>>,
+    composition_renderer: RwLock<String>,
     /// Media and proxy paths that came from a document, with that document's path (see
     /// [`Self::follow`]).
     stored: RwLock<HashMap<String, Option<PathBuf>>>,
@@ -74,6 +86,7 @@ impl Default for MediaPool {
             use_proxies: AtomicBool::new(false),
             failures: Arc::default(),
             openers: RwLock::new(filmcraft_codecs::openers()),
+            composition_renderer: RwLock::default(),
             stored: RwLock::default(),
         }
     }
@@ -89,6 +102,9 @@ pub const PROBE_WHOLE_FILE_MAX: u64 = 64 * 1024 * 1024;
 pub fn media_key(m: &MediaClip) -> String {
     match &m.media {
         MediaRef::File { path } if m.offline => format!("offline:{path}"),
+        MediaRef::File { path } if m.interpret.linked_composition.is_some() => {
+            format!("composition:{}:{path}", m.interpret.linked_composition.unwrap_or_default())
+        }
         MediaRef::File { path } => format!("file:{path}"),
         MediaRef::Generator(g) => format!("generator:{g:?}"),
     }
@@ -149,25 +165,64 @@ fn file_name(path: &str) -> String {
 }
 
 impl MediaPool {
+    pub fn set_composition_renderer(&self, executable: &str) {
+        *self.composition_renderer.write().unwrap_or_else(PoisonError::into_inner) = executable.to_string();
+    }
+
+    pub fn open_composition(&self, path: &str, comp: u64) -> Result<SharedSource, MediaError> {
+        let renderer = self.composition_renderer.read().unwrap_or_else(PoisonError::into_inner).clone();
+        crate::linked_compositions::open_source(path, comp, &renderer)
+    }
+
+    pub fn open_media_file(&self, path: &str, media: &MediaClip, services: &dyn Services) -> Result<SharedSource, MediaError> {
+        if let Some(comp) = media.interpret.linked_composition { self.open_composition(path, comp) } else { self.open_file(path, services) }
+    }
+
+    pub fn link_failed(&self, p: &Project, item: ItemId, path: &str, error: &str) {
+        if let Some(m) = p.item(item).and_then(|i| i.as_media()) {
+            self.set_offline(item, OfflineReason::Unreadable, path, error);
+            let slate: SharedSource = Arc::new(SlateSource::new(m.info.clone(), &m.info.name, OfflineReason::Unreadable));
+            self.cache_source(item, media_key(m), slate);
+        }
+    }
     pub fn register_opener(&self, o: Opener) {
         self.openers.write().unwrap_or_else(PoisonError::into_inner).push(o);
     }
 
     /// Cache a source for an item, valid whatever the item's reference (generators).
     pub fn insert(&self, item: ItemId, src: SharedSource) {
-        self.sources.write().unwrap_or_else(PoisonError::into_inner).insert(item, (String::new(), src));
+        self.cache_source(item, String::new(), src);
     }
 
     /// Cache a source for an item under its [`media_key`].
     pub fn insert_keyed(&self, item: ItemId, key: String, src: SharedSource) {
-        self.sources.write().unwrap_or_else(PoisonError::into_inner).insert(item, (key, src));
+        self.offline.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
+        self.cache_source(item, key, src);
+    }
+
+    fn cache_source(&self, item: ItemId, key: String, source: SharedSource) -> SharedSource {
+        let link = key
+            .strip_prefix("composition:")
+            .and_then(|s| s.split_once(':'))
+            .map(|(_, path)| Arc::new(LinkDiagnostic { path: path.to_string(), error: Mutex::default() }));
+        let source = if let Some(diagnostic) = &link {
+            Arc::new(PreviewLinkSource {
+                slate: SlateSource::new(source.info().clone(), &source.info().name, OfflineReason::Unreadable),
+                inner: source,
+                diagnostic: diagnostic.clone(),
+            }) as SharedSource
+        } else {
+            source
+        };
+        self.sources.write().unwrap_or_else(PoisonError::into_inner).insert(item, CachedSource { key, source: source.clone(), link });
+        source
     }
 
     /// Cache a source opened from `path` for an item.
     pub fn insert_file(&self, item: ItemId, path: &str, src: SharedSource) {
         self.offline.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
         let src = self.unsupported_as_slate(item, path, src);
-        self.sources.write().unwrap_or_else(PoisonError::into_inner).insert(item, (format!("file:{path}"), src));
+        self.cache_source(item, format!("file:{path}"), src);
     }
 
     /// `src` (opened from `path` for `item`) showing the unreadable slate for the frames it
@@ -239,7 +294,7 @@ impl MediaPool {
     }
 
     pub fn cached(&self, item: ItemId) -> Option<SharedSource> {
-        self.sources.read().unwrap_or_else(PoisonError::into_inner).get(&item).map(|(_, s)| s.clone())
+        self.sources.read().unwrap_or_else(PoisonError::into_inner).get(&item).map(|s| s.source.clone())
     }
 
     /// Sources opened so far (originals and proxies; `perf.stats`).
@@ -270,7 +325,13 @@ impl MediaPool {
 
     /// Why an item last rendered offline (None = online or not opened yet).
     pub fn offline_status(&self, item: ItemId) -> Option<OfflineStatus> {
-        self.offline.read().unwrap_or_else(PoisonError::into_inner).get(&item).cloned()
+        if let Some(status) = self.offline.read().unwrap_or_else(PoisonError::into_inner).get(&item).cloned() {
+            return Some(status);
+        }
+        let sources = self.sources.read().unwrap_or_else(PoisonError::into_inner);
+        let diagnostic = sources.get(&item)?.link.as_ref()?;
+        let error = diagnostic.error.lock().unwrap_or_else(PoisonError::into_inner).clone()?;
+        Some(OfflineStatus { reason: OfflineReason::Unreadable, path: diagnostic.path.clone(), error })
     }
 
     /// Open a file through the registered openers.
@@ -322,10 +383,10 @@ impl MediaPool {
             return Some(s);
         }
         let key = media_key(m);
-        if let Some((k, s)) = self.sources.read().unwrap_or_else(PoisonError::into_inner).get(&item)
-            && (k.is_empty() || *k == key)
+        if let Some(cached) = self.sources.read().unwrap_or_else(PoisonError::into_inner).get(&item)
+            && (cached.key.is_empty() || cached.key == key)
         {
-            return Some(s.clone());
+            return Some(cached.source.clone());
         }
         let src: SharedSource = match &m.media {
             MediaRef::Generator(g) => {
@@ -341,12 +402,12 @@ impl MediaPool {
                 if m.info.kind == filmcraft_media::MediaKind::ImageSequence {
                     open_image_sequence(&file, services, m.info.frame_rate(), &it.name)
                 } else {
-                    self.open_file(&file, services)
+                    self.open_media_file(&file, m, services)
                 }
             }) {
                 Ok(s) => {
                     self.offline.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
-                    self.unsupported_as_slate(item, path, s)
+                    if m.interpret.linked_composition.is_some() { s } else { self.unsupported_as_slate(item, path, s) }
                 }
                 Err(_) if filmcraft_media::pending::is_set() => {
                     // the host is still fetching the file's bytes: show the slate for now, retry later
@@ -360,8 +421,7 @@ impl MediaPool {
                 }
             },
         };
-        self.sources.write().unwrap_or_else(PoisonError::into_inner).insert(item, (key, src.clone()));
-        Some(src)
+        Some(self.cache_source(item, key, src))
     }
 
     /// A copy of `item`'s file for a background job: the file opened again through the host's
@@ -373,6 +433,15 @@ impl MediaPool {
     pub fn own_source(&self, p: &Project, item: ItemId, services: &dyn Services) -> Option<SharedSource> {
         let (item, m, _) = p.resolve_media(item)?;
         let MediaRef::File { path } = &m.media else { return None };
+        if !m.offline && m.interpret.linked_composition.is_some() {
+            // Export cannot fall back to an old preview snapshot when a newly saved project or
+            // its dependencies fail to open. Return a failing source and stop the export.
+            let source = self.follow_media(path).and_then(|file| self.open_media_file(&file, m, services));
+            return Some(match source {
+                Ok(src) => src,
+                Err(error) => Arc::new(LinkErrorSource { info: m.info.clone(), error: error.to_string() }),
+            });
+        }
         if m.offline || m.info.kind == filmcraft_media::MediaKind::ImageSequence || self.offline_status(item).is_some() {
             return None;
         }
@@ -402,7 +471,9 @@ impl MediaPool {
                 let audio_from = if s.info().audio_streams.len() < m.info.audio_streams.len() {
                     log::warn!("proxy has fewer audio streams than the original: {path}; audio from full-resolution media");
                     match &m.media {
-                        MediaRef::File { path: original } if !m.offline => self.follow_media(original).and_then(|file| self.open_file(&file, services)).ok(),
+                        MediaRef::File { path: original } if !m.offline => {
+                            self.follow_media(original).and_then(|file| self.open_media_file(&file, m, services)).ok()
+                        }
                         _ => None,
                     }
                 } else {
@@ -422,12 +493,12 @@ impl MediaPool {
 
     /// A render-side provider bound to a project snapshot (proxies when enabled).
     pub fn provider(self: &Arc<Self>, project: Arc<Project>, services: Arc<dyn Services>) -> PoolProvider {
-        PoolProvider { pool: self.clone(), project, services, full_res: false, used: None, own: None }
+        PoolProvider { pool: self.clone(), project, services, full_res: false, used: None, own: None, link_failure: Arc::default() }
     }
 
     /// A provider that always reads full-resolution media (export).
     pub fn full_res_provider(self: &Arc<Self>, project: Arc<Project>, services: Arc<dyn Services>) -> PoolProvider {
-        PoolProvider { pool: self.clone(), project, services, full_res: true, used: None, own: None }
+        PoolProvider { pool: self.clone(), project, services, full_res: true, used: None, own: None, link_failure: Arc::default() }
     }
 }
 
@@ -441,10 +512,38 @@ pub struct PoolProvider {
     /// Items asked for so far, when recording ([`PoolProvider::recording`]).
     used: Option<Mutex<BTreeSet<ItemId>>>,
     /// Per media item, its own copy or None to share the pool's source ([`PoolProvider::own_sources`]).
-    own: Option<Mutex<HashMap<ItemId, Option<SharedSource>>>>,
+    own: Option<Mutex<OwnSources>>,
+    link_failure: Arc<LinkFailure>,
+}
+
+#[derive(Default)]
+struct OwnSources {
+    items: HashMap<ItemId, Option<SharedSource>>,
+    compositions: crate::linked_compositions::JobSources,
+}
+
+#[derive(Default)]
+struct LinkFailure {
+    error: Mutex<Option<String>>,
+    progress: Option<Arc<filmcraft_export::Progress>>,
+}
+impl LinkFailure {
+    fn report(&self, error: String) {
+        self.error.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert(error);
+        if let Some(progress) = &self.progress {
+            progress.cancel.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 impl PoolProvider {
+    pub fn stop_on_link_error(mut self, progress: Arc<filmcraft_export::Progress>) -> Self {
+        self.link_failure = Arc::new(LinkFailure { error: Mutex::default(), progress: Some(progress) });
+        self
+    }
+    pub fn link_error(&self) -> Option<String> {
+        self.link_failure.error.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
     /// This full-resolution provider, reading its own copy of each file ([`MediaPool::own_source`])
     /// instead of the source the monitors read: a background job then never makes them wait for
     /// its frames, or seek their decoder away from the playhead. The copies close with the provider.
@@ -469,6 +568,18 @@ impl PoolProvider {
         media
             .into_iter()
             .filter_map(|id| {
+                // A private linked renderer has independent availability. Its errors fail the
+                // export through LinkFailure; a retired/unavailable preview must not claim that
+                // a successfully rendered export omitted this otherwise healthy composition.
+                if self.own.is_some()
+                    && self
+                        .project
+                        .item(id)
+                        .and_then(|i| i.as_media())
+                        .is_some_and(|m| !m.offline && m.interpret.linked_composition.is_some() && matches!(m.media, MediaRef::File { .. }))
+                {
+                    return None;
+                }
                 let st = self.pool.offline_status(id)?;
                 let status = match st.reason {
                     OfflineReason::Missing => "missing",
@@ -488,17 +599,30 @@ impl filmcraft_render::SourceProvider for PoolProvider {
             used.lock().unwrap_or_else(PoisonError::into_inner).insert(item);
         }
         if let Some(own) = &self.own
-            && let Some((media, _, _)) = self.project.resolve_media(item)
+            && let Some((media, m, _)) = self.project.resolve_media(item)
         {
             // opened under the lock: the job's threads open each file once
             let mut own = own.lock().unwrap_or_else(PoisonError::into_inner);
-            let src = match own.get(&media) {
+            let src = match own.items.get(&media) {
                 Some(src) => src.clone(),
                 None => {
-                    let src = self.pool.own_source(&self.project, media, &*self.services);
+                    let src = if !m.offline
+                        && let Some(comp) = m.interpret.linked_composition
+                        && let MediaRef::File { path } = &m.media
+                    {
+                        let renderer = self.pool.composition_renderer.read().unwrap_or_else(PoisonError::into_inner).clone();
+                        let source = self.pool.follow_media(path).and_then(|file| own.compositions.source(&file, comp, &renderer));
+                        let inner: SharedSource = match source {
+                            Ok(src) => src,
+                            Err(e) => Arc::new(LinkErrorSource { info: m.info.clone(), error: e.to_string() }),
+                        };
+                        Some(Arc::new(ReportingLinkSource { inner, failure: self.link_failure.clone() }) as SharedSource)
+                    } else {
+                        self.pool.own_source(&self.project, media, &*self.services)
+                    };
                     // the host is still fetching the file's bytes (the browser): try again next time
                     if src.is_some() || !filmcraft_media::pending::is_set() {
-                        own.insert(media, src.clone());
+                        own.items.insert(media, src.clone());
                     }
                     src
                 }
@@ -513,6 +637,80 @@ impl filmcraft_render::SourceProvider for PoolProvider {
 
 /// The offline slate as a media source: video frames are the slate at the requested scale of the
 /// item's frame size; audio is silence.
+struct LinkErrorSource {
+    info: MediaInfo,
+    error: String,
+}
+
+/// The diagnostic belongs to this exact cached source, not an item/path-wide callback. A late
+/// error from a replaced worker can only change its retired diagnostic, never the current one.
+struct PreviewLinkSource {
+    inner: SharedSource,
+    slate: SlateSource,
+    diagnostic: Arc<LinkDiagnostic>,
+}
+impl PreviewLinkSource {
+    fn record(&self, error: &MediaError) -> bool {
+        if matches!(error, MediaError::Cancelled | MediaError::NoStream(_)) || filmcraft_media::pending::is_set() {
+            return false;
+        }
+        self.diagnostic.error.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(|| {
+            format!("{}. Refresh this linked composition to reconnect to EffectCraft.", error.to_string().chars().take(4096).collect::<String>())
+        });
+        true
+    }
+}
+impl MediaSource for PreviewLinkSource {
+    fn info(&self) -> &MediaInfo {
+        self.inner.info()
+    }
+    fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
+        if self.diagnostic.error.lock().unwrap_or_else(PoisonError::into_inner).is_some() {
+            return self.slate.video_frame(req);
+        }
+        match self.inner.video_frame(req) {
+            Ok(frame) => Ok(frame),
+            Err(error) if self.record(&error) => self.slate.video_frame(req),
+            Err(error) => Err(error),
+        }
+    }
+    fn audio(&self, start: i64, frames: usize, rate: u32) -> Result<AudioBuffer, MediaError> {
+        if let Some(error) = self.diagnostic.error.lock().unwrap_or_else(PoisonError::into_inner).clone() {
+            return Err(MediaError::Decode(error));
+        }
+        self.inner.audio(start, frames, rate).inspect_err(|error| {
+            self.record(error);
+        })
+    }
+}
+
+struct ReportingLinkSource {
+    inner: SharedSource,
+    failure: Arc<LinkFailure>,
+}
+impl MediaSource for ReportingLinkSource {
+    fn info(&self) -> &MediaInfo {
+        self.inner.info()
+    }
+    fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
+        self.inner.video_frame(req).inspect_err(|e| self.failure.report(format!("Linked composition {}: {e}", self.info().name)))
+    }
+    fn audio(&self, start: i64, frames: usize, rate: u32) -> Result<AudioBuffer, MediaError> {
+        self.inner.audio(start, frames, rate).inspect_err(|e| self.failure.report(format!("Linked composition {}: {e}", self.info().name)))
+    }
+}
+impl MediaSource for LinkErrorSource {
+    fn info(&self) -> &MediaInfo {
+        &self.info
+    }
+    fn video_frame(&self, _: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
+        Err(MediaError::Decode(self.error.clone()))
+    }
+    fn audio(&self, _: i64, _: usize, _: u32) -> Result<AudioBuffer, MediaError> {
+        Err(MediaError::Decode(self.error.clone()))
+    }
+}
+
 pub struct SlateSource {
     info: MediaInfo,
     name: String,
@@ -922,6 +1120,7 @@ mod tests {
     const LOADING: u8 = 3;
     const CANCELLED: u8 = 4;
     const NO_VIDEO: u8 = 5;
+    const AUDIO_FAIL: u8 = 6;
     impl Flaky {
         fn set(&self, mode: u8) {
             self.1.store(mode, Ordering::Relaxed);
@@ -933,7 +1132,7 @@ mod tests {
         }
         fn video_frame(&self, _: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
             Err(match self.1.load(Ordering::Relaxed) {
-                OK => return Ok(Arc::new(VideoFrame::rgba8(2, 2, vec![7; 16]))),
+                OK | AUDIO_FAIL => return Ok(Arc::new(VideoFrame::rgba8(2, 2, vec![7; 16]))),
                 DAMAGED => MediaError::Decode("damaged slice".into()),
                 IO => MediaError::Io("short read".into()),
                 LOADING => {
@@ -946,6 +1145,9 @@ mod tests {
             })
         }
         fn audio(&self, _start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<AudioBuffer> {
+            if self.1.load(Ordering::Relaxed) == AUDIO_FAIL {
+                return Err(MediaError::Io("audio worker disconnected".into()));
+            }
             Ok(AudioBuffer::silence(sample_rate, 1, frames))
         }
     }
@@ -955,6 +1157,95 @@ mod tests {
             .info()
             .clone();
         (MediaPool::default(), ItemId(1), Arc::new(Flaky(info, Default::default())))
+    }
+
+    #[test]
+    fn linked_preview_reports_runtime_video_and_audio_failures_with_refresh_guidance() {
+        for mode in [IO, AUDIO_FAIL] {
+            let (pool, item, src) = flaky();
+            pool.insert_keyed(item, "composition:5:source.ecproj".into(), src.clone());
+            let preview = pool.cached(item).unwrap();
+            assert!(frame(&preview).is_ok());
+            assert!(pool.offline_status(item).is_none());
+            src.set(mode);
+            if mode == AUDIO_FAIL {
+                assert!(preview.audio(0, 16, 48000).is_err());
+            }
+            assert!(is_slate(&frame(&preview), &src.info().name), "failed linked video must show a visible unavailable slate");
+            let problem = pool.offline_status(item).expect("the current linked worker's error must reach the inspector");
+            assert_eq!(problem.reason, OfflineReason::Unreadable);
+            assert_eq!(problem.path, "source.ecproj");
+            assert!(problem.error.contains("Refresh"));
+        }
+    }
+
+    #[test]
+    fn retired_linked_workers_cannot_set_or_clear_a_new_workers_status() {
+        let (pool, item, old) = flaky();
+        let key = "composition:5:source.ecproj".to_string();
+        pool.insert_keyed(item, key.clone(), old.clone());
+        let retired = pool.cached(item).unwrap();
+        let fresh = Arc::new(Flaky(old.info().clone(), Default::default()));
+        pool.insert_keyed(item, key.clone(), fresh.clone());
+        let current = pool.cached(item).unwrap();
+        fresh.set(IO);
+        frame(&current).unwrap();
+        assert!(pool.offline_status(item).is_some());
+        frame(&retired).unwrap();
+        assert!(pool.offline_status(item).is_some(), "a retired successful response cannot clear the new worker's failure");
+        let restored = Arc::new(Flaky(old.info().clone(), Default::default()));
+        pool.insert_keyed(item, key, restored);
+        old.set(IO);
+        frame(&retired).unwrap();
+        assert!(pool.offline_status(item).is_none(), "a retired failed response cannot poison a successfully refreshed worker");
+    }
+
+    #[test]
+    fn linked_preview_does_not_mark_cancellation_pending_or_absent_streams_as_dead() {
+        for mode in [CANCELLED, LOADING, NO_VIDEO] {
+            let (pool, item, src) = flaky();
+            pool.insert_keyed(item, "composition:5:source.ecproj".into(), src.clone());
+            src.set(mode);
+            assert!(frame(&pool.cached(item).unwrap()).is_err());
+            assert!(pool.offline_status(item).is_none());
+            filmcraft_media::pending::take();
+        }
+    }
+
+    #[test]
+    fn an_unavailable_preview_does_not_falsely_report_a_healthy_private_export_offline() {
+        let mut s = crate::Session::default();
+        s.execute("file.importDemoFootage", serde_json::json!({})).unwrap();
+        let id = s.project.items.values().find(|i| i.as_media().is_some()).unwrap().id;
+        let m = Arc::make_mut(&mut s.project).item_mut(id).unwrap().as_media_mut().unwrap();
+        m.media = MediaRef::File { path: "source.ecproj".into() };
+        m.interpret.linked_composition = Some(5);
+        let key = media_key(m);
+        let (_, _, preview) = flaky();
+        s.media.insert_keyed(id, key, preview.clone());
+        preview.set(IO);
+        frame(&s.media.cached(id).unwrap()).unwrap();
+        assert!(s.media.offline_status(id).is_some());
+        let provider = s.media.full_res_provider(s.project.clone(), s.services.clone()).own_sources().recording();
+        let (_, _, healthy) = flaky();
+        provider.own.as_ref().unwrap().lock().unwrap().items.insert(id, Some(healthy));
+        let private = filmcraft_render::SourceProvider::source(&provider, id).unwrap();
+        assert!(frame(&private).is_ok());
+        assert!(provider.offline_used().is_empty(), "the export used a healthy private source, not the failed preview");
+        assert!(s.media.offline_status(id).is_some(), "the separate preview still needs a refresh");
+    }
+
+    #[test]
+    fn linked_export_cancels_on_a_renderer_failure_after_an_initial_good_frame() {
+        let (_, _, src) = flaky();
+        let progress = Arc::new(filmcraft_export::Progress::default());
+        let failure = Arc::new(LinkFailure { error: Mutex::default(), progress: Some(progress.clone()) });
+        let wrapped: SharedSource = Arc::new(ReportingLinkSource { inner: src.clone(), failure: failure.clone() });
+        assert!(frame(&wrapped).is_ok());
+        src.set(IO);
+        assert!(frame(&wrapped).is_err());
+        assert!(progress.cancel.load(Ordering::Relaxed));
+        assert!(failure.error.lock().unwrap().as_ref().unwrap().contains("short read"));
     }
 
     fn frame(src: &SharedSource) -> filmcraft_media::Result<Arc<VideoFrame>> {

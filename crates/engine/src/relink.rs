@@ -238,7 +238,7 @@ pub fn check_candidate(s: &Session, item: ItemId, path: &str, o: &MatchOptions) 
         }
     }
     if c.problems.is_empty() {
-        match s.media.open_file(path, &*s.services) {
+        match s.media.open_media_file(path, m, &*s.services) {
             Ok(src) => {
                 let info = src.info().clone();
                 let fd = m.info.frame_rate().frame_duration();
@@ -420,7 +420,8 @@ pub fn relink(s: &mut Session, p: &Value) -> Result<Value> {
     if c.source.is_none() {
         // Forced past a failed check: the file was never opened for its properties, so do it now
         // and let the item take the new file's own info instead of keeping the old file's.
-        let Ok(src) = s.media.open_file(&path, &*s.services) else {
+        let media = s.project.item(item).and_then(|i| i.as_media()).ok_or_else(|| bad("media.relink", "item is not media"))?;
+        let Ok(src) = s.media.open_media_file(&path, media, &*s.services) else {
             return Err(EngineError::Other(format!("{path} can't be opened")));
         };
         c.info = Some(src.info().clone());

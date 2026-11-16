@@ -48,6 +48,8 @@ impl FilmcraftApp {
             network_project: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             assistant: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            linked_compositions: Default::default(),
             file_dialogs: Default::default(),
             native_dialog: None,
             overwrite_prompt: None,
@@ -416,6 +418,9 @@ impl FilmcraftApp {
         if cfg!(target_arch = "wasm32") && self.frames.queue_len() > 0 {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
+        // Dialog controls must register in the accepted layout before automation resolves IDs.
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::linked_compositions::show(self, &ctx);
         if !ctx.will_discard() {
             self.drain_ui_requests(&ctx);
             #[cfg(not(target_arch = "wasm32"))]

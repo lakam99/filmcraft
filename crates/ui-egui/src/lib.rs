@@ -61,6 +61,8 @@ pub mod header;
 pub mod i18n;
 pub mod icons;
 mod ime_reset;
+#[cfg(not(target_arch = "wasm32"))]
+mod linked_compositions;
 pub mod links;
 pub mod menus;
 pub mod native_dialogs;
@@ -218,6 +220,8 @@ pub struct FilmcraftApp {
     /// Credentials, chat and worker state are deliberately outside serialized UiState.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) assistant: assistant::Runtime,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) linked_compositions: linked_compositions::Runtime,
     pub file_dialogs: panels::file_dialogs::FileDialogState,
     /// The native file dialog the host is showing ([`Self::pick`]).
     native_dialog: Option<native_dialogs::PendingDialog>,

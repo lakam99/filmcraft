@@ -66,6 +66,16 @@ fn native_key(h: &mut Harness<'_, FilmcraftApp>, key: Key) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn linked_composition_picker_controls_use_the_accepted_layout() {
+    let mut d = Driver::new(true);
+    d.ok("ui.menu.invoke", json!({"command":"file.linkComposition","params":{}}), true);
+    // A visible dialog must register its geometry before queued control requests are handled.
+    d.ok("ui.click", json!({"id":"composition.projectPath"}), true);
+    d.ok("ui.type", json!({"text":"example.ecproj"}), true);
+}
+
 #[test]
 fn native_j_cannot_start_reverse_playback_during_control_only_editing() {
     let mut d = Driver::new(true);

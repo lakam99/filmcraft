@@ -20,7 +20,10 @@ impl FilmcraftApp {
             }
         }
         let media = &self.session.prefs.media;
-        let (on, every) = (media.refresh_growing_files, f64::from(media.growing_refresh_seconds.max(1)));
+        let has_links = self.session.project.items.values().any(|i| i.as_media().is_some_and(|m| m.interpret.linked_composition.is_some() && !m.offline));
+        // A linked composition is expected to update while both editors are visible. Do not
+        // inherit the slower ingest polling interval or the growing-recording toggle.
+        let (on, every) = (media.refresh_growing_files || has_links, if has_links { 1.0 } else { f64::from(media.growing_refresh_seconds.max(1)) });
         let (last_key, focus_key) = (egui::Id::unique("mediaWatch.lastScan"), egui::Id::unique("mediaWatch.focused"));
         let focused = self.native_window_focused.unwrap_or(false);
         let was_focused: bool = ctx.data(|d| d.get_temp(focus_key)).unwrap_or(focused);

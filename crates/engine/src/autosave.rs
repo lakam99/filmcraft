@@ -242,6 +242,9 @@ pub struct Guide {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MediaPrefs {
+    /// Local trusted application path, never loaded from a project document. Empty autodetects
+    /// an EffectCraft installation next to FilmCraft in the fork launcher's apps directory.
+    pub effectcraft_executable: String,
     /// "Indeterminate Media Timebase": the frame rate of stills (`29.97df`, `25`, …).
     pub indeterminate_timebase: String,
     /// "Timecode": `useMediaSource` | `generate`.
@@ -272,6 +275,7 @@ pub struct MediaPrefs {
 impl Default for MediaPrefs {
     fn default() -> Self {
         Self {
+            effectcraft_executable: String::new(),
             indeterminate_timebase: "29.97df".into(),
             timecode: "useMediaSource".into(),
             frame_count: "startAt0".into(),

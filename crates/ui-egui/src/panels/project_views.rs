@@ -21,6 +21,7 @@ const LEAD: f32 = 26.0;
 
 pub fn item_icon(k: &ItemKind) -> Icon {
     match k {
+        ItemKind::Media(m) if m.interpret.linked_composition.is_some() => Icon::Link,
         ItemKind::Media(m) => match m.info.kind {
             filmcraft_media::MediaKind::AudioOnly => Icon::Audio,
             filmcraft_media::MediaKind::Still | filmcraft_media::MediaKind::ImageSequence => Icon::Image,
@@ -284,6 +285,19 @@ pub(super) fn item_interactions(app: &mut FilmcraftApp, ui: &egui::Ui, actions: 
 }
 
 fn item_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui, id: ItemId, kind: &ItemKind, actions: &mut Actions) {
+    if matches!(kind,ItemKind::Media(m) if m.interpret.linked_composition.is_some()) {
+        for (label, cmd) in
+            [("Open in EffectCraft", "composition.open"), ("Refresh linked composition", "composition.refresh"), ("Relink composition…", "composition.relink")]
+        {
+            let r = ui.button(label);
+            app.auto.add(&format!("project.itemMenu.{cmd}"), r.rect, label);
+            if r.clicked() {
+                actions.push((cmd.into(), json!({"item":id.0})));
+                ui.close();
+            }
+        }
+        ui.separator();
+    }
     let sel = || json!({"items": [id.0]});
     if ui.button(tl!("Rename")).clicked() {
         actions.push(("projectPanel.rename".into(), json!({"item": id.0})));

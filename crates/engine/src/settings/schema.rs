@@ -450,6 +450,7 @@ pub(super) static CATEGORIES: &[Category] = &[
         id: "media",
         title: "Media",
         rows: &[
+            f("media.effectcraftExecutable", "EffectCraft application (empty = automatic)", Kind::Text, true),
             f("media.indeterminateTimebase", "Indeterminate Media Timebase", Kind::Choice(TIMEBASE), true),
             f("media.timecode", "Timecode", Kind::Choice(TIMECODE), false),
             f("media.frameCount", "Frame Count", Kind::Choice(FRAME_COUNT), false),
