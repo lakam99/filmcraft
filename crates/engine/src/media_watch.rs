@@ -102,10 +102,29 @@ impl Session {
     /// Compare the media files' stamps with the ones last seen and read the changed files
     /// again. Returns `{refreshed: [item ids]}`.
     fn apply_media_stamps(&mut self, now: Vec<(String, Option<Stamp>)>) -> Result<Value> {
+        let linked_files: BTreeSet<_> = self
+            .project
+            .items
+            .values()
+            .filter_map(|i| {
+                let m = i.as_media()?;
+                m.interpret.linked_composition?;
+                if m.offline {
+                    return None;
+                }
+                let MediaRef::File { path } = &m.media else { return None };
+                Some(path.clone())
+            })
+            .collect();
         // Only the files the project uses now are remembered.
         let before: HashMap<String, Stamp> = std::mem::take(&mut self.media_stamps);
         let mut changed = BTreeSet::new();
         for (path, stamp) in now {
+            if linked_files.contains(&path)
+                && (crate::linked_compositions::observe_file(self, &path, stamp.is_some()) || !before.contains_key(&path) && stamp.is_some())
+            {
+                changed.insert(path.clone());
+            }
             match (before.get(&path), stamp) {
                 // Not there right now (an app saving by delete and rename): keep the last stamp.
                 (Some(old), None) => {
@@ -123,10 +142,27 @@ impl Session {
         if changed.is_empty() {
             return Ok(json!({"refreshed": []}));
         }
+        let linked_paths: BTreeSet<_> = self
+            .project
+            .items
+            .values()
+            .filter_map(|i| {
+                let m = i.as_media()?;
+                if m.interpret.linked_composition.is_none() || m.offline {
+                    return None;
+                }
+                let MediaRef::File { path } = &m.media else { return None };
+                changed.contains(path).then(|| path.clone())
+            })
+            .collect();
+        let linked_job = if linked_paths.is_empty() { None } else { Some(crate::linked_compositions::refresh_paths(self, &linked_paths)?) };
         let mut fresh = Vec::new();
         let mut failed = BTreeSet::new();
         for (id, it) in &self.project.items {
             let Some(m) = it.as_media().filter(|m| !m.offline) else { continue };
+            if m.interpret.linked_composition.is_some() {
+                continue;
+            }
             let MediaRef::File { path } = &m.media else { continue };
             if !changed.contains(path) || failed.contains(path) {
                 continue;
@@ -151,8 +187,12 @@ impl Session {
         }
         // A file that can't be opened (still being written, or not media FilmCraft reads) keeps its
         // new stamp: it is tried again once it changes again, not on every look.
+        let mut result = json!({"refreshed": []});
+        if let Some(job) = linked_job {
+            result["linkedJob"] = job;
+        }
         if fresh.is_empty() {
-            return Ok(json!({"refreshed": []}));
+            return Ok(result);
         }
         let p = Arc::make_mut(&mut self.project);
         let mut refreshed: Vec<ItemId> = Vec::new();
@@ -167,6 +207,7 @@ impl Session {
             refreshed.push(id);
         }
         self.bump_view();
-        Ok(json!({"refreshed": refreshed.iter().map(|i| i.0).collect::<Vec<_>>()}))
+        result["refreshed"] = json!(refreshed.iter().map(|i| i.0).collect::<Vec<_>>());
+        Ok(result)
     }
 }

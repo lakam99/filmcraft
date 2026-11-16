@@ -25,6 +25,7 @@ pub mod graphics;
 pub mod interchange;
 pub mod keyboard;
 mod keyframe_move;
+pub mod linked_compositions;
 mod marker_edit;
 mod marker_export;
 pub mod masks;
@@ -526,6 +527,7 @@ pub struct Session {
     pub media_stamps: std::collections::HashMap<String, media_watch::Stamp>,
     /// The stamps being taken on a worker thread ([`Session::start_media_scan`]).
     pub media_scan: Option<media_watch::MediaScan>,
+    pub linked: linked_compositions::Runtime,
 }
 
 /// An export advanced a batch at a time on the host's thread ([`Session::pump_jobs`]).
@@ -621,6 +623,7 @@ impl Session {
             command_origin: None,
             media_stamps: Default::default(),
             media_scan: None,
+            linked: Default::default(),
         }
     }
 
@@ -658,6 +661,7 @@ impl Session {
     pub fn start_autosave(&mut self, cfg: autosave::AutosaveConfig) -> std::io::Result<()> {
         let prefs_path = cfg.data_dir.join("preferences.json");
         self.prefs = autosave::Preferences::load(&prefs_path);
+        self.media.set_composition_renderer(&self.prefs.media.effectcraft_executable);
         // a restart restores the persisted Selection Follows Playhead toggle (#3089)
         self.state.selection_follows_playhead = self.prefs.timeline.selection_follows_playhead;
         self.prefs.apply_hardware_decoding();
@@ -706,6 +710,7 @@ impl Session {
     /// Apply worker notifications (call regularly, e.g. once per UI frame). Also applies the
     /// results of finished proxy / ingest jobs.
     pub fn poll_persistence(&mut self) {
+        linked_compositions::poll(self);
         proxies::poll(self);
         masks::poll(self);
         scene_detect::poll(self);
@@ -733,6 +738,7 @@ impl Session {
     pub fn set_prefs(&mut self, p: autosave::Preferences) -> std::io::Result<()> {
         let cache_changed = self.prefs.media_cache != p.media_cache;
         self.prefs = p;
+        self.media.set_composition_renderer(&self.prefs.media.effectcraft_executable);
         // the session mirrors the persisted Selection Follows Playhead toggle (#3089)
         self.state.selection_follows_playhead = self.prefs.timeline.selection_follows_playhead;
         self.prefs.apply_hardware_decoding();

@@ -19,6 +19,7 @@
 > the upstream downloads and community links below refer to the original FilmCraft project.
 > Download this fork and its relay bundle from [lakam99/filmcraft releases](https://github.com/lakam99/filmcraft/releases).
 > This fork's built-in update checker uses that same release feed.
+> **Linked EffectCraft compositions:** keep effects editable and refresh saved changes without an intermediate video export. See the [linked-composition guide](docs/linked-compositions.md).
 >
 > **AI editor chat:** **Window → AI Chat** accepts your OpenAI API key, inspects current video
 > frames, and operates FilmCraft through its existing editor tools. See [AI chat setup and controls](docs/ai-chat.md).

@@ -23,6 +23,8 @@ macro_rules! uic {
 
 pub const UI_COMMANDS: &[UiCommand] = &[
     #[cfg(not(target_arch = "wasm32"))]
+    uic!("composition.manage", "Linked Compositions…", ["Clip", "Linked Composition"], None),
+    #[cfg(not(target_arch = "wasm32"))]
     uic!("ai.chat", "AI Chat", [], None),
     #[cfg(not(target_arch = "wasm32"))]
     uic!("ai.connection", "OpenAI Connection", [], None),
@@ -239,6 +241,12 @@ pub(crate) fn menu_items_with_focus(app: &FilmcraftApp, ctx: &egui::Context) -> 
 
 /// Execute a UI or engine command by id.
 pub fn invoke_command(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params: Value) -> Result<Value, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(result) = crate::linked_compositions::route(app, id, &params) {
+        // A menu/control command opens the dialog after this pass laid out its windows.
+        ctx.request_repaint();
+        return result;
+    }
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(result) = crate::assistant::route(app, ctx, id) {
         return result;
