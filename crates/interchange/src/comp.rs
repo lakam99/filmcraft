@@ -412,7 +412,11 @@ impl Exporter<'_> {
             ItemKind::Media(m) => m,
             ItemKind::Sequence(nested) => {
                 let ckind = if kind == TrackKind::Video { CKind::Picture } else { CKind::Sound };
-                let channel = sub.map(|s| c.source_channels.get(s as usize).map(|&x| x as u32).unwrap_or(s));
+                let channel = if self.media.essence_for(EssenceKey::Clip(c.id), sub).is_some() {
+                    sub
+                } else {
+                    sub.map(|s| c.source_channels.get(s as usize).map(|&x| x as u32).unwrap_or(s))
+                };
                 return self.nest_source(c, item, &it.name, nested, ckind, channel);
             }
             _ => {
@@ -432,7 +436,11 @@ impl Exporter<'_> {
         };
         let ckind = if kind == TrackKind::Video { CKind::Picture } else { CKind::Sound };
         // the source channel this slot plays when broken out to mono
-        let channel = sub.map(|s| c.source_channels.get(s as usize).map(|&x| x as u32).unwrap_or(s));
+        let channel = if ckind == CKind::Sound && self.media.essence_for(EssenceKey::Clip(c.id), sub).is_some() {
+            sub
+        } else {
+            sub.map(|s| c.source_channels.get(s as usize).map(|&x| x as u32).unwrap_or(s))
+        };
         let clip_key = EssenceKey::Clip(c.id);
         let media_key = EssenceKey::media(item, c.audio_stream);
         let ess = (ckind == CKind::Sound)
@@ -534,7 +542,8 @@ impl Exporter<'_> {
 
     fn gain_of(&mut self, c: &TrackItem, source: &Source) -> Option<Gain> {
         if source.key.starts_with("clip:") {
-            return None; // rendered: effects baked in
+            let gain = self.media.essence.iter().find(|e| e.key == EssenceKey::Clip(c.id)).map_or(1.0, |e| e.render_gain);
+            return (gain != 1.0).then_some(Gain::Constant(gain)); // restore PCM headroom; effects are baked in
         }
         let g = c.gain_db;
         match param(c, "volume", "level") {
@@ -627,10 +636,16 @@ impl Exporter<'_> {
                 _ => e,
             };
             if c.speed != 1.0 || c.reverse || c.frame_hold.is_some() {
-                self.report.warn("speed changes, reverse playback and frame holds are not exported (clips play at 100%)");
+                if kind == TrackKind::Audio && self.media.essence.iter().any(|e| e.key == EssenceKey::Clip(c.id) && e.timing_rendered) {
+                    self.report.info("retimed audio and its clip effects were rendered into PCM");
+                } else if kind == TrackKind::Video {
+                    self.report.warn("video speed changes, reverse playback and frame holds are not exported (picture plays at 100%)");
+                } else {
+                    self.report.warn("speed changes, reverse playback and frame holds are not exported (clips play at 100%)");
+                }
             }
             let source = self.doc.sources[src].clone();
-            // clips play at 100% here, so timeline and media advance together
+            // Prepared PCM already contains retiming; the document advances at 100%.
             let start = c.source_in + (seg_start - s) - source.offset;
             if start < Tick::ZERO {
                 self.report.warn("a clip uses media before the start of its (trimmed) essence");

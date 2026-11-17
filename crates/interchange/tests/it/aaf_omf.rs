@@ -123,6 +123,8 @@ fn trimmed_retimed_audio_covers_the_declared_clip() {
             channels: 2,
             data: EssenceData::Embedded(vec![0; frames as usize * 4]),
             effects_rendered: false,
+            timing_rendered: false,
+            render_gain: 1.0,
         };
         let opts = AafOptions { media: MediaOptions { essence: vec![essence], ..Default::default() }, ..Default::default() };
         let (bytes, report) = aaf::export(&p, s, &opts).unwrap();
@@ -261,6 +263,8 @@ fn aaf_embedded_trimmed_audio() {
             channels: 2,
             data: EssenceData::Embedded(pcm_ramp(frames as usize, 2, k as i32)),
             effects_rendered: false,
+            timing_rendered: false,
+            render_gain: 1.0,
         });
     }
     let opts = AafOptions { media: MediaOptions { essence: essence.clone(), ..Default::default() }, ..Default::default() };
@@ -307,6 +311,8 @@ fn aaf_linked_consolidated_audio_and_mixdown() {
                 channels: 1,
                 data: EssenceData::File { path: format!("/out/{:?}_{c}.wav", n.key).replace(['(', ')'], "") },
                 effects_rendered: true,
+                timing_rendered: false,
+                render_gain: 1.0,
             })
         })
         .collect();
@@ -351,6 +357,8 @@ fn omf_round_trip_audio_only() {
                     channels: 2,
                     data: EssenceData::Embedded(pcm_ramp(frames as usize, 2, k as i32 * 7)),
                     effects_rendered: false,
+                    timing_rendered: false,
+                    render_gain: 1.0,
                 }
             })
             .collect();
@@ -408,6 +416,8 @@ fn omf_separate_files_and_breakout() {
                 channels: 1,
                 data: EssenceData::File { path: format!("/omf/media/{}_{c}.aif", n.item.0) },
                 effects_rendered: false,
+                timing_rendered: false,
+                render_gain: 1.0,
             })
         })
         .collect();
@@ -473,6 +483,8 @@ fn empty_and_damaged_documents() {
             channels: 2,
             data: EssenceData::Embedded(pcm_ramp(100, 2, 1)),
             effects_rendered: false,
+            timing_rendered: false,
+            render_gain: 1.0,
         })
         .collect();
     let (omf_bytes, _) = omf::export(&p, s, &OmfOptions { media: MediaOptions { essence, ..Default::default() }, ..Default::default() }).unwrap();
@@ -710,6 +722,8 @@ fn omf_carries_the_rendered_sound_of_a_nested_sequence() {
                 channels: 2,
                 data: EssenceData::Embedded(pcm_ramp(frames as usize, 2, k as i32 * 11)),
                 effects_rendered: matches!(n.key, EssenceKey::Clip(_)),
+                timing_rendered: false,
+                render_gain: 1.0,
             }
         })
         .collect();
@@ -742,9 +756,10 @@ fn omf_carries_the_rendered_sound_of_a_nested_sequence() {
 }
 
 /// Media with an absurd channel count and sample rate (a hand-edited or hostile project file)
-/// overflowed the PCM descriptor's block align and average-bytes fields.
+/// overflowed the PCM descriptor's block align and average-bytes fields. Reject the unsupported
+/// channel count before expanding source slots instead of allocating from that hostile count.
 #[test]
-fn absurd_audio_stream_values_export_without_overflow() {
+fn absurd_audio_stream_values_are_rejected_without_overflow() {
     let rate = FrameRate::FPS_25;
     let mut p = Project::new("p");
     let a = media(&mut p, "/media/A.wav", false, true, rate);
@@ -754,7 +769,8 @@ fn absurd_audio_stream_values_export_without_overflow() {
     }
     let s = sequence(&mut p, "S", rate, false);
     clip(&mut p, s, TrackKind::Audio, 0, a, 0..25, 0);
-    assert!(aaf::export(&p, s, &AafOptions::default()).is_ok());
+    let error = aaf::export(&p, s, &AafOptions::default()).expect_err("unsupported channel counts need an actionable error");
+    assert!(error.to_string().contains("channels"), "{error}");
 }
 
 /// The OMF writer had the same overflow, and cut the channel count to u16 with `as` (65 536

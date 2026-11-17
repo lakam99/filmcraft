@@ -734,11 +734,22 @@ imported timeline. `file.exportInterchange`, `file.exportEdl`,
 any other value is a parameter error and nothing is written. For AAF and
 OMF the engine (`engine::aaf_omf`) first prepares the audio the document references: it lists the
 used ranges (`interchange::essence::audio_needs`), decodes or renders them (clip effects through the
-export audio pipeline), embeds them or writes WAV / AIFF files, and optionally renders a video
+audio mixer), embeds them or writes WAV / AIFF files, and optionally renders a video
 mixdown. A nested sequence is exported the way Premiere Pro does it: a composition of its own in
 AAF (the media of the clips inside it is prepared with the rest), its sound mixed into the document
 in OMF, a nested sequence in FCP7 XML, FCPXML and OTIO, and one `AX` event in an EDL (table in the
 [interchange README](../crates/interchange/README.md)).
+
+AAF/OMF audio with speed changes or reverse playback is always rendered per clip
+at the export sample rate, including its clip effects, gain, automation and channel mapping.
+This also applies to linked audio (only retimed clips receive new sidecar files) and retimed
+nested sequences. Rendering keeps the original timeline coordinate system and visible clip
+boundaries so automation blocks and pitch-preserving grains match playback. Handles remain
+available for trimming; transitions retain their separate AAF/OMF edit operations. Hot rendered
+audio is scaled into integer PCM headroom and restored by a gain operation to avoid clipping.
+Use 24-bit audio at the sequence sample rate for the closest sample match. Track/submix/master
+effects are not baked into individual clips. The generic `file.exportInterchange` command uses
+the same media preparation for AAF/OMF.
 
 ## 7. Automation surfaces
 

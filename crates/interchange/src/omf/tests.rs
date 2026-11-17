@@ -78,6 +78,8 @@ fn written_files_have_the_required_structure() {
             channels: 2,
             data: EssenceData::Embedded(vec![7; 480 * 4]),
             effects_rendered: false,
+            timing_rendered: false,
+            render_gain: 1.0,
         })
         .collect();
     let (bytes, _) = export(&p, s, &OmfOptions { media: MediaOptions { essence, ..Default::default() }, ..Default::default() }).unwrap();

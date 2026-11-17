@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 
 use filmcraft_interchange::essence::{AudioEssence, AudioNeed, EssenceData, EssenceKey, MediaOptions, MixdownVideo, NeedOptions, NestNeeds, audio_needs};
-use filmcraft_project::{ClipId, ItemId, Project, Sequence, SequenceSettings, Track, TrackItem, TrackKind};
+use filmcraft_project::{ClipId, ItemId, Project, Sequence, Track, TrackItem, TrackKind};
 use filmcraft_time::{Tick, TimeRange};
 
 use crate::commands::{bad, bool_p, str_p, u64_p};
@@ -33,7 +33,7 @@ pub enum AudioMode {
     Embedded,
     /// Separate WAV / AIFF files next to the document.
     Separate,
-    /// The original media files (AAF only; untrimmed, unrendered).
+    /// Original media files (AAF only), with rendered sidecars for retimed clips.
     Linked,
 }
 
@@ -120,28 +120,39 @@ fn quantize(planar: &[&Vec<f32>], bits: u16) -> Vec<u8> {
     out
 }
 
-fn dequantize(pcm: &[u8], channels: usize, bits: u16) -> Vec<Vec<f32>> {
-    let bps = bits.div_ceil(8) as usize;
-    let ch = channels.max(1);
-    let n = pcm.len() / (bps * ch).max(1);
-    let mut out = vec![Vec::with_capacity(n); ch];
-    for i in 0..n {
-        for (c, o) in out.iter_mut().enumerate() {
-            let s = &pcm[(i * ch + c) * bps..(i * ch + c + 1) * bps];
-            let v = match bps {
-                1 => (s[0] as f32 - 128.0) / 128.0,
-                2 => i16::from_le_bytes([s[0], s[1]]) as f32 / 32_768.0,
-                3 => (i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8) as f32 / 8_388_608.0,
-                _ => i32::from_le_bytes([s[0], s[1], s[2], s[3]]) as f32 / 2_147_483_648.0,
-            };
-            o.push(v);
-        }
-    }
-    out
-}
-
 const MAX_EXPORT_AUDIO_CHANNELS: usize = 64;
 const MAX_EXPORT_AUDIO_SAMPLES: usize = 64 * 1024 * 1024;
+
+/// Playback can fall back to silence after a decode failure. An interchange render must
+/// instead fail, so a receiving editor never mistakes missing audio for a successful bake.
+struct RenderAudioSource {
+    inner: filmcraft_media::SharedSource,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+impl filmcraft_media::MediaSource for RenderAudioSource {
+    fn info(&self) -> &filmcraft_media::MediaInfo {
+        self.inner.info()
+    }
+    fn video_frame(&self, req: filmcraft_media::FrameRequest) -> filmcraft_media::Result<Arc<filmcraft_frame::VideoFrame>> {
+        self.inner.video_frame(req)
+    }
+    fn audio(&self, start: i64, frames: usize, rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+        self.audio_stream(0, start, frames, rate)
+    }
+    fn audio_stream(&self, stream: usize, start: i64, frames: usize, rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+        let channels = self.info().audio_streams.get(stream).map_or(1, |a| a.channels.max(1) as usize);
+        let result = if frames.saturating_mul(channels) > MAX_EXPORT_AUDIO_SAMPLES {
+            Err(filmcraft_media::MediaError::Decode("audio render source request exceeds the sample budget".into()))
+        } else {
+            self.inner.audio_stream(stream, start, frames, rate)
+        };
+        if let Err(e) = &result {
+            self.error.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| e.to_string());
+        }
+        result
+    }
+}
 
 /// Decode a media range at `sample_rate` (planar).
 fn decode(s: &Session, need: &AudioNeed, sample_rate: u32) -> Result<Vec<Vec<f32>>> {
@@ -173,54 +184,127 @@ fn decode(s: &Session, need: &AudioNeed, sample_rate: u32) -> Result<Vec<Vec<f32
     Ok(out)
 }
 
-/// Render one clip (with its effects, gain and volume) over a media range, through the export
-/// pipeline's audio mixer.
-fn render_clip(s: &Session, seq: ItemId, need: &AudioNeed, sample_rate: u32, bits: u16) -> Result<Vec<Vec<f32>>> {
+/// Render in the original timeline coordinate system: gain automation, DSP blocks and
+/// pitch-preserving grains must have the same phase and clip boundaries as playback.
+fn render_clip(s: &Session, seq: ItemId, need: &AudioNeed, sample_rate: u32) -> Result<Vec<Vec<f32>>> {
     let EssenceKey::Clip(clip_id) = need.key else { return decode(s, need, sample_rate) };
-    let (q, track, c) = audio_clip(&s.project, seq, clip_id).ok_or_else(|| EngineError::Other("clip not found".into()))?;
-    let c = c.clone();
-    let mut p: Project = (*s.project).clone();
-    let settings = SequenceSettings { sample_rate, ..q.settings.clone() };
-    let rs = p.new_sequence("AAF audio render", settings, 0, 1, None);
-    let dur = need.end - need.start;
-    let mut c = c;
-    c.start = Tick::ZERO;
-    c.source_in = need.start;
-    c.duration = dur;
-    c.speed = 1.0;
-    c.reverse = false;
-    c.link = None;
-    let channels = match track.channels {
-        filmcraft_project::AudioChannels::Mono => 1,
-        filmcraft_project::AudioChannels::Surround51 => 6,
-        _ => 2,
-    };
-    if let Some(t) = p.sequence_mut(rs).and_then(|r| r.audio_tracks.first_mut()) {
-        t.channels = track.channels;
-        t.items = vec![c];
+    let (_, track, c) = audio_clip(&s.project, seq, clip_id).ok_or_else(|| EngineError::Other("clip not found".into()))?;
+    if c.frame_hold.is_some() {
+        return Err(EngineError::Other("frame holds are supported on video clips only".into()));
     }
-    let buf: Arc<Mutex<Vec<u8>>> = Arc::default();
-    let sink_buf = buf.clone();
-    let mut settings = filmcraft_export::ExportSettings {
-        format: filmcraft_export::Format::Wav,
-        path: "render.wav".into(),
-        range: Some(TimeRange::new(Tick::ZERO, dur)),
-        part_of_batch: true,
-        sink: Some(filmcraft_export::OutputSink(Arc::new(move |_: &str, d: Vec<u8>| {
-            *sink_buf.lock().unwrap_or_else(|e| e.into_inner()) = d;
-            Ok(())
-        }))),
-        ..Default::default()
+    if c.duration <= Tick::ZERO {
+        return Err(EngineError::Other("audio render needs a positive clip duration".into()));
+    }
+    let sr = i64::from(sample_rate);
+    let head = (c.source_in - need.start).to_units_floor(sr).max(0);
+    let tail = (need.end - c.source_in - c.duration).to_units_floor(sr).max(0);
+    let body_start = c.start.to_units_floor(sr);
+    let body_end = c.end().to_units_floor(sr);
+    let first = body_start.checked_sub(head).ok_or_else(|| EngineError::Other("audio render start overflow".into()))?;
+    let end = body_end.checked_add(tail).ok_or_else(|| EngineError::Other("audio render end overflow".into()))?;
+    // AAF stores rounded sample units; a sub-sample edit can declare one more sample
+    // than playback's floor(end)-floor(start). Supply that sample rather than a short file.
+    let requested = ((i128::from((need.end - need.start).0) * i128::from(sample_rate) + i128::from(filmcraft_time::TICKS_PER_SECOND / 2))
+        / i128::from(filmcraft_time::TICKS_PER_SECOND))
+    .max(0);
+    let frames =
+        usize::try_from(i128::from(end.saturating_sub(first)).max(requested)).map_err(|_| EngineError::Other("invalid audio render duration".into()))?;
+    let channels = if track.channels == filmcraft_project::AudioChannels::Surround51 { 6 } else { 2 };
+    if !c.speed.is_finite()
+        || c.speed.abs() < 1e-6
+        || frames.saturating_mul(channels) > MAX_EXPORT_AUDIO_SAMPLES
+        || frames as f64 * c.speed.abs().max(1.0) * f64::from(need.channels.max(1)) > MAX_EXPORT_AUDIO_SAMPLES as f64
+    {
+        return Err(EngineError::Other(
+            "audio render exceeds the supported sample budget or has an invalid speed; split the clip into shorter sections".into(),
+        ));
+    }
+    if s.project.sequence(need.item).is_none() && s.media.full_res_source(&s.project, need.item, &*s.services).is_none() {
+        return Err(EngineError::Other(format!("media {} is offline", need.path.as_deref().unwrap_or("?"))));
+    }
+    let provider = s.media.full_res_provider(s.project.clone(), s.services.clone()).recording();
+    let error: Arc<Mutex<Option<String>>> = Arc::default();
+    let checked = |item| {
+        filmcraft_render::SourceProvider::source(&provider, item)
+            .map(|inner| Arc::new(RenderAudioSource { inner, error: error.clone() }) as filmcraft_media::SharedSource)
     };
-    settings.audio.sample_rate = Some(sample_rate);
-    settings.audio.channels = channels;
-    settings.audio.bits = bits;
-    let project = Arc::new(p);
-    let provider = s.media.full_res_provider(project.clone(), s.services.clone());
-    filmcraft_export::export(&project, rs, &settings, &provider, &Default::default()).map_err(|e| EngineError::Other(e.to_string()))?;
-    let wav = std::mem::take(&mut *buf.lock().unwrap_or_else(|e| e.into_inner()));
-    let (pcm, ch, _, b) = filmcraft_interchange::wav::parse_wav(&wav).ok_or_else(|| EngineError::Other("audio render produced no WAVE data".into()))?;
-    Ok(dequantize(&pcm, ch as usize, b))
+    // Keep source requests bounded too, including faster-than-realtime playback and
+    // nested mixes. Absolute resampling/DSP grids make these chunks sample-equivalent.
+    let chunk_frames = (16_384.0 / c.speed.abs().max(1.0)).floor().clamp(1.0, 4096.0) as usize;
+    let mut isolated = track.clone();
+    isolated.transitions.clear(); // the interchange composition carries the transitions
+    let extended = filmcraft_render::audio::with_handles(c, Tick::from_units(first, sr), Tick::from_units(end, sr));
+    let mut out = vec![Vec::with_capacity(frames); channels];
+    // Extending a pitch-preserving clip changes its edge grains. Keep the original clip for
+    // the visible body, and extend only the editable handles, so consolidation cannot alter it.
+    for (start, stop, item) in [(first, body_start, &extended), (body_start, body_end, c), (body_end, end, &extended)] {
+        if stop <= start {
+            continue;
+        }
+        isolated.items = vec![item.clone()];
+        for at in (start..stop).step_by(chunk_frames) {
+            let n = (stop - at).min(chunk_frames as i64) as usize;
+            let b = filmcraft_render::audio::track_input(&s.project, &isolated, at, n, sample_rate, &checked);
+            for (dst, src) in out.iter_mut().zip(b.channels) {
+                dst.extend(src);
+            }
+        }
+    }
+    // Playback recomputes each transition using that transition's own extended clip.
+    // Preserve its edge grains too; the receiving AAF mixer applies the fade separately.
+    for tr in &track.transitions {
+        if tr.from != Some(c.id) && tr.to != Some(c.id) {
+            continue;
+        }
+        let start = tr.start.to_units_floor(sr).max(first);
+        let stop = tr.end().to_units_floor(sr).min(end);
+        if stop <= start {
+            continue;
+        }
+        isolated.items = vec![filmcraft_render::audio::with_handles(c, tr.start, tr.end())];
+        for at in (start..stop).step_by(chunk_frames) {
+            let n = (stop - at).min(chunk_frames as i64) as usize;
+            let b = filmcraft_render::audio::track_input(&s.project, &isolated, at, n, sample_rate, &checked);
+            let offset = (at - first) as usize;
+            for (dst, src) in out.iter_mut().zip(b.channels) {
+                if let Some(dst) = dst.get_mut(offset..offset + src.len()) {
+                    dst.copy_from_slice(&src);
+                }
+            }
+        }
+    }
+    if !provider.offline_used().is_empty() {
+        return Err(EngineError::Other("audio render contains offline media; relink it before exporting".into()));
+    }
+    if let Some(error) = error.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        return Err(EngineError::Other(format!("audio render failed: {error}")));
+    }
+    for channel in &mut out {
+        channel.resize(frames, 0.0);
+    }
+    Ok(out)
+}
+
+/// Power-of-two scaling keeps hot floating-point audio intact in integer PCM. The AAF gain
+/// operation restores this scale in the receiving mixer instead of clipping the baked samples.
+fn preserve_headroom(planar: &mut [Vec<f32>]) -> Result<f64> {
+    let mut peak = 1.0f32;
+    for &sample in planar.iter().flatten() {
+        if !sample.is_finite() {
+            return Err(EngineError::Other("audio render produced a non-finite sample".into()));
+        }
+        peak = peak.max(sample.abs());
+    }
+    let gain = 2.0f64.powf(f64::from(peak).log2().ceil());
+    if gain > 16384.0 {
+        return Err(EngineError::Other("audio render exceeds the representable AAF/OMF gain; reduce the clip level before exporting".into()));
+    }
+    if gain > 1.0 {
+        for sample in planar.iter_mut().flatten() {
+            *sample = (f64::from(*sample) / gain) as f32;
+        }
+    }
+    Ok(gain)
 }
 
 /// The audio clip `clip` with its track and sequence: in `seq`, or in a sequence nested in it
@@ -250,8 +334,8 @@ fn ensure_dir(s: &Session, dir: &str) {
 
 fn check_linked_streams(s: &Session, seq: ItemId, plan: &AudioPlan) -> Result<()> {
     if plan.mode == AudioMode::Linked && !plan.trim && !plan.render_effects {
-        let needs = audio_needs(&s.project, seq, &NeedOptions { nests: plan.nests, ..Default::default() });
-        if needs.iter().any(|need| need.audio_stream > 0) {
+        let needs = audio_needs(&s.project, seq, &NeedOptions { nests: plan.nests, bake_retiming: true, ..Default::default() });
+        if needs.iter().any(|need| need.audio_stream > 0 && !matches!(need.key, EssenceKey::Clip(_))) {
             return Err(EngineError::Other("linked AAF media cannot select container audio streams; choose embedded or separate audio".into()));
         }
     }
@@ -261,21 +345,42 @@ fn check_linked_streams(s: &Session, seq: ItemId, plan: &AudioPlan) -> Result<()
 /// Prepare the audio essence of an export; returns the essence and the files written.
 pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str) -> Result<(Vec<AudioEssence>, Vec<String>)> {
     check_linked_streams(s, seq, plan)?;
-    if plan.mode == AudioMode::Linked && !plan.trim && !plan.render_effects {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let needs = audio_needs(
+    let mut needs = audio_needs(
         &s.project,
         seq,
-        &NeedOptions { handles: plan.handles, per_clip: plan.render_effects, whole_media: !plan.trim && !plan.render_effects, nests: plan.nests },
+        &NeedOptions {
+            handles: plan.handles,
+            per_clip: plan.render_effects,
+            whole_media: !plan.trim && !plan.render_effects,
+            nests: plan.nests,
+            bake_retiming: true,
+        },
     );
     let mut essence = Vec::new();
     let mut files = Vec::new();
     let mut used = std::collections::HashSet::new();
-    for need in &needs {
-        // a nested sequence has no file to read: its sound is mixed, with what is on the clip
+    for need in &mut needs {
         let nest = s.project.sequence(need.item).is_some();
-        let planar = if plan.render_effects || nest { render_clip(s, seq, need, plan.sample_rate, plan.bits)? } else { decode(s, need, plan.sample_rate)? };
+        let timing = match need.key {
+            EssenceKey::Clip(id) => audio_clip(&s.project, seq, id).is_some_and(|(_, _, c)| filmcraft_interchange::essence::retimed(c)),
+            _ => false,
+        };
+        if plan.mode == AudioMode::Linked && !plan.trim && !plan.render_effects && !timing && !nest {
+            continue;
+        }
+        let rendered = plan.render_effects || nest || timing;
+        if rendered
+            && let EssenceKey::Clip(id) = need.key
+            && let Some((_, _, c)) = audio_clip(&s.project, seq, id)
+        {
+            let sr = i64::from(plan.sample_rate);
+            let head = (c.source_in - need.start).to_units_floor(sr).max(0);
+            let tail = (need.end - c.source_in - c.duration).to_units_floor(sr).max(0);
+            need.start = c.source_in - Tick::from_units(head, sr);
+            need.end = c.source_in + c.duration + Tick::from_units(tail, sr);
+        }
+        let mut planar = if rendered { render_clip(s, seq, need, plan.sample_rate)? } else { decode(s, need, plan.sample_rate)? };
+        let render_gain = if rendered { preserve_headroom(&mut planar)? } else { 1.0 };
         let frames = planar.first().map_or(0, Vec::len) as u64;
         let groups: Vec<(Option<u32>, Vec<&Vec<f32>>)> =
             if plan.breakout { planar.iter().enumerate().map(|(c, x)| (Some(c as u32), vec![x])).collect() } else { vec![(None, planar.iter().collect())] };
@@ -350,7 +455,9 @@ pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str
                 bits: plan.bits,
                 channels: n,
                 data,
-                effects_rendered: plan.render_effects || nest,
+                effects_rendered: rendered,
+                timing_rendered: timing,
+                render_gain,
             });
         }
     }

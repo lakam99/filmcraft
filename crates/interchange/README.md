@@ -56,7 +56,19 @@ Embedded / consolidated audio (`essence`): `audio_needs` lists the media ranges 
 references (per media item or per clip, with handles); the engine decodes or renders them and
 passes `AudioEssence` (embedded PCM or a written file) back in `MediaOptions`.
 
-Not represented: speed changes and frame holds (exported at 100 % with a report entry),
+The engine renders retimed audio (speed, pitch preservation, and reverse) into
+per-clip PCM, including clip effects and automation, even in linked mode. Use 24-bit audio
+at the sequence sample rate for the closest sample match. Direct library callers must supply
+essence with `timing_rendered` set, otherwise timing is reported as unsupported. Hot rendered
+samples use `render_gain` to restore headroom without PCM clipping.
+
+Interleaved AAF audio exposes every file channel as a source slot, with explicit one-based
+`SourceReference::ChannelIDs` for whole-file references (Object Specification v1.1 §7.6).
+Studio Pro otherwise creates a mono mixer channel for a stereo WAV and attenuates its center
+pan. Readback keeps whole-file and mono channel selections separate in the source cache.
+Slot expansion accepts at most 64 channels and rejects invalid source channel indices.
+
+Not represented: picture speed changes and frame holds (exported at 100 % with a report entry),
 graphics and synthetic media (gaps), video effects other than transitions, clip
 markers (written to the master mob, so they come back as media markers), OMF video and markers.
 

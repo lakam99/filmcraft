@@ -116,13 +116,20 @@ fn indirect_f64(d: &[u8]) -> Option<f64> {
     }
 }
 
+#[derive(Default)]
+struct SourceContext {
+    key: Option<String>,
+    full_channels: Option<u32>,
+}
+
 struct R<'a> {
     report: &'a mut Report,
     mobs: HashMap<MobId, &'a Obj>,
     essence: HashMap<MobId, &'a [u8]>,
     doc: Document,
-    /// (file mob id, slot id, master key) → source index
-    sources: HashMap<(MobId, u32, String), usize>,
+    /// (file mob id, slot id, master key, full channel count) → source index.
+    /// A whole-file reference must not overwrite a cached mono reference to that file.
+    sources: HashMap<(MobId, u32, String, Option<u32>), usize>,
     /// Composition mobs read as nested compositions: their index in `doc.nested`.
     nests: HashMap<MobId, usize>,
     /// The compositions being read, outermost first.
@@ -447,7 +454,7 @@ impl R<'_> {
         if let Some(mob) = self.mobs.get(&id).copied().filter(|m| m.class == cls::COMPOSITION_MOB) {
             return self.nest_clip(c, NestClip { mob, mob_id: id, slot_id: slot, rate, kind, name });
         }
-        match self.resolve(id, slot, start, kind, master_key, 0) {
+        match self.resolve(id, slot, start, kind, SourceContext { key: master_key, ..Default::default() }, 0) {
             Some((source, t)) => CItem::Clip(CClip { len, source, start: t, gain: None, name }),
             None => CItem::Filler(len),
         }
@@ -477,7 +484,7 @@ impl R<'_> {
         // the start counts edit units of the slot the clip points at
         let slot_rate = mob.objs(pid::SLOTS).iter().find(|s| s.u32(pid::SLOT_ID) == Some(slot_id)).and_then(|s| rate_of(s, pid::EDIT_RATE)).unwrap_or(rate);
         let start = units_to_ticks(c.i64(pid::START_TIME).unwrap_or(0), slot_rate.0, slot_rate.1);
-        let skey = (id, if kind == CKind::Picture { 0 } else { 1 }, "composition".to_string());
+        let skey = (id, if kind == CKind::Picture { 0 } else { 1 }, "composition".to_string(), None);
         let source =
             match self.sources.get(&skey) {
                 Some(&i) => i,
@@ -526,7 +533,7 @@ impl R<'_> {
     }
 
     /// Follow a source reference to a file source mob: (source index, file time).
-    fn resolve(&mut self, id: MobId, slot_id: u32, start: Tick, kind: CKind, master_key: Option<String>, depth: usize) -> Option<(usize, Tick)> {
+    fn resolve(&mut self, id: MobId, slot_id: u32, start: Tick, kind: CKind, context: SourceContext, depth: usize) -> Option<(usize, Tick)> {
         if depth > 16 {
             return None;
         }
@@ -542,7 +549,7 @@ impl R<'_> {
             return None;
         }
         if mob.class == cls::MASTER_MOB {
-            let key = master_key.unwrap_or_else(|| {
+            let key = context.key.unwrap_or_else(|| {
                 tagged_values(mob, pid::MOB_USER_COMMENTS)
                     .into_iter()
                     .find_map(|(name, value)| (name == SOURCE_GROUP_TAG && !value.is_empty()).then_some(value))
@@ -561,7 +568,21 @@ impl R<'_> {
                 .filter(|s| s.class == cls::EVENT_MOB_SLOT)
                 .flat_map(|s| s.strong(pid::SEGMENT).map(|g| markers_of(g, rate_of(s, pid::EVENT_EDIT_RATE).unwrap_or(rate))).unwrap_or_default())
                 .collect::<Vec<_>>();
-            let r = self.resolve(next, next_slot, start + inner, kind, Some(key), depth + 1)?;
+            // Multiple file slots can describe a whole interleaved file. Respect an
+            // explicit full, in-order ChannelIDs reference instead of selecting only
+            // the first channel through the legacy multi-slot heuristic below. Bound
+            // the declaration, and carry it into the cache key before resolving.
+            let full_channels = clip
+                .data(pid::CHANNEL_IDS)
+                .filter(|data| {
+                    !data.is_empty()
+                        && data.len() <= 64 * 4
+                        && data.len().is_multiple_of(4)
+                        && data.as_chunks::<4>().0.iter().zip(1u32..).all(|(bytes, channel)| *bytes == channel.to_le_bytes())
+                })
+                .map(|data| (data.len() / 4) as u32)
+                .or(context.full_channels);
+            let r = self.resolve(next, next_slot, start + inner, kind, SourceContext { key: Some(key), full_channels }, depth + 1)?;
             let src = &mut self.doc.sources[r.0];
             if src.markers.is_empty() {
                 src.markers = markers;
@@ -579,8 +600,8 @@ impl R<'_> {
         if !is_file {
             return None;
         }
-        let key = master_key.unwrap_or_else(|| hex(&id));
-        let skey = (id, slot_id, key.clone());
+        let key = context.key.unwrap_or_else(|| hex(&id));
+        let skey = (id, slot_id, key.clone(), context.full_channels);
         if let Some(&i) = self.sources.get(&skey) {
             return Some((i, start));
         }
@@ -597,7 +618,7 @@ impl R<'_> {
         let sound_slots = mob.objs(pid::SLOTS).iter().filter(|s| s.strong(pid::SEGMENT).is_some_and(|g| data_kind(g) == DataKind::Sound)).count();
         let wave_info = wave_summary_info(d);
         let file_channels = wave_info.map(|w| w.1).or_else(|| d.u32(pid::CHANNELS)).unwrap_or(1).max(1);
-        let channel = (seg_kind == CKind::Sound && file_channels > 1 && sound_slots > 1)
+        let channel = (seg_kind == CKind::Sound && file_channels > 1 && sound_slots > 1 && context.full_channels != Some(file_channels))
             .then(|| slot.u32(pid::PHYSICAL_TRACK_NUMBER).unwrap_or(slot_id).saturating_sub(1).min(file_channels - 1));
         let mut layout = d.u8(pid::FRAME_LAYOUT).unwrap_or(0);
         if layout > 4 {
@@ -785,6 +806,50 @@ fn hex(b: &[u8]) -> String {
 #[cfg(test)]
 mod summary_tests {
     use super::*;
+
+    #[test]
+    fn interleaved_and_mono_references_to_one_file_do_not_share_channel_selection() {
+        let sound = || {
+            Obj::new(cls::SOURCE_CLIP)
+                .with(pid::DATA_DEFINITION, Value::Weak(vec![], pid::IDENTIFICATION, ddef::SOUND.to_vec()))
+                .data_prop(pid::LENGTH, 48_000i64.to_le_bytes().to_vec())
+        };
+        let slot = |id: u32, segment: Obj| {
+            Obj::new(cls::TIMELINE_MOB_SLOT)
+                .data_prop(pid::SLOT_ID, id.to_le_bytes().to_vec())
+                .data_prop(pid::PHYSICAL_TRACK_NUMBER, id.to_le_bytes().to_vec())
+                .data_prop(pid::EDIT_RATE, super::super::store::rational(48_000, 1))
+                .with(pid::SEGMENT, Value::Strong(Box::new(segment)))
+        };
+        let file = Obj::new(cls::SOURCE_MOB).with(pid::SLOTS, Value::StrongVec(vec![slot(1, sound()), slot(2, sound())])).with(
+            pid::ESSENCE_DESCRIPTION,
+            Value::Strong(Box::new(
+                Obj::new(cls::PCM_DESCRIPTOR)
+                    .data_prop(pid::SAMPLE_RATE, super::super::store::rational(48_000, 1))
+                    .data_prop(pid::CHANNELS, 2u32.to_le_bytes().to_vec()),
+            )),
+        );
+        let reference = sound().data_prop(pid::SOURCE_ID, vec![1; 32]).data_prop(pid::SOURCE_MOB_SLOT_ID, 1u32.to_le_bytes().to_vec());
+        let mono = Obj::new(cls::MASTER_MOB).with(pid::SLOTS, Value::StrongVec(vec![slot(1, reference.clone())]));
+        let stereo = Obj::new(cls::MASTER_MOB)
+            .with(pid::SLOTS, Value::StrongVec(vec![slot(1, reference.data_prop(pid::CHANNEL_IDS, [1u32.to_le_bytes(), 2u32.to_le_bytes()].concat()))]));
+        let mut report = Report::default();
+        let mut reader = R {
+            report: &mut report,
+            mobs: HashMap::from([([1; 32], &file), ([2; 32], &mono), ([3; 32], &stereo)]),
+            essence: HashMap::new(),
+            doc: Document::default(),
+            sources: HashMap::new(),
+            nests: HashMap::new(),
+            open: vec![],
+        };
+        let context = || SourceContext { key: Some("shared".into()), ..Default::default() };
+        let (left, _) = reader.resolve([2; 32], 1, Tick::ZERO, CKind::Sound, context(), 0).unwrap();
+        let (both, _) = reader.resolve([3; 32], 1, Tick::ZERO, CKind::Sound, context(), 0).unwrap();
+        assert_eq!(reader.doc.sources[left].channel, Some(0));
+        assert_eq!(reader.doc.sources[both].channel, None);
+        assert_ne!(left, both);
+    }
 
     #[test]
     fn wave_summaries_accept_header_only_pcm_and_float_and_bound_corrupt_chunks() {

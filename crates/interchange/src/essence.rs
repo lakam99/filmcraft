@@ -40,7 +40,8 @@ pub struct AudioNeed {
     pub audio_stream: usize,
     /// The media file, when the item is file media.
     pub path: Option<String>,
-    /// Media time range to supply (handles included, clamped to the media).
+    /// Media time range to supply (handles included). Rendered clips use virtual
+    /// timeline-rate media coordinates; decoded ranges are clamped to the source.
     pub start: Tick,
     pub end: Tick,
     /// Channels of the media's audio.
@@ -75,6 +76,21 @@ pub struct AudioEssence {
     /// Clip effects (volume, gain, audio effects) are rendered into these samples: the document
     /// carries no gain for clips that use it.
     pub effects_rendered: bool,
+    /// Speed and reverse playback have been rendered into timeline-rate PCM.
+    #[serde(default)]
+    pub timing_rendered: bool,
+    /// Linear gain restoring headroom removed before integer PCM quantization.
+    #[serde(default = "unity")]
+    pub render_gain: f64,
+}
+
+fn unity() -> f64 {
+    1.0
+}
+
+/// Whether audio needs rendering to preserve the clip's playback timing.
+pub fn retimed(c: &filmcraft_project::TrackItem) -> bool {
+    c.speed != 1.0 || c.reverse
 }
 
 /// A rendered video mixdown that replaces every video track with one clip.
@@ -133,6 +149,9 @@ pub struct NeedOptions {
     /// per media item and container stream covering all its uses. Stream zero keeps
     /// the legacy [`EssenceKey::Media`] identity.
     pub per_clip: bool,
+    /// Prepare retimed clips separately in virtual, timeline-rate media coordinates.
+    #[serde(default)]
+    pub bake_retiming: bool,
     /// Whole media instead of the used range (embedding / copying without trimming).
     pub whole_media: bool,
     /// Nested sequences on the audio tracks.
@@ -169,11 +188,23 @@ fn collect_needs(
     for t in seq.tracks(TrackKind::Audio) {
         for c in &t.items {
             let item = crate::common::base_item(project, c.item);
-            // Interchange currently exports these clips at 100% (and reports retiming).
-            // Preparing only the retimed source span can leave the declared clip past
-            // the end of its trimmed file, causing a receiving DAW to shorten it.
+            let render_timing = opts.bake_retiming && retimed(c);
+            // Rendered audio advances in timeline time, regardless of the original speed.
+            // Reference-only callers still need the full declared 100% playback span.
             let (lo, hi) = (c.source_in, c.source_in + c.duration.max(Tick::ZERO));
-            let (mut start, mut end) = ((lo - opts.handles).max(Tick::ZERO), hi + opts.handles);
+            // Virtual rendered coordinates can be negative: a reverse clip with source_in
+            // zero still has real leading handles. Only decoded source ranges clamp at zero.
+            let (mut start, mut end) = (if render_timing { lo - opts.handles } else { (lo - opts.handles).max(Tick::ZERO) }, hi + opts.handles);
+            if opts.per_clip || render_timing {
+                // A two-sided transition plays beyond the visible cut even with zero
+                // requested handles. Its rendered source must cover that whole overlap.
+                for tr in &t.transitions {
+                    if tr.from == Some(c.id) || tr.to == Some(c.id) {
+                        start = start.min(c.source_in + (tr.start - c.start));
+                        end = end.max(c.source_in + (tr.end() - c.start));
+                    }
+                }
+            }
             match project.item(item).map(|i| &i.kind) {
                 Some(ItemKind::Media(m)) => {
                     let Some(a) = m.info.audio_streams.get(c.audio_stream) else { continue };
@@ -182,14 +213,14 @@ fn collect_needs(
                         MediaRef::Generator(_) => None,
                     };
                     let dur = m.info.duration;
-                    if dur > Tick::ZERO {
+                    if dur > Tick::ZERO && !render_timing {
                         end = end.min(dur);
                     }
-                    if opts.whole_media {
+                    if opts.whole_media && !render_timing {
                         start = Tick::ZERO;
                         end = dur.max(end);
                     }
-                    let key = if opts.per_clip { EssenceKey::Clip(c.id) } else { EssenceKey::media(item, c.audio_stream) };
+                    let key = if opts.per_clip || render_timing { EssenceKey::Clip(c.id) } else { EssenceKey::media(item, c.audio_stream) };
                     let e = by_item.entry(key).or_insert_with(|| AudioNeed {
                         key,
                         item,
@@ -203,12 +234,14 @@ fn collect_needs(
                     e.start = e.start.min(start);
                     e.end = e.end.max(end);
                 }
-                Some(ItemKind::Sequence(nested)) => match opts.nests {
+                Some(ItemKind::Sequence(nested)) => match if render_timing { NestNeeds::Render } else { opts.nests } {
                     NestNeeds::Skip => {}
                     NestNeeds::Inside => collect_needs(project, item, opts, open, done, by_item),
                     NestNeeds::Render => {
                         // a clip longer than its sequence plays silence past the end: nothing to supply
-                        end = end.min(nested.duration());
+                        if !render_timing {
+                            end = end.min(nested.duration());
+                        }
                         if end <= start {
                             continue;
                         }

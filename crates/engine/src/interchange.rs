@@ -183,6 +183,19 @@ pub fn export(s: &mut Session, p: &Value) -> Result<Value> {
             crate::commands::bad("file.exportInterchange", format!("unknown format {v}: use one of {}", names.join(", ")))
         })?,
     };
+    // Use the same media preparation as the AAF/OMF dialogs. A reference-only AAF
+    // silently loses retiming when invoked through the generic automation command.
+    match format {
+        Format::Aaf => {
+            let mut params = p.clone();
+            if params.get("audio").is_none() {
+                params["audio"] = json!("linked");
+            }
+            return crate::aaf_omf::export_aaf(s, &params);
+        }
+        Format::Omf => return crate::aaf_omf::export_omf(s, p),
+        _ => {}
+    }
     let path = p.get("path").and_then(Value::as_str).ok_or_else(|| EngineError::Other("need `path`".into()))?.to_string();
     let seq = p.get("sequence").and_then(Value::as_u64).map(ItemId).or(s.state.active_sequence).ok_or(EngineError::NoSequence)?;
     let opts = ExportOptions {
