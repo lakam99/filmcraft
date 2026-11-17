@@ -952,6 +952,137 @@ fn is_picture(o: &Obj) -> bool {
     o.weak_key(pid::DATA_DEFINITION) == Some(&ddef::PICTURE[..])
 }
 
+/// Reproduce the observed Studio Pro audio-only layout without distributing its files:
+/// empty picture first, sound next, timecode last, all using an audio-sample edit clock.
+fn sample_clock_layout(sample_rate: u32, timecode: Option<(u16, bool)>) -> Obj {
+    let (mut p, sequence) = project();
+    let q = p.sequence_mut(sequence).unwrap();
+    q.settings.frame_rate = FrameRate::FPS_25;
+    q.settings.sample_rate = sample_rate;
+    q.video_tracks[0].items.clear();
+    q.video_tracks[0].transitions.clear();
+    q.audio_tracks[0].transitions.clear();
+    q.audio_tracks[0].items.truncate(1);
+    let clip = &mut q.audio_tracks[0].items[0];
+    clip.start = Tick::from_units(i64::from(sample_rate / 4), i64::from(sample_rate));
+    clip.duration = Tick::from_units(i64::from(sample_rate) * 4, i64::from(sample_rate));
+    clip.source_in = Tick::from_units(24_000, 48_000);
+    let bytes = export(&p, sequence, &AafOptions::default()).unwrap().0;
+    let mut root = store::read(&bytes).unwrap();
+    let comp = top_composition_mut(&mut root);
+    // Third-party files do not carry FilmCraft's optional hints.
+    comp.props.retain(|(p, _)| *p != pid::MOB_USER_COMMENTS);
+    let slots = objs_mut(comp, pid::SLOTS);
+    slots.retain(|s| timecode.is_some() || s.strong(pid::SEGMENT).unwrap().class != cls::TIMECODE);
+    for slot in slots.iter_mut() {
+        slot.set(pid::EDIT_RATE, Value::Data(store::rational(i64::from(sample_rate), 1)));
+        let segment = strong_mut(slot, pid::SEGMENT);
+        if segment.class == cls::TIMECODE {
+            let (fps, drop) = timecode.unwrap();
+            segment.set(pid::TC_FPS, Value::Data(fps.to_le_bytes().to_vec()));
+            segment.set(pid::TC_DROP, Value::Data(vec![u8::from(drop)]));
+            segment.set(pid::TC_START, Value::Data(90_000i64.to_le_bytes().to_vec()));
+        }
+    }
+    slots.sort_by_key(|s| match s.strong(pid::SEGMENT).unwrap().weak_key(pid::DATA_DEFINITION) {
+        Some(kind) if kind == ddef::PICTURE => 0,
+        Some(kind) if kind == ddef::SOUND => 1,
+        _ => 2,
+    });
+    root
+}
+
+fn top_composition_mut(root: &mut Obj) -> &mut Obj {
+    let content = strong_mut(strong_mut(root, pid::ROOT_HEADER), pid::CONTENT);
+    objs_mut(content, pid::MOBS).iter_mut().find(|m| m.class == cls::COMPOSITION_MOB).unwrap()
+}
+
+fn import_sample_clock_layout(root: &Obj, expected: FrameRate, sample_rate: u32) {
+    let bytes = store::write(root, filmcraft_cfb::Version::V3).unwrap();
+    let (imported, _, _) = import(&bytes, &ImportOptions::default()).unwrap();
+    let sequence = imported.project.sequence(imported.sequences[0]).unwrap();
+    sequence.settings.validate().expect("third-party edit clocks must produce valid editor settings");
+    assert_eq!(sequence.settings.frame_rate, expected);
+    assert_eq!(sequence.settings.sample_rate, sample_rate);
+    let clip = &sequence.audio_tracks[0].items[0];
+    assert_eq!(clip.start, Tick::from_units(i64::from(sample_rate / 4), i64::from(sample_rate)));
+    assert_eq!(clip.duration, Tick::from_units(4, 1));
+    assert_eq!(clip.source_in, Tick::from_units(1, 2), "source timing is independent of the display frame rate");
+}
+
+#[test]
+fn proprietary_sample_clock_placeholders_use_timecode_fps() {
+    for rate in [44_100, 48_000, 96_000, 192_000] {
+        let root = sample_clock_layout(rate, Some((25, false)));
+        import_sample_clock_layout(&root, FrameRate::FPS_25, rate);
+    }
+}
+
+#[test]
+fn proprietary_sample_clock_drop_timecode_keeps_its_fractional_rate() {
+    for (fps, expected) in [(30, FrameRate::FPS_29_97), (60, FrameRate::FPS_59_94)] {
+        let root = sample_clock_layout(48_000, Some((fps, true)));
+        import_sample_clock_layout(&root, expected, 48_000);
+        let bytes = store::write(&root, filmcraft_cfb::Version::V3).unwrap();
+        let (imported, _, _) = import(&bytes, &ImportOptions::default()).unwrap();
+        let sequence = imported.project.sequence(imported.sequences[0]).unwrap();
+        assert!(sequence.settings.drop_frame);
+        assert_eq!(sequence.start_timecode, 90_000);
+    }
+}
+
+#[test]
+fn proprietary_audio_only_missing_or_bad_timecode_has_a_valid_fallback() {
+    for timecode in [None, Some((0, false)), Some((u16::MAX, true))] {
+        let root = sample_clock_layout(48_000, timecode);
+        import_sample_clock_layout(&root, FrameRate::FPS_25, 48_000);
+    }
+}
+
+#[test]
+fn proprietary_empty_picture_hint_does_not_override_timecode() {
+    let mut root = sample_clock_layout(44_100, Some((25, false)));
+    let picture = objs_mut(top_composition_mut(&mut root), pid::SLOTS).iter_mut().find(|s| s.strong(pid::SEGMENT).is_some_and(is_picture)).unwrap();
+    picture.set(pid::EDIT_RATE, Value::Data(store::rational(24, 1)));
+    import_sample_clock_layout(&root, FrameRate::FPS_25, 44_100);
+}
+
+#[test]
+fn proprietary_audio_only_keeps_valid_fractional_and_frame_based_clocks() {
+    let mut root = sample_clock_layout(48_000, Some((30, false)));
+    let tc = objs_mut(top_composition_mut(&mut root), pid::SLOTS).iter_mut().find(|s| s.strong(pid::SEGMENT).unwrap().class == cls::TIMECODE).unwrap();
+    tc.set(pid::EDIT_RATE, Value::Data(store::rational(30_000, 1001)));
+    import_sample_clock_layout(&root, FrameRate::FPS_29_97, 48_000);
+
+    let mut root = sample_clock_layout(24, None);
+    objs_mut(top_composition_mut(&mut root), pid::SLOTS).retain(|s| !s.strong(pid::SEGMENT).is_some_and(is_picture));
+    // An audio slot may count video frames while its source still contains 48 kHz PCM.
+    import_sample_clock_layout(&root, FrameRate::FPS_24, 48_000);
+}
+
+#[test]
+fn proprietary_real_picture_rate_wins_over_earlier_timecode_and_bad_placeholders() {
+    let (mut p, sequence) = project();
+    p.sequence_mut(sequence).unwrap().settings.frame_rate = FrameRate::FPS_59_94;
+    let bytes = export(&p, sequence, &AafOptions::default()).unwrap().0;
+    for bad_rate in [(0, 1), (-24, 1), (i64::from(i32::MAX), 1), (1, i64::from(i32::MAX))] {
+        let mut root = store::read(&bytes).unwrap();
+        let slots = objs_mut(top_composition_mut(&mut root), pid::SLOTS);
+        let mut placeholder = slots.iter().find(|s| s.strong(pid::SEGMENT).is_some_and(is_picture)).unwrap().clone();
+        placeholder.set(pid::SLOT_ID, Value::Data(99u32.to_le_bytes().to_vec()));
+        placeholder.set(pid::EDIT_RATE, Value::Data(store::rational(bad_rate.0, bad_rate.1)));
+        let segment = strong_mut(&mut placeholder, pid::SEGMENT);
+        segment.set(pid::COMPONENTS, Value::StrongVec(Vec::new()));
+        segment.set(pid::LENGTH, Value::Data(0i64.to_le_bytes().to_vec()));
+        // A valid timecode clock is not necessarily the picture frame rate.
+        slots[0].set(pid::EDIT_RATE, Value::Data(store::rational(30, 1)));
+        slots.insert(0, placeholder);
+        let modified = store::write(&root, filmcraft_cfb::Version::V4).unwrap();
+        let (imported, _, _) = import(&modified, &ImportOptions::default()).unwrap();
+        assert_eq!(imported.project.sequence(imported.sequences[0]).unwrap().settings.frame_rate, FrameRate::FPS_59_94);
+    }
+}
+
 /// How Premiere Pro 26.5.2 lays a sequence with a nested sequence out in AAF (seen in a file it
 /// exported): every composition is tagged top-level, the nested one too; all video tracks of a
 /// composition are in ONE slot, a nested scope with a segment per track, lowest first; a clip of
