@@ -483,7 +483,7 @@ fn output_path(s: &Session, p: &Value, seq: ItemId, settings: &ExportSettings, s
 }
 
 /// Write the caption sidecar (`settings.caption_sidecar`) next to `path` for `range` of `seq`.
-fn write_sidecar(s: &Session, project: &Project, seq: ItemId, settings: &ExportSettings) -> Result<Option<String>> {
+pub(crate) fn write_sidecar(s: &Session, project: &Project, seq: ItemId, settings: &ExportSettings) -> Result<Option<String>> {
     let Some(kind) = settings.caption_sidecar.as_deref() else { return Ok(None) };
     let q = project.sequence(seq).ok_or(EngineError::NoSequence)?;
     let Some(track) = q.caption_tracks.first() else { return Ok(None) };
@@ -504,6 +504,10 @@ fn write_sidecar(s: &Session, project: &Project, seq: ItemId, settings: &ExportS
 
 /// Run an export of `seq` in `project` as a background job (or now, with `wait`); returns the job id.
 pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut settings: ExportSettings, label: String, wait: bool) -> Result<u64> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::backend::enabled(s) {
+        return crate::backend::start_media(s, project, seq, settings, label);
+    }
     let format = settings.format;
     if !filmcraft_export::available(format) {
         return Err(EngineError::Other(format!("{} export is not available (no encoder registered)", format.label())));
@@ -606,6 +610,15 @@ fn output_json(out: &mut Value, path: &str, files: Option<(String, String)>) {
     }
 }
 
+fn wait_for_jobs(s: &Session, p: &Value) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::backend::enabled(s) {
+        return false;
+    }
+    let _ = s;
+    bool_p(p, "wait").unwrap_or(false)
+}
+
 /// `file.exportMedia`: export the active (or `sequence`) sequence now.
 pub fn export_media(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.exportMedia";
@@ -618,7 +631,7 @@ pub fn export_media(s: &mut Session, p: &Value) -> Result<Value> {
     let (range, warnings) = range_with_warnings(s, &project, seq, p.get("range"), p, cmd)?;
     settings.range = range;
     settings.path = output_path(s, p, seq, &settings, None);
-    let wait = bool_p(p, "wait").unwrap_or(false);
+    let wait = wait_for_jobs(s, p);
     let path = settings.path.clone();
     let files = sequence_files(&project, seq, &settings);
     let id = spawn_export(s, project, seq, settings, format!("Export {}", file_name(&path)), wait)?;
@@ -698,6 +711,13 @@ impl ExportQueue {
 /// that poll an export (the bridge, MCP long exports) can report it like `file.exportMedia` does.
 pub(crate) fn job_json(s: &Session, j: &crate::Job) -> Value {
     let mut v = j.to_json();
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(details) = s.backend.details(j.id) {
+        if let Some(offline) = details["output"].get("offlineMedia") {
+            v["offlineMedia"] = offline.clone();
+        }
+        v["backend"] = details;
+    }
     if s.export_offline.contains_key(&j.id) {
         v["offlineMedia"] = offline_media_json(s, j.id);
     }
@@ -706,6 +726,12 @@ pub(crate) fn job_json(s: &Session, j: &crate::Job) -> Value {
 
 /// The offline items export job `job` drew the slate for, as JSON (`[]` while it runs or when none).
 fn offline_media_json(s: &Session, job: u64) -> Value {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(details) = s.backend.details(job)
+        && let Some(offline) = details["output"].get("offlineMedia")
+    {
+        return offline.clone();
+    }
     let list = s.export_offline.get(&job).map(|o| o.lock().unwrap_or_else(|e| e.into_inner()).clone()).unwrap_or_default();
     serde_json::to_value(list).unwrap_or_else(|_| json!([]))
 }
@@ -994,7 +1020,7 @@ fn quick(s: &mut Session, p: &Value) -> Result<Value> {
     let (range, warnings) = range_with_warnings(s, &project, seq, q.get("range"), &q, cmd)?;
     settings.range = range;
     settings.path = output_path(s, &q, seq, &settings, None);
-    let wait = bool_p(p, "wait").unwrap_or(false);
+    let wait = wait_for_jobs(s, p);
     let path = settings.path.clone();
     let files = sequence_files(&project, seq, &settings);
     let id = spawn_export(s, project, seq, settings, format!("Quick Export {}", file_name(&path)), wait)?;

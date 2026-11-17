@@ -12,6 +12,8 @@
 
 pub mod aaf_omf;
 pub mod autosave;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod backend;
 pub mod captions;
 pub mod clip_ops;
 pub mod color;
@@ -467,6 +469,12 @@ pub struct Session {
     pub journal: Vec<(String, Value)>,
     /// Background jobs (exports, render previews…).
     pub jobs: Vec<Job>,
+    /// Native render/export workers; the frontend never waits for their I/O or process exits.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub backend: backend::Runtime,
+    /// Progress shared with the supervisor only inside a headless worker.
+    pub(crate) worker_progress: Option<Arc<filmcraft_export::Progress>>,
+    pub(crate) worker_gpu: bool,
     /// Export job → the offline items it drew the slate for, filled when the export finishes
     /// (#1054; `offlineMedia` in `file.exportMedia` and queue results).
     pub export_offline: std::collections::HashMap<u64, Arc<std::sync::Mutex<Vec<media_pool::OfflineMedia>>>>,
@@ -595,6 +603,10 @@ impl Session {
             events: Vec::new(),
             journal: Vec::new(),
             jobs: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            backend: Default::default(),
+            worker_progress: None,
+            worker_gpu: true,
             export_offline: Default::default(),
             prefs: Default::default(),
             prefs_path: None,

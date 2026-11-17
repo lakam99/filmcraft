@@ -70,7 +70,12 @@ fn draw_picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, which: Which, mv: &cr
     let channel = display.is_channel();
     // the GPU compositor's output is opaque, so the Transparency Grid takes the CPU frames
     let grid = mv.transparency_grid && !channel;
-    let use_gpu = which == Which::Program && app.gpu.is_some() && !channel && !grid && !crate::panels::menu_dialogs::software_renderer(app);
+    let use_gpu = which == Which::Program
+        && app.gpu.is_some()
+        && !app.frames.process_rendering()
+        && !channel
+        && !grid
+        && !crate::panels::menu_dialogs::software_renderer(app);
     // render previews are opaque, so the grid and Display Mode ▸ Alpha take live renders
     let live = grid || display == DisplayMode::Alpha;
     let cpu_target = target;

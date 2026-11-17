@@ -125,6 +125,11 @@ fn poll(app: &mut FilmcraftApp) {
     }
     match result {
         Ok(Completed::Connected(relay, mut session)) if app.session.revision == pending.revision => {
+            if let Err(error) = preserve_render_runtime(&mut app.session, &mut session) {
+                app.network_project.message = error.clone();
+                app.ui.status = error;
+                return;
+            }
             app.stop();
             app.stop_source();
             session.persistence = app.session.persistence.take();
@@ -152,6 +157,20 @@ fn poll(app: &mut FilmcraftApp) {
         Err(error) => app.network_project.message = error,
     }
     app.ui.status = app.network_project.message.clone();
+}
+
+fn preserve_render_runtime(previous: &mut Session, next: &mut Session) -> Result<(), String> {
+    // Render jobs belong to the native application, not the project loaded on its relay
+    // worker. Losing this runtime would silently turn desktop exports synchronous again.
+    // Keep running immutable snapshots visible and cancellable after the session replacement.
+    if !next.jobs.is_empty() {
+        return Err("The network session unexpectedly started render jobs; the current project was kept open".into());
+    }
+    next.backend = std::mem::take(&mut previous.backend);
+    next.jobs = std::mem::take(&mut previous.jobs);
+    next.export_offline = std::mem::take(&mut previous.export_offline);
+    next.export_queue = std::mem::take(&mut previous.export_queue);
+    Ok(())
 }
 
 pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
@@ -229,6 +248,24 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_a_network_session_preserves_native_backend_and_render_jobs() {
+        let mut previous = Session::default();
+        previous.backend.enable(std::path::PathBuf::from("native-application"));
+        previous.backend.set_gpu_rendering(false);
+        let job = filmcraft_engine::Job { id: 17, label: "Export previous snapshot".into(), progress: Default::default(), result: Default::default() };
+        let progress = job.progress.clone();
+        previous.jobs.push(job);
+        let mut next = Session::new(Arc::new(filmcraft_engine::FsServices));
+        preserve_render_runtime(&mut previous, &mut next).unwrap();
+        drop(previous);
+        assert_eq!(next.backend.executable(), Some(std::path::Path::new("native-application")));
+        assert_eq!(next.jobs[0].id, 17);
+        assert!(Arc::ptr_eq(&next.jobs[0].progress, &progress));
+        assert!(!progress.cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!filmcraft_engine::backend::frames::Config::for_session(&next).unwrap().gpu);
+    }
 
     fn pending_save(app: &mut FilmcraftApp) {
         let (sender, receiver) = mpsc::channel();

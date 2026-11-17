@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use filmcraft_frame::{AudioBuffer, VideoFrame};
@@ -74,6 +74,7 @@ pub struct MediaPool {
     /// Media and proxy paths that came from a document, with that document's path (see
     /// [`Self::follow`]).
     stored: RwLock<HashMap<String, Option<PathBuf>>>,
+    generation: AtomicU64,
 }
 
 impl Default for MediaPool {
@@ -88,6 +89,7 @@ impl Default for MediaPool {
             openers: RwLock::new(filmcraft_codecs::openers()),
             composition_renderer: RwLock::default(),
             stored: RwLock::default(),
+            generation: AtomicU64::new(0),
         }
     }
 }
@@ -220,6 +222,7 @@ impl MediaPool {
 
     /// Cache a source opened from `path` for an item.
     pub fn insert_file(&self, item: ItemId, path: &str, src: SharedSource) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
         self.offline.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
         let src = self.unsupported_as_slate(item, path, src);
         self.cache_source(item, format!("file:{path}"), src);
@@ -233,6 +236,7 @@ impl MediaPool {
     }
 
     pub fn remove(&self, item: ItemId) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
         self.sources.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
         self.proxies.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
         self.offline.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
@@ -263,6 +267,13 @@ impl MediaPool {
         self.stored.write().unwrap_or_else(PoisonError::into_inner).clear();
     }
 
+    /// Preserve source document provenance across a native worker boundary. The coordinator
+    /// captures this away from the render loop; paths picked in the session remain allowed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn stored_snapshot(&self) -> Vec<(String, Option<PathBuf>)> {
+        self.stored.read().unwrap_or_else(PoisonError::into_inner).iter().map(|(path, document)| (path.clone(), document.clone())).collect()
+    }
+
     /// The user picked `path` in this session (import, Link Media): open it as given.
     pub fn allow(&self, path: &str) {
         self.stored.write().unwrap_or_else(PoisonError::into_inner).remove(path);
@@ -288,6 +299,7 @@ impl MediaPool {
 
     /// Forget every opened source (files are re-read on next use).
     pub fn clear(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
         self.sources.write().unwrap_or_else(PoisonError::into_inner).clear();
         self.proxies.write().unwrap_or_else(PoisonError::into_inner).clear();
         self.offline.write().unwrap_or_else(PoisonError::into_inner).clear();
@@ -306,8 +318,15 @@ impl MediaPool {
         self.use_proxies.load(Ordering::Relaxed)
     }
 
+    /// Explicit source invalidations, distinct from lazy cache fills.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
     pub fn set_use_proxies(&self, on: bool) {
-        self.use_proxies.store(on, Ordering::Relaxed);
+        if self.use_proxies.swap(on, Ordering::Relaxed) != on {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// `src` (item `item`) as the monitors show it: once [`DAMAGED_AFTER`] of its video frames in a

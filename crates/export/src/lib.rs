@@ -142,7 +142,7 @@ impl Progress {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Report {
     pub path: String,
     pub frames: u64,
@@ -150,7 +150,7 @@ pub struct Report {
     pub bytes: u64,
     pub render_fps: f64,
     /// Further files written besides `path` (MXF OP-Atom audio files).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_files: Vec<String>,
 }
 
