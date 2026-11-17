@@ -604,7 +604,14 @@ fn aaf_video_mixdown() {
     let files = r["mediaFiles"].as_array().unwrap();
     assert_eq!(files.len(), 1);
     let mov = files[0].as_str().unwrap();
-    assert!(mov.ends_with("Video Mixdown.mov") && std::path::Path::new(mov).exists());
+    assert!(mov.ends_with("Video Mixdown.mp4") && std::path::Path::new(mov).exists(), "the default must play in DAWs without a DNxHR decoder: {mov}");
+    let bytes = std::fs::read(mov).unwrap();
+    let movie = filmcraft_isobmff::open(bytes.as_slice()).unwrap();
+    let video = movie.track_of_kind(filmcraft_isobmff::TrackKind::Video).unwrap();
+    assert_eq!(movie.tracks[video].entries[0].format.0, *b"avc1", "the mixdown must contain AVC, not merely have an MP4 extension");
+    let filmcraft_isobmff::CodecConfig::Avc(config) = &movie.tracks[video].entries[0].codec else { panic!("missing AVC configuration") };
+    assert_eq!(config.profile, 100, "use ordinary 8-bit High, not High 10/4:2:2/4:4:4");
+    assert_eq!(movie.tracks[video].samples.len(), 48);
     let r = s.execute("file.import", json!({"paths": [path]})).unwrap();
     let n = imported_seq(&r);
     let q = s.project.sequence(n).unwrap();
@@ -615,6 +622,73 @@ fn aaf_video_mixdown() {
     let m = s.project.item(v.item).unwrap().as_media().unwrap();
     assert!(!m.offline);
     assert_eq!(m.info.video.as_ref().map(|v| (v.width, v.height)), Some((64, 36)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aaf_video_mixdown_formats_keep_fractional_frame_timing_and_audio_edits() {
+    let (mut s, _items, seq, dir) = setup("aaf-mixdown-formats");
+    let rate = FrameRate::FPS_59_94;
+    let q = Arc::make_mut(&mut s.project).sequence_mut(seq).unwrap();
+    q.settings.frame_rate = rate;
+    for track in q.all_tracks_mut() {
+        for (i, clip) in track.items.iter_mut().enumerate() {
+            clip.start = rate.tick_of(i as i64 * 3);
+            clip.duration = rate.tick_of(3);
+        }
+    }
+    let mut audio_edits = None;
+    for extension in ["mp4", "mov", "mxf"] {
+        let path = dir.join(format!("{extension}.aaf"));
+        let result = s
+            .execute("file.exportAaf", json!({"path":path,"sequence":seq.0,"preserveMix":false,"audio":"linked","mixdownVideo":true,"mixdownFormat":extension}))
+            .unwrap();
+        let files = result["mediaFiles"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        let video_path = files[0].as_str().unwrap();
+        assert!(video_path.ends_with(&format!("Video Mixdown.{extension}")));
+        let bytes = std::fs::read(video_path).unwrap();
+        if extension == "mxf" {
+            assert_eq!(filmcraft_mxf::open(&bytes).unwrap().operational_pattern.name(), "OP-Atom");
+        } else {
+            let movie = filmcraft_isobmff::open(bytes.as_slice()).unwrap();
+            let video = &movie.tracks[movie.track_of_kind(filmcraft_isobmff::TrackKind::Video).unwrap()];
+            assert_eq!(video.entries[0].format.0, if extension == "mp4" { *b"avc1" } else { *b"AVdh" });
+            assert_eq!(video.samples.len(), 6);
+            assert_eq!(video.timescale, 60_000);
+            assert_eq!(video.samples.iter().map(|s| u64::from(s.duration)).sum::<u64>(), 6_006);
+        }
+        let imported = s.execute("file.importAaf", json!({"path":path})).unwrap();
+        let q = s.project.sequence(imported_seq(&imported)).unwrap();
+        assert_eq!(q.settings.frame_rate, rate);
+        let video = &q.video_tracks[0].items[0];
+        assert_eq!(video.start, filmcraft_time::Tick::ZERO);
+        assert_eq!(video.duration, rate.tick_of(6));
+        let media = s.project.item(video.item).unwrap().as_media().unwrap();
+        assert!(!media.offline);
+        assert_eq!(media.info.video.as_ref().unwrap().frame_rate, rate);
+        let audio: Vec<_> = q.audio_tracks.iter().flat_map(|t| &t.items).map(|c| (c.start, c.duration, c.source_in)).collect();
+        assert!(!audio.is_empty());
+        match &audio_edits {
+            Some(expected) => assert_eq!(&audio, expected, "video format must not change audio placement"),
+            None => audio_edits = Some(audio),
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aaf_video_mixdown_rejects_invalid_formats_before_writing_media() {
+    let (mut s, _items, seq, dir) = setup("aaf-mixdown-hostile");
+    let path = dir.join("invalid.aaf");
+    let before = serde_json::to_value(&s.project).unwrap();
+    for format in [json!("mpeg2"), json!(false), json!(17), json!({})] {
+        let error = s.execute("file.exportAaf", json!({"path":path,"sequence":seq.0,"mixdownVideo":true,"mixdownFormat":format})).unwrap_err();
+        assert!(error.to_string().contains("mixdownFormat"));
+        assert!(!path.exists());
+        assert!(!dir.join("invalid Media").exists());
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 
