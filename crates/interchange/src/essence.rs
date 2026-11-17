@@ -116,6 +116,10 @@ pub struct MediaOptions {
     pub essence: Vec<AudioEssence>,
     /// Replace the video tracks with this rendered file.
     pub mixdown_video: Option<MixdownVideo>,
+    /// Replace the top-level sound tracks with the caller's complete mixer output.
+    /// This preserves processing that cannot be represented portably as editable clips.
+    #[serde(default)]
+    pub mixdown_audio: Option<AudioEssence>,
 }
 
 impl MediaOptions {

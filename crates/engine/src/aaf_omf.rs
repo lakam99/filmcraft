@@ -9,6 +9,8 @@
 //! `file.exportAaf {path, sequence?, mixdownVideo?, breakoutToMono?, audio?: "embedded"|"separate"|
 //! "linked", audioFormat?: "wav"|"aiff"|"mxf" (OP-Atom, AAF only), sampleRate?, bitDepth?, trimAudio?, handles? (frames),
 //! renderAudioEffects?, smallSectors?}`
+//! AAF defaults to `preserveMix: true`: render clip and mixer processing, retaining edits
+//! for a separable stereo mixer; print the complete mix for buses, inserts or transitions.
 //!
 //! `file.exportOmf {path, sequence?, audio?: "embedded"|"separate", audioFormat?, sampleRate?,
 //! bitDepth?, trimAudio? (default on), handles?, renderAudioEffects?, breakoutToMono?}`
@@ -49,6 +51,8 @@ pub struct AudioPlan {
     pub trim: bool,
     pub handles: Tick,
     pub render_effects: bool,
+    /// Preserve the audible mixer output rather than only interchange clip metadata.
+    pub preserve_mix: bool,
     pub breakout: bool,
     /// Nested sequences on the audio tracks. OMF: their sound is rendered into the export, as
     /// Premiere Pro does. AAF: they are written as compositions, so the media of the clips inside
@@ -74,10 +78,17 @@ fn plan_from(s: &Session, p: &Value, seq: ItemId, cmd: &str, omf: bool) -> Resul
     if !(8_000..=192_000).contains(&sample_rate) {
         return Err(bad(cmd, "sampleRate must be 8000–192000"));
     }
+    let preserve_mix = !omf && bool_p(p, "preserveMix").unwrap_or(true);
     // A number, or the string the params list it as ("16|24"); anything else is refused rather
     // than read as 16 (#4019).
     let bits: u16 = match p.get("bitDepth").filter(|v| !v.is_null()) {
-        None => 16,
+        None => {
+            if preserve_mix {
+                24
+            } else {
+                16
+            }
+        }
         Some(v) => match v
             .as_u64()
             .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && *f >= 0.0).map(|f| f as u64))
@@ -89,6 +100,10 @@ fn plan_from(s: &Session, p: &Value, seq: ItemId, cmd: &str, omf: bool) -> Resul
         },
     };
     let frames = u64_p(p, "handles").unwrap_or(if omf { 30 } else { 0 }) as i64;
+    let breakout = bool_p(p, "breakoutToMono").unwrap_or(false);
+    if preserve_mix && breakout {
+        return Err(bad(cmd, "preserveMix requires interleaved audio to avoid the receiving editor's mono pan law; disable breakoutToMono or preserveMix"));
+    }
     Ok(AudioPlan {
         mode,
         aiff,
@@ -98,7 +113,8 @@ fn plan_from(s: &Session, p: &Value, seq: ItemId, cmd: &str, omf: bool) -> Resul
         trim: bool_p(p, "trimAudio").unwrap_or(omf),
         handles: q.settings.frame_rate.tick_of(frames),
         render_effects: bool_p(p, "renderAudioEffects").unwrap_or(false),
-        breakout: bool_p(p, "breakoutToMono").unwrap_or(false),
+        preserve_mix,
+        breakout,
         nests: if omf { NestNeeds::Render } else { NestNeeds::Inside },
     })
 }
@@ -186,9 +202,9 @@ fn decode(s: &Session, need: &AudioNeed, sample_rate: u32) -> Result<Vec<Vec<f32
 
 /// Render in the original timeline coordinate system: gain automation, DSP blocks and
 /// pitch-preserving grains must have the same phase and clip boundaries as playback.
-fn render_clip(s: &Session, seq: ItemId, need: &AudioNeed, sample_rate: u32) -> Result<Vec<Vec<f32>>> {
+fn render_clip(s: &Session, seq: ItemId, need: &AudioNeed, sample_rate: u32, preserve_mix: bool) -> Result<Vec<Vec<f32>>> {
     let EssenceKey::Clip(clip_id) = need.key else { return decode(s, need, sample_rate) };
-    let (_, track, c) = audio_clip(&s.project, seq, clip_id).ok_or_else(|| EngineError::Other("clip not found".into()))?;
+    let (sequence, track, c) = audio_clip(&s.project, seq, clip_id).ok_or_else(|| EngineError::Other("clip not found".into()))?;
     if c.frame_hold.is_some() {
         return Err(EngineError::Other("frame holds are supported on video clips only".into()));
     }
@@ -233,6 +249,13 @@ fn render_clip(s: &Session, seq: ItemId, need: &AudioNeed, sample_rate: u32) -> 
     let chunk_frames = (16_384.0 / c.speed.abs().max(1.0)).floor().clamp(1.0, 4096.0) as usize;
     let mut isolated = track.clone();
     isolated.transitions.clear(); // the interchange composition carries the transitions
+    let mut mixer = sequence.clone();
+    mixer.settings.sample_rate = sample_rate;
+    for t in &mut mixer.audio_tracks {
+        t.items.clear();
+        t.transitions.clear();
+    }
+    let mixer_track = mixer.audio_tracks.iter().position(|t| t.id == track.id).ok_or_else(|| EngineError::Other("audio track not found".into()))?;
     let extended = filmcraft_render::audio::with_handles(c, Tick::from_units(first, sr), Tick::from_units(end, sr));
     let mut out = vec![Vec::with_capacity(frames); channels];
     // Extending a pitch-preserving clip changes its edge grains. Keep the original clip for
@@ -242,9 +265,16 @@ fn render_clip(s: &Session, seq: ItemId, need: &AudioNeed, sample_rate: u32) -> 
             continue;
         }
         isolated.items = vec![item.clone()];
+        if let Some(t) = mixer.audio_tracks.get_mut(mixer_track) {
+            t.items = isolated.items.clone();
+        }
         for at in (start..stop).step_by(chunk_frames) {
             let n = (stop - at).min(chunk_frames as i64) as usize;
-            let b = filmcraft_render::audio::track_input(&s.project, &isolated, at, n, sample_rate, &checked);
+            let b = if preserve_mix {
+                filmcraft_render::mixer::mix_graph(&s.project, &mixer, at, n, &checked, None)
+            } else {
+                filmcraft_render::audio::track_input(&s.project, &isolated, at, n, sample_rate, &checked)
+            };
             for (dst, src) in out.iter_mut().zip(b.channels) {
                 dst.extend(src);
             }
@@ -333,7 +363,7 @@ fn ensure_dir(s: &Session, dir: &str) {
 }
 
 fn check_linked_streams(s: &Session, seq: ItemId, plan: &AudioPlan) -> Result<()> {
-    if plan.mode == AudioMode::Linked && !plan.trim && !plan.render_effects {
+    if plan.mode == AudioMode::Linked && !plan.trim && !plan.render_effects && !plan.preserve_mix {
         let needs = audio_needs(&s.project, seq, &NeedOptions { nests: plan.nests, bake_retiming: true, ..Default::default() });
         if needs.iter().any(|need| need.audio_stream > 0 && !matches!(need.key, EssenceKey::Clip(_))) {
             return Err(EngineError::Other("linked AAF media cannot select container audio streams; choose embedded or separate audio".into()));
@@ -350,9 +380,9 @@ pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str
         seq,
         &NeedOptions {
             handles: plan.handles,
-            per_clip: plan.render_effects,
-            whole_media: !plan.trim && !plan.render_effects,
-            nests: plan.nests,
+            per_clip: plan.render_effects || plan.preserve_mix,
+            whole_media: !plan.trim && !plan.render_effects && !plan.preserve_mix,
+            nests: if plan.preserve_mix { NestNeeds::Render } else { plan.nests },
             bake_retiming: true,
         },
     );
@@ -365,10 +395,10 @@ pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str
             EssenceKey::Clip(id) => audio_clip(&s.project, seq, id).is_some_and(|(_, _, c)| filmcraft_interchange::essence::retimed(c)),
             _ => false,
         };
-        if plan.mode == AudioMode::Linked && !plan.trim && !plan.render_effects && !timing && !nest {
+        if plan.mode == AudioMode::Linked && !plan.trim && !plan.render_effects && !plan.preserve_mix && !timing && !nest {
             continue;
         }
-        let rendered = plan.render_effects || nest || timing;
+        let rendered = plan.render_effects || plan.preserve_mix || nest || timing;
         if rendered
             && let EssenceKey::Clip(id) = need.key
             && let Some((_, _, c)) = audio_clip(&s.project, seq, id)
@@ -379,7 +409,7 @@ pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str
             need.start = c.source_in - Tick::from_units(head, sr);
             need.end = c.source_in + c.duration + Tick::from_units(tail, sr);
         }
-        let mut planar = if rendered { render_clip(s, seq, need, plan.sample_rate)? } else { decode(s, need, plan.sample_rate)? };
+        let mut planar = if rendered { render_clip(s, seq, need, plan.sample_rate, plan.preserve_mix)? } else { decode(s, need, plan.sample_rate)? };
         let render_gain = if rendered { preserve_headroom(&mut planar)? } else { 1.0 };
         let frames = planar.first().map_or(0, Vec::len) as u64;
         let groups: Vec<(Option<u32>, Vec<&Vec<f32>>)> =
@@ -510,6 +540,117 @@ fn join(dir: &str, name: &str) -> String {
     if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }
 }
 
+/// Independent clip prints commute with a linear stereo mixer. Inserts, bus routing,
+/// overlaps and transitions do not: summing separate processed clips would change the sound.
+pub fn needs_mixdown(q: &Sequence) -> bool {
+    q.settings.audio_master != filmcraft_project::AudioChannels::Stereo
+        || !q.submix_tracks.is_empty()
+        || q.master_effects.iter().any(|e| e.enabled)
+        || q.audio_tracks.iter().any(|t| {
+            t.channels == filmcraft_project::AudioChannels::Surround51
+                || t.effects.iter().any(|e| e.enabled)
+                || !t.mixer.sends.is_empty()
+                || t.mixer.output.is_some()
+                || !t.transitions.is_empty()
+                || t.items.windows(2).any(|c| c.first().zip(c.get(1)).is_some_and(|(a, b)| a.end() > b.start))
+        })
+}
+
+/// Printed samples start on playback's floor-based sample grid. AAF otherwise rounds
+/// sub-sample event boundaries, moving an already-rendered waveform by one sample.
+/// The editor's project stays unchanged, and baked pan is never applied a second time.
+fn printed_clip_project(s: &Session, seq: ItemId, sample_rate: u32) -> Result<Project> {
+    let mut p = (*s.project).clone();
+    let q = p.sequence_mut(seq).ok_or(EngineError::NoSequence)?;
+    q.settings.sample_rate = sample_rate;
+    q.master_volume_db = 0.0;
+    q.master_effects.clear();
+    q.master_mixer = Default::default();
+    for t in &mut q.audio_tracks {
+        t.channels = filmcraft_project::AudioChannels::Stereo;
+        t.volume_db = 0.0;
+        t.pan = 0.0;
+        t.muted = false;
+        t.solo = false;
+        t.mixer = Default::default();
+        for c in &mut t.items {
+            let end = c.end().to_units_floor(i64::from(sample_rate));
+            let start = c.start.to_units_floor(i64::from(sample_rate));
+            c.start = Tick::from_units(start, i64::from(sample_rate));
+            c.duration = Tick::from_units(end.saturating_sub(start), i64::from(sample_rate));
+        }
+    }
+    Ok(p)
+}
+
+/// A bounded complete mixer print. Processing shared by several tracks must run once
+/// after their sum, rather than once per stem (nonlinear master effects especially).
+fn prepare_mixdown_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str) -> Result<(AudioEssence, Vec<String>)> {
+    if plan.mxf {
+        return Err(EngineError::Other("a complete audio mix print requires WAV or AIFF; choose one of those formats".into()));
+    }
+    let mut q = s.project.sequence(seq).ok_or(EngineError::NoSequence)?.clone();
+    q.settings.sample_rate = plan.sample_rate;
+    let frames =
+        usize::try_from(q.duration().to_units_floor(i64::from(plan.sample_rate))).map_err(|_| EngineError::Other("invalid audio mix duration".into()))?;
+    let channels = filmcraft_render::mixer::width_of(q.settings.audio_master);
+    if frames == 0 || frames.saturating_mul(channels) > MAX_EXPORT_AUDIO_SAMPLES {
+        return Err(EngineError::Other("audio mix exceeds the render sample budget or is empty; export a shorter sequence".into()));
+    }
+    let provider = s.media.full_res_provider(s.project.clone(), s.services.clone()).recording();
+    let error: Arc<Mutex<Option<String>>> = Arc::default();
+    let checked = |item| {
+        filmcraft_render::SourceProvider::source(&provider, item)
+            .map(|inner| Arc::new(RenderAudioSource { inner, error: error.clone() }) as filmcraft_media::SharedSource)
+    };
+    let mut out = vec![Vec::with_capacity(frames); channels];
+    for at in (0..frames).step_by(4096) {
+        let n = (frames - at).min(4096);
+        let b = filmcraft_render::mixer::mix_graph(&s.project, &q, at as i64, n, &checked, None);
+        for (dst, src) in out.iter_mut().zip(b.channels) {
+            dst.extend(src);
+        }
+    }
+    if !provider.offline_used().is_empty() {
+        return Err(EngineError::Other("audio mix contains offline media; relink it before exporting".into()));
+    }
+    if let Some(error) = error.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        return Err(EngineError::Other(format!("audio mix render failed: {error}")));
+    }
+    let render_gain = preserve_headroom(&mut out)?;
+    let pcm = quantize(&out.iter().collect::<Vec<_>>(), plan.bits);
+    let mut files = Vec::new();
+    let data = if plan.mode == AudioMode::Embedded {
+        EssenceData::Embedded(pcm)
+    } else {
+        let path = join(media_dir, if plan.aiff { "FilmCraft Mix.aif" } else { "FilmCraft Mix.wav" });
+        let bytes = if plan.aiff {
+            filmcraft_interchange::wav::aiff_file(&pcm, channels as u16, plan.sample_rate, plan.bits)
+        } else {
+            filmcraft_interchange::wav::wav_file(&pcm, channels as u16, plan.sample_rate, plan.bits)
+        };
+        s.services.write_file(&path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        files.push(path.clone());
+        EssenceData::File { path }
+    };
+    Ok((
+        AudioEssence {
+            key: EssenceKey::Media(seq),
+            channel: None,
+            start: Tick::ZERO,
+            frames: frames as u64,
+            sample_rate: plan.sample_rate,
+            bits: plan.bits,
+            channels: channels as u32,
+            data,
+            effects_rendered: true,
+            timing_rendered: true,
+            render_gain,
+        },
+        files,
+    ))
+}
+
 /// `file.exportAaf`
 pub fn export_aaf(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.exportAaf";
@@ -523,7 +664,14 @@ pub fn export_aaf(s: &mut Session, p: &Value) -> Result<Value> {
     if plan.mode != AudioMode::Embedded || bool_p(p, "mixdownVideo").unwrap_or(false) {
         ensure_dir(s, &media_dir);
     }
-    let (essence, written) = prepare_audio(s, seq, &plan, &media_dir)?;
+    let full_mix = plan.preserve_mix && needs_mixdown(s.project.sequence(seq).ok_or(EngineError::NoSequence)?);
+    let (essence, mixdown_audio, written) = if full_mix {
+        let (mix, files) = prepare_mixdown_audio(s, seq, &plan, &media_dir)?;
+        (Vec::new(), Some(mix), files)
+    } else {
+        let (essence, files) = prepare_audio(s, seq, &plan, &media_dir)?;
+        (essence, None, files)
+    };
     files.extend(written);
     let mixdown_video = if bool_p(p, "mixdownVideo").unwrap_or(false) {
         let ext = if str_p(p, "mixdownFormat") == Some("mxf") { "mxf" } else { "mov" };
@@ -535,12 +683,20 @@ pub fn export_aaf(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let opts = filmcraft_interchange::aaf::AafOptions {
         name: s.project.item(seq).map(|i| i.name.clone()),
-        media: MediaOptions { breakout_to_mono: plan.breakout, audio_only: false, essence, mixdown_video },
+        media: MediaOptions { breakout_to_mono: plan.breakout, audio_only: false, essence, mixdown_video, mixdown_audio },
         small_sectors: bool_p(p, "smallSectors").unwrap_or(false),
     };
-    let (bytes, report) = filmcraft_interchange::aaf::export(&s.project, seq, &opts).map_err(|e| EngineError::Other(e.to_string()))?;
+    let printed = if plan.preserve_mix && !full_mix { Some(printed_clip_project(s, seq, plan.sample_rate)?) } else { None };
+    let project = printed.as_ref().unwrap_or(&s.project);
+    let (bytes, mut report) = filmcraft_interchange::aaf::export(project, seq, &opts).map_err(|e| EngineError::Other(e.to_string()))?;
+    if printed.is_some() {
+        report.info("clip effects, track levels, mute, solo, pan and master level were rendered; editable audio events are preserved");
+    } else if !plan.preserve_mix {
+        report.warn("mix matching is disabled: track, bus and master mixer processing is not preserved");
+    }
     s.services.write_file(&path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-    Ok(json!({"path": path, "bytes": bytes.len(), "mediaFiles": files, "report": report_json(&report)}))
+    Ok(json!({"path": path, "bytes": bytes.len(), "mediaFiles": files, "report": report_json(&report),
+        "preserveMix": plan.preserve_mix, "audioLayout": if full_mix { "mixdown" } else { "clips" }}))
 }
 
 /// `file.exportOmf`
@@ -557,7 +713,7 @@ pub fn export_omf(s: &mut Session, p: &Value) -> Result<Value> {
     let (essence, files) = prepare_audio(s, seq, &plan, &media_dir)?;
     let opts = filmcraft_interchange::omf::OmfOptions {
         name: str_p(p, "title").map(str::to_string).or_else(|| s.project.item(seq).map(|i| i.name.clone())),
-        media: MediaOptions { breakout_to_mono: plan.breakout, audio_only: true, essence, mixdown_video: None },
+        media: MediaOptions { breakout_to_mono: plan.breakout, audio_only: true, essence, mixdown_video: None, mixdown_audio: None },
     };
     let (bytes, report) = filmcraft_interchange::omf::export(&s.project, seq, &opts).map_err(|e| EngineError::Other(e.to_string()))?;
     if bytes.len() as u64 > i32::MAX as u64 {

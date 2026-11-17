@@ -279,6 +279,47 @@ impl Exporter<'_> {
                 }
             }
         }
+        if let Some(mix) = media.mixdown_audio.as_ref().filter(|_| top) {
+            let length = Tick::from_units(mix.frames.min(i64::MAX as u64) as i64, i64::from(mix.sample_rate.max(1)));
+            let source = self.doc.sources.len();
+            let (path, embedded) = match &mix.data {
+                EssenceData::Embedded(data) => (None, Some(data.clone())),
+                EssenceData::File { path } => (Some(path.clone()), None),
+            };
+            self.doc.sources.push(Source {
+                key: "audio-mixdown".into(),
+                name: "FilmCraft Mix".into(),
+                kind: CKind::Sound,
+                path,
+                channel: None,
+                channels: mix.channels,
+                file_channels: mix.channels,
+                width: 0,
+                height: 0,
+                frame_rate: rate,
+                sample_rate: mix.sample_rate,
+                bits: mix.bits,
+                wave_format: Some(1),
+                length,
+                offset: Tick::ZERO,
+                start_tc: None,
+                tc_rate: rate,
+                embedded,
+                markers: Vec::new(),
+                nested: None,
+            });
+            let gain = (mix.render_gain != 1.0).then_some(Gain::Constant(mix.render_gain));
+            comp.tracks.push(CTrack {
+                kind: CKind::Sound,
+                name: "FilmCraft Mix".into(),
+                number: 1,
+                channels: mix.channels,
+                items: vec![CItem::Clip(CClip { len: length, source, start: Tick::ZERO, gain, name: "FilmCraft Mix".into() })],
+            });
+            self.report.info("the complete audio mix was rendered to preserve track, bus, master and transition processing");
+            self.seq_rate = outer_rate;
+            return comp;
+        }
         let mut n = 0;
         for t in &seq.audio_tracks {
             let ch = match t.channels {
@@ -429,6 +470,9 @@ impl Exporter<'_> {
         };
         let path = match &m.media {
             MediaRef::File { path } => path.clone(),
+            // A generator has no original file locator, but prepared audio supplies one
+            // (or embedded PCM) below. Rejecting it here would discard audible prints.
+            MediaRef::Generator(_) if kind == TrackKind::Audio && self.media.essence_for(EssenceKey::Clip(c.id), sub).is_some() => String::new(),
             MediaRef::Generator(_) => {
                 self.report.warn("synthetic media (bars, colour mattes, …) is not exported (left as gaps)");
                 return None;

@@ -5,7 +5,7 @@
 //! Automation ids (`<p>` is `aafExport` or `omfExport`): `<p>.mixdownVideo` (AAF),
 //! `<p>.breakoutToMono`, `<p>.audio.<embedded|separate|linked>` (linked: AAF only),
 //! `<p>.audioFormat.<wav|aiff|mxf>` (mxf: AAF only), `<p>.sampleRate.<rate>`, `<p>.bitDepth.<16|24>`, `<p>.trimAudio`,
-//! `<p>.handles` (frames), `<p>.renderAudioEffects`, `<p>.title` (OMF), `<p>.ok`, `<p>.cancel`.
+//! `<p>.handles` (frames), `<p>.renderAudioEffects`, `<p>.preserveMix` (AAF), `<p>.title` (OMF), `<p>.ok`, `<p>.cancel`.
 
 use crate::widgets::CenteredDialog as _;
 use serde_json::{Value, json};
@@ -26,6 +26,7 @@ struct Draft {
     trim: bool,
     handles: i64,
     render_effects: bool,
+    preserve_mix: bool,
 }
 
 fn draft_id() -> egui::Id {
@@ -52,6 +53,7 @@ pub fn open(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str) -> Result<Val
         trim: omf,
         handles: if omf { 30 } else { 0 },
         render_effects: false,
+        preserve_mix: !omf,
     };
     ctx.data_mut(|m| m.insert_temp(draft_id(), Some(d)));
     Ok(json!({"dialog": if omf { "omfExport" } else { "aafExport" }}))
@@ -101,6 +103,17 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 }
             });
             ui.end_row();
+            if !d.omf {
+                ui.label(tl!("Mix:"));
+                let r = ui.checkbox(&mut d.preserve_mix, tl!("Match FilmCraft audio mix")).on_hover_text(tl!(
+                    "Preserves levels, mute, pan and effects. Keeps editable clips when possible; prints one mix for bus, master or transition processing."
+                ));
+                elems.push((format!("{p}.preserveMix"), r.rect, d.preserve_mix.to_string()));
+                if d.preserve_mix {
+                    d.breakout = false;
+                }
+                ui.end_row();
+            }
             ui.label(tl!("Audio File Format:"));
             ui.horizontal(|ui| {
                 let formats: &[(&'static str, &str)] =
@@ -146,14 +159,21 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             elems.push((format!("{p}.handles"), r.rect, d.handles.to_string()));
             ui.end_row();
             ui.label("");
-            let r = ui.add_enabled(!linked, egui::Checkbox::new(&mut d.render_effects, tl!("Render audio clip effects")));
-            elems.push((format!("{p}.renderAudioEffects"), r.rect, d.render_effects.to_string()));
+            let mut rendered = d.render_effects || d.preserve_mix;
+            let r = ui.add_enabled(!linked && !d.preserve_mix, egui::Checkbox::new(&mut rendered, tl!("Render audio clip effects")));
+            if !d.preserve_mix {
+                d.render_effects = rendered;
+            }
+            elems.push((format!("{p}.renderAudioEffects"), r.rect, rendered.to_string()));
             ui.end_row();
             ui.label("");
-            let r = ui.checkbox(&mut d.breakout, tl!("Breakout to mono"));
+            let r = ui.add_enabled(!d.preserve_mix, egui::Checkbox::new(&mut d.breakout, tl!("Breakout to mono")));
             elems.push((format!("{p}.breakoutToMono"), r.rect, d.breakout.to_string()));
             ui.end_row();
         });
+        if d.preserve_mix && app.session.active_sequence().is_some_and(filmcraft_engine::aaf_omf::needs_mixdown) {
+            ui.label(tl!("This project will export one audio mix to preserve its bus, master or transition processing."));
+        }
         ui.label(tl!("Retimed audio is always rendered with its clip effects to preserve playback."));
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -201,6 +221,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     params["title"] = json!(d.title);
                 } else {
                     params["mixdownVideo"] = json!(d.mixdown_video);
+                    params["preserveMix"] = json!(d.preserve_mix);
                 }
                 let cmd = if d.omf { "file.exportOmf" } else { "file.exportAaf" };
                 match app.session.execute(cmd, params) {
