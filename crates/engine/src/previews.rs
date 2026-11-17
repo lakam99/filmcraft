@@ -35,7 +35,7 @@ use filmcraft_media::{FrameRequest, SharedSource};
 use filmcraft_project::{ItemId, Project};
 use filmcraft_render::preview::{AudioSegment, Need, Segment, segment_at, video_segments};
 use filmcraft_time::{FrameRate, Tick, TimeRange};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{EngineError, MediaPool, Result, Session};
@@ -60,7 +60,7 @@ pub struct BarSpan {
 }
 
 /// Which segments a render command picks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RenderMode {
     /// Red segments in In/Out (Enter), as in Premiere: yellow ones should play in real time, and
     /// rendering them too can take hours of encoding on a long sequence (#1220).
@@ -321,6 +321,26 @@ impl PreviewStore {
     /// Register a finished video preview file (`<hash>.mov` or `<hash>-<off>-<len>.mov`).
     fn add_video(&self, name: &str) {
         self.files.write().unwrap_or_else(|e| e.into_inner()).insert(name.to_string());
+        self.reindex();
+        self.bump();
+    }
+
+    /// Index complete worker outputs off the render loop. Holding the directory read guard
+    /// prevents an old job from refreshing a newly selected project's preview folder.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn refresh_from_backend(&self, expected: &Path) {
+        let Ok(entries) = std::fs::read_dir(expected) else { return };
+        let names: Vec<String> = entries
+            .flatten()
+            .take(100_000)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| parse_video_name(name).is_some() || name.strip_suffix(".wav").is_some_and(is_hash))
+            .collect();
+        let directory = self.dir.read().unwrap_or_else(|e| e.into_inner());
+        if directory.as_deref() != Some(expected) {
+            return;
+        }
+        self.files.write().unwrap_or_else(|e| e.into_inner()).extend(names);
         self.reindex();
         self.bump();
     }
@@ -637,6 +657,10 @@ struct Todo {
 /// The In/Out modes render only the frames between In and Out (a segment that extends past them
 /// gets a partial preview), and every mode renders only frames that have no preview yet.
 pub fn render(s: &mut Session, mode: RenderMode, p: &Value) -> Result<Value> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::backend::enabled(s) {
+        return crate::backend::start_preview(s, Some(mode), p);
+    }
     let (seq, range) = in_out(s)?;
     let rate = s.project.sequence(seq).ok_or(EngineError::NoSequence)?.settings.frame_rate;
     let store = s.previews.clone();
@@ -668,7 +692,7 @@ pub fn render(s: &mut Session, mode: RenderMode, p: &Value) -> Result<Value> {
     let job = crate::Job {
         id,
         label: format!("Rendering {} preview segment{}", todo.len(), if todo.len() == 1 { "" } else { "s" }),
-        progress: Default::default(),
+        progress: s.worker_progress.clone().unwrap_or_default(),
         result: Default::default(),
     };
     job.progress.total.store(frames.max(1) as u64, Ordering::Relaxed);
@@ -755,6 +779,10 @@ pub fn render(s: &mut Session, mode: RenderMode, p: &Value) -> Result<Value> {
 
 /// Render Audio: mix the audio segments in In/Out (or the whole sequence) to float WAV previews.
 pub fn render_audio(s: &mut Session, p: &Value) -> Result<Value> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::backend::enabled(s) {
+        return crate::backend::start_preview(s, None, p);
+    }
     let (seq, range) = in_out(s)?;
     let store = s.previews.clone();
     let dir = store.dir().ok_or_else(|| EngineError::Other("render previews are not available here (no preview folder)".into()))?;
@@ -773,7 +801,7 @@ pub fn render_audio(s: &mut Session, p: &Value) -> Result<Value> {
     std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("preview folder {}: {e}", dir.display())))?;
     let total: i64 = todo.iter().map(|g| g.samples).sum();
     let id = s.jobs.len() as u64 + 1;
-    let job = crate::Job { id, label: "Rendering audio previews".into(), progress: Default::default(), result: Default::default() };
+    let job = crate::Job { id, label: "Rendering audio previews".into(), progress: s.worker_progress.clone().unwrap_or_default(), result: Default::default() };
     job.progress.total.store(total.max(1) as u64, Ordering::Relaxed);
     let project = s.project.clone();
     let provider = s.media.full_res_provider(project.clone(), s.services.clone()).own_sources();

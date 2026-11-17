@@ -25,7 +25,7 @@ impl FilmcraftApp {
     pub fn new(mut session: Session) -> Self {
         session.shortcuts.register_external(menus::external_commands());
         let recovery = !session.recovery_candidates().is_empty();
-        let frames = Arc::new(FrameServer::new(session.media.clone(), session.services.clone(), session.previews.clone(), FrameServer::default_workers()));
+        let frames = Arc::new(FrameServer::for_session(&session));
         let workspaces =
             session.prefs_path.as_ref().and_then(|p| p.parent()).map(|d| dock::WorkspacePrefs::load(&d.join(dock::WORKSPACES_FILE))).unwrap_or_default();
         let language = i18n::Language::parse(&session.prefs.general.interface_language).unwrap_or_default();
@@ -183,13 +183,12 @@ impl FilmcraftApp {
 
     /// Rebuild the frame server if the session's media pool was replaced (e.g. project opened).
     fn sync_pool(&mut self) {
-        if !Arc::ptr_eq(&self.frames.pool, &self.session.media) || !Arc::ptr_eq(&self.frames.previews, &self.session.previews) {
-            self.frames = Arc::new(FrameServer::new(
-                self.session.media.clone(),
-                self.session.services.clone(),
-                self.session.previews.clone(),
-                FrameServer::default_workers(),
-            ));
+        if !Arc::ptr_eq(&self.frames.pool, &self.session.media)
+            || !Arc::ptr_eq(&self.frames.services, &self.session.services)
+            || !Arc::ptr_eq(&self.frames.previews, &self.session.previews)
+            || !self.frames.backend_matches(&self.session)
+        {
+            self.frames = Arc::new(FrameServer::for_session(&self.session));
             self.textures.clear();
             self.thumb_used.clear();
             self.tl.reset_media_caches();
@@ -270,6 +269,9 @@ impl FilmcraftApp {
         self.frames.set_context(ctx);
         self.frames.pump(std::time::Duration::from_millis(if self.playback.playing { 24 } else { 40 }));
         self.session.poll_persistence();
+        if let Some(error) = self.frames.take_backend_error() {
+            self.session.events.push(filmcraft_engine::Event::Toast { message: format!("Preview renderer restarted: {error}"), error: true });
+        }
         panels::trim_monitor::advance_at(self, now);
         if self.session.trim_play.active() {
             ctx.request_repaint();

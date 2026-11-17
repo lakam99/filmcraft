@@ -152,6 +152,9 @@ struct Job {
 }
 
 struct Shared {
+    backend_error: Mutex<(Option<String>, Option<String>)>,
+    #[cfg(not(target_arch = "wasm32"))]
+    backend: Option<filmcraft_engine::backend::frames::Config>,
     queue: Mutex<VecDeque<Job>>,
     cv: Condvar,
     done: Mutex<Cache>,
@@ -175,6 +178,7 @@ struct Shared {
 /// Cumulative frame-job statistics (`perf.stats`): cheap enough to keep on all the time.
 #[derive(Clone, Debug, Default)]
 pub struct FrameStats {
+    pub backend_pids: Vec<u32>,
     /// Jobs finished (including cancelled ones).
     pub jobs: u64,
     /// Jobs whose decode/render panicked (the worker survives; the frame is not cached).
@@ -212,6 +216,7 @@ impl FrameStats {
         let n = self.jobs.max(1) as f64;
         let req = self.request_hits + self.request_misses;
         serde_json::json!({
+            "backendPids": self.backend_pids,
             "jobs": self.jobs, "cancelled": self.cancelled, "failedJobs": self.failed, "previewJobs": self.preview, "prefetchJobs": self.prefetch,
             "requestHitRate": if req == 0 { 0.0 } else { self.request_hits as f64 / req as f64 },
             "decodeMs": {"mean": self.source_ms / n, "p50": pct(&|r| r.0, 0.5), "p95": pct(&|r| r.0, 0.95)},
@@ -497,7 +502,65 @@ impl FrameServer {
     }
 
     pub fn new(pool: Arc<MediaPool>, services: Arc<dyn Services>, previews: Arc<PreviewStore>, workers: usize) -> Self {
+        Self::build(
+            pool,
+            services,
+            previews,
+            workers,
+            #[cfg(not(target_arch = "wasm32"))]
+            None,
+        )
+    }
+
+    pub fn for_session(session: &filmcraft_engine::Session) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let backend = filmcraft_engine::backend::frames::Config::for_session(session);
+            let workers = if backend.is_some() { 2 } else { Self::default_workers() };
+            Self::build(session.media.clone(), session.services.clone(), session.previews.clone(), workers, backend)
+        }
+        #[cfg(target_arch = "wasm32")]
+        Self::new(session.media.clone(), session.services.clone(), session.previews.clone(), Self::default_workers())
+    }
+
+    pub fn process_rendering(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.shared.backend.is_some()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+
+    pub fn take_backend_error(&self) -> Option<String> {
+        self.shared.backend_error.lock().unwrap_or_else(PoisonError::into_inner).1.take()
+    }
+
+    pub fn backend_matches(&self, session: &filmcraft_engine::Session) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.shared.backend == filmcraft_engine::backend::frames::Config::for_session(session)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = session;
+            true
+        }
+    }
+
+    fn build(
+        pool: Arc<MediaPool>,
+        services: Arc<dyn Services>,
+        previews: Arc<PreviewStore>,
+        workers: usize,
+        #[cfg(not(target_arch = "wasm32"))] backend: Option<filmcraft_engine::backend::frames::Config>,
+    ) -> Self {
         let shared = Arc::new(Shared {
+            backend_error: Mutex::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            backend,
             queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
             done: Mutex::new(Cache { map: HashMap::new(), bytes: 0, budget: 768 << 20, clock: 0 }),
@@ -811,7 +874,15 @@ impl FrameServer {
                     None => break,
                 }
             };
-            if run_job(&self.shared, &job, &self.pool, &self.services, &self.previews) {
+            if run_job(
+                &self.shared,
+                &job,
+                &self.pool,
+                &self.services,
+                &self.previews,
+                #[cfg(not(target_arch = "wasm32"))]
+                None,
+            ) {
                 done += 1;
             } else {
                 retry.push(job);
@@ -925,6 +996,7 @@ fn worker(
     previews: Arc<PreviewStore>,
     repaint: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
 ) {
+    let mut backend = sh.backend.clone().map(filmcraft_engine::backend::frames::Renderer::new);
     loop {
         let job = {
             let mut q = sh.queue.lock().unwrap_or_else(PoisonError::into_inner);
@@ -945,7 +1017,7 @@ fn worker(
         // A panic while decoding or rendering one frame (bad media, a decoder bug) must not take
         // the worker down with it: a dead worker leaves its frame "in flight" forever and the
         // monitors blank. Log it, forget the job and keep serving.
-        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&sh, &job, &pool, &services, &previews)));
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&sh, &job, &pool, &services, &previews, backend.as_mut())));
         if ran.is_err() {
             sh.in_flight.lock().unwrap_or_else(PoisonError::into_inner).retain(|(k, c, _)| !(*k == job.key && Arc::ptr_eq(c, &job.cancel)));
             sh.stats.lock().unwrap_or_else(PoisonError::into_inner).failed += 1;
@@ -967,7 +1039,14 @@ pub fn inject_job_panics(n: u32) {
 }
 static INJECT_PANICS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-fn run_job(sh: &Shared, job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, previews: &PreviewStore) -> bool {
+fn run_job(
+    sh: &Shared,
+    job: &Job,
+    pool: &Arc<MediaPool>,
+    services: &Arc<dyn Services>,
+    previews: &PreviewStore,
+    #[cfg(not(target_arch = "wasm32"))] backend: Option<&mut filmcraft_engine::backend::frames::Renderer>,
+) -> bool {
     {
         let mut in_flight = sh.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
         // A job taken from the queue just before the server was dropped is not in the list
@@ -993,6 +1072,64 @@ fn run_job(sh: &Shared, job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Ser
         filmcraft_media::cancel::with_catch_up(job.catch_up, || {
             filmcraft_media::cancel::with_draft(job.key.draft, || {
                 filmcraft_media::cancel::with_background(is_background(job), || {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(backend) = backend {
+                        use filmcraft_engine::backend::frames::{FrameRequest, Target as RemoteTarget};
+                        let target = match job.key.target {
+                            Target::Sequence(id) | Target::SequencePlan(id, _) => RemoteTarget::Sequence(id),
+                            Target::SequenceLive(id) => RemoteTarget::SequenceLive(id),
+                            Target::Item(id) => RemoteTarget::Item(id),
+                            Target::MulticamGrid(id, side, page) => RemoteTarget::MulticamGrid(id, side, page),
+                            Target::MulticamAngle(id, angle) => RemoteTarget::MulticamAngle(id, angle),
+                        };
+                        let request = FrameRequest {
+                            target,
+                            time: job.time,
+                            scale: job.scale,
+                            draft: job.key.draft,
+                            gpu: !matches!(target, RemoteTarget::SequenceLive(_)),
+                            preview_directory: previews.dir(),
+                            preview_generation: previews.generation.load(Ordering::Relaxed),
+                            source_generation: pool.generation(),
+                        };
+                        return match backend.render(&job.project, pool, services, request, &job.cancel, &sh.stop) {
+                            Ok(frame) => {
+                                {
+                                    let mut stats = sh.stats.lock().unwrap_or_else(PoisonError::into_inner);
+                                    if !stats.backend_pids.contains(&frame.worker_pid) {
+                                        stats.backend_pids.push(frame.worker_pid);
+                                        if stats.backend_pids.len() > 2 {
+                                            stats.backend_pids.remove(0);
+                                        }
+                                    }
+                                }
+                                sh.backend_error.lock().unwrap_or_else(PoisonError::into_inner).0 = None;
+                                loading = frame.loading;
+                                if !job.cancel.load(Ordering::Relaxed) && !loading {
+                                    sh.done
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .insert(job.key, Arc::new(Rgba { w: frame.width, h: frame.height, px: frame.rgba }));
+                                }
+                                frame.preview
+                            }
+                            Err(error) => {
+                                loading = true;
+                                if !job.cancel.load(Ordering::Relaxed) && !sh.stop.load(Ordering::Relaxed) {
+                                    sh.stats.lock().unwrap_or_else(PoisonError::into_inner).failed += 1;
+                                    if error != "preview backend is restarting" {
+                                        let error: String = error.chars().take(512).collect();
+                                        let mut last = sh.backend_error.lock().unwrap_or_else(PoisonError::into_inner);
+                                        if last.0.as_ref() != Some(&error) {
+                                            log::warn!("preview backend: {error}");
+                                            *last = (Some(error.clone()), Some(error));
+                                        }
+                                    }
+                                }
+                                false
+                            }
+                        };
+                    }
                     if let Target::SequencePlan(seq, caps) = job.key.target {
                         let (plan, pv) = plan_job(job, seq, caps, pool, services, previews);
                         loading = filmcraft_media::pending::take();
@@ -1309,7 +1446,15 @@ mod tests {
         };
         // what `Drop` sets before it cancels the jobs in flight
         server.shared.stop.store(true, Ordering::Relaxed);
-        run_job(&server.shared, &job, &server.pool, &server.services, &server.previews);
+        run_job(
+            &server.shared,
+            &job,
+            &server.pool,
+            &server.services,
+            &server.previews,
+            #[cfg(not(target_arch = "wasm32"))]
+            None,
+        );
         assert!(job.cancel.load(Ordering::Relaxed), "the job ran without its cancel flag");
         assert!(!server.is_ready(&job.key), "a cancelled job's frame is not cached");
     }

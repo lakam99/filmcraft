@@ -136,7 +136,9 @@ impl FilmcraftApp {
             && j.progress.finished.load(Ordering::Relaxed)
         {
             self.watched_render = None;
-            let ok = j.progress.error.lock().map(|e| e.is_none()).unwrap_or(false);
+            let ok = j.result.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|r| r.as_ref().is_ok_and(|r| r.frames > 0));
+            #[cfg(not(target_arch = "wasm32"))]
+            let ok = ok && self.session.backend.can_play_preview(id, self.session.document_epoch, self.session.revision, self.session.state.active_sequence);
             if ok && self.ui.play_after_render && !self.playback.playing {
                 self.session.set_playhead(from);
                 self.play(1.0);
@@ -272,6 +274,34 @@ mod job_status_tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn changing_host_services_rebuilds_the_frame_broker() {
+        let mut app = FilmcraftApp::new(filmcraft_engine::Session::default());
+        let previous = app.frames.clone();
+        app.session.services = std::sync::Arc::new(filmcraft_engine::FsServices);
+        app.sync_pool();
+        assert!(!std::sync::Arc::ptr_eq(&previous, &app.frames));
+        assert!(std::sync::Arc::ptr_eq(&app.frames.services, &app.session.services));
+    }
+
+    #[test]
+    fn completed_noop_preview_does_not_start_playback() {
+        for frames in [0, 1] {
+            let mut session = filmcraft_engine::Session::default();
+            session.execute("file.newSequence", serde_json::json!({})).unwrap();
+            let job = filmcraft_engine::Job { id: 7, label: "Rendering previews".into(), progress: Default::default(), result: Default::default() };
+            *job.result.lock().unwrap() =
+                Some(Ok(filmcraft_engine::export::Report { path: String::new(), frames, seconds: 0.0, bytes: 0, render_fps: 0.0, extra_files: Vec::new() }));
+            job.progress.finished.store(true, Ordering::Relaxed);
+            session.jobs.push(job);
+            let mut app = FilmcraftApp::new(session);
+            app.ui.play_after_render = true;
+            app.watched_render = Some((7, Tick::ZERO));
+            app.poll_jobs(&egui::Context::default());
+            assert_eq!(app.playback.playing, frames > 0);
+        }
+    }
 
     /// The status bar's export text changed on every frame, and right-aligned against the bar, so
     /// "Exporting… 46%" jumped sideways whenever the time left gained or lost a digit or its hour.

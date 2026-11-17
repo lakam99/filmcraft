@@ -5,6 +5,57 @@ use std::io::Cursor;
 pub(super) enum Tool {
     Editor(ControlRequest),
     Frame { monitor: String, snapshot: Option<Snapshot> },
+    Job(JobWait),
+}
+
+pub(super) struct JobWait {
+    id: u64,
+    envelope: Value,
+    progress: std::sync::Arc<filmcraft_engine::export::Progress>,
+    completed: bool,
+}
+
+impl Drop for JobWait {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if !self.completed && !self.progress.finished.load(Ordering::Acquire) {
+            self.progress.cancel.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl JobWait {
+    fn poll(&mut self, app: &mut FilmcraftApp) -> Result<Option<Value>, String> {
+        let job = app.session.jobs.iter().find(|job| job.id == self.id).ok_or("Background job no longer exists")?;
+        let result = job.result.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(result) = result else { return Ok(None) };
+        self.completed = true;
+        if let Err(error) = result {
+            let mut envelope = self.envelope.clone();
+            envelope["ok"] = false.into();
+            envelope["error"] = error.into();
+            if let Some(fields) = envelope.as_object_mut() {
+                fields.remove("result");
+            }
+            return Ok(Some(Value::String(envelope.to_string())));
+        }
+        // One local query on completion enriches the reply with AAF warnings/media paths.
+        // Waiting consumes no additional provider requests or model tool calls.
+        let jobs = app.session.execute("jobs.list", json!({})).map_err(|e| e.to_string())?;
+        let done = jobs.as_array().and_then(|jobs| jobs.iter().find(|job| job["id"] == self.id)).ok_or("Completed job result is unavailable")?;
+        let mut envelope = self.envelope.clone();
+        let output = envelope["result"].as_object_mut().ok_or("Invalid background job acknowledgement")?;
+        for key in ["poll", "cancel", "background"] {
+            output.remove(key);
+        }
+        if let Some(fields) = done["backend"]["output"].as_object() {
+            output.extend(fields.clone());
+        }
+        output.insert("job".into(), self.id.into());
+        output.insert("finished".into(), true.into());
+        output.insert("result".into(), done["result"].clone());
+        Ok(Some(Value::String(envelope.to_string())))
+    }
 }
 
 pub(super) struct Snapshot {
@@ -35,25 +86,36 @@ pub(super) fn start(call: &craft_ai_chat_egui::ToolCall) -> Result<Pending, Stri
     Ok(Pending { tool, control_reply })
 }
 pub(super) fn poll(app: &mut FilmcraftApp, ctx: &egui::Context, pending: &mut Pending) -> Result<Option<Value>, String> {
-    match &mut pending.tool {
-        Tool::Frame { monitor, snapshot } => frame(app, monitor, snapshot),
+    let response = match &mut pending.tool {
+        Tool::Frame { monitor, snapshot } => return frame(app, monitor, snapshot),
+        Tool::Job(wait) => return wait.poll(app),
         Tool::Editor(req) => match pending.control_reply.try_recv() {
-            Ok(value) => Ok(Some(Value::String(value.to_string()))),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("Editor input channel closed".into()),
-            Err(std::sync::mpsc::TryRecvError::Empty) if req.method.is_empty() => Ok(None),
+            Ok(value) => Some(value),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return Err("Editor input channel closed".into()),
+            Err(std::sync::mpsc::TryRecvError::Empty) if req.method.is_empty() => None,
             Err(std::sync::mpsc::TryRecvError::Empty) => match control::handle(app, ctx, req) {
-                control::Outcome::Done(value) => Ok(Some(Value::String(value.to_string()))),
-                control::Outcome::Retry(_) => Ok(None),
+                control::Outcome::Done(value) => Some(value),
+                control::Outcome::Retry(_) => None,
                 control::Outcome::AfterInput => {
                     app.input_waiters.push(req.reply.clone());
                     req.method.clear();
-                    Ok(None)
+                    None
                 }
 
-                control::Outcome::Screenshot { .. } => Err("Use active-view capture to inspect media".into()),
+                control::Outcome::Screenshot { .. } => return Err("Use active-view capture to inspect media".into()),
             },
         },
+    };
+    let Some(response) = response else { return Ok(None) };
+    if response["ok"] == true
+        && response["result"]["poll"] == "jobs.list"
+        && let Some(id) = response["result"]["job"].as_u64()
+        && let Some(job) = app.session.jobs.iter().find(|job| job.id == id)
+    {
+        pending.tool = Tool::Job(JobWait { id, envelope: response, progress: job.progress.clone(), completed: false });
+        return Ok(None);
     }
+    Ok(Some(Value::String(response.to_string())))
 }
 
 fn snapshot(app: &FilmcraftApp, monitor: &str) -> Result<Snapshot, String> {
@@ -130,4 +192,61 @@ pub(super) fn frame(app: &FilmcraftApp, monitor: &str, pending: &mut Option<Snap
         {"type":"input_text","text":json!({"monitor":monitor,"ticks":snapshot.time.0,"frame":snapshot.key.frame,"width":rgba.w,"height":rgba.h}).to_string()},
         {"type":"input_image","image_url":format!("data:image/png;base64,{}", crate::control::base64(&png)),"detail":"auto"}
     ])))
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn setup() -> (FilmcraftApp, Pending) {
+        let mut app = FilmcraftApp::new(filmcraft_engine::Session::default());
+        let job = filmcraft_engine::Job { id: 7, label: "Export AAF".into(), progress: Default::default(), result: Default::default() };
+        let wait = JobWait {
+            id: 7,
+            envelope: json!({"ok":true,"result":{"job":7,"path":"out.aaf","poll":"jobs.list","cancel":"jobs.cancel"}}),
+            progress: job.progress.clone(),
+            completed: false,
+        };
+        app.session.jobs.push(job);
+        let (_, control_reply) = std::sync::mpsc::channel();
+        (app, Pending { tool: Tool::Job(wait), control_reply })
+    }
+
+    #[test]
+    fn background_tool_stays_pending_until_a_success_or_error_is_available() {
+        for success in [true, false] {
+            let (mut app, mut pending) = setup();
+            let context = egui::Context::default();
+            for _ in 0..40 {
+                assert!(poll(&mut app, &context, &mut pending).unwrap().is_none());
+            }
+            *app.session.jobs[0].result.lock().unwrap() = Some(if success {
+                Ok(filmcraft_engine::export::Report { path: "out.aaf".into(), frames: 3, seconds: 0.1, bytes: 128, render_fps: 30.0, extra_files: Vec::new() })
+            } else {
+                Err("cancelled".into())
+            });
+            app.session.jobs[0].progress.finished.store(true, Ordering::Release);
+            let result = poll(&mut app, &context, &mut pending).unwrap().unwrap();
+            let result: Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+            assert_eq!(result["ok"], success);
+            if success {
+                assert_eq!(result["result"]["finished"], true);
+                assert_eq!(result["result"]["path"], "out.aaf");
+                assert_eq!(result["result"]["result"]["frames"], 3);
+                assert!(result["result"].get("poll").is_none());
+            } else {
+                assert_eq!(result["error"], "cancelled");
+            }
+            drop(pending);
+            assert!(!app.session.jobs[0].progress.cancel.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn stopping_the_pending_tool_cancels_its_job() {
+        let (app, pending) = setup();
+        drop(pending);
+        assert!(app.session.jobs[0].progress.cancel.load(Ordering::Acquire));
+    }
 }

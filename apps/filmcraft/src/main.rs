@@ -80,6 +80,23 @@ fn tell(text: &str, error: bool) {
 }
 
 fn main() -> eframe::Result {
+    if std::env::args_os().skip(1).eq([std::ffi::OsString::from(filmcraft_engine::backend::FRAME_WORKER_ARGUMENT)]) {
+        register_hardware_decoders();
+        if let Err(error) = filmcraft_engine::backend::frames::serve_stdio(build_gpu_frame_renderer) {
+            eprintln!("FilmCraft preview backend: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if std::env::args_os().skip(1).eq([std::ffi::OsString::from(filmcraft_engine::backend::WORKER_ARGUMENT)]) {
+        register_hardware_decoders();
+        register_gpu_frame_renderer();
+        if let Err(error) = filmcraft_engine::backend::serve_stdio() {
+            eprintln!("FilmCraft backend: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     // Windows: the update helper is a copy of this program started with `--finish-update`.
     #[cfg(windows)]
     if let Some(result) = craft_update::self_update::finish(&filmcraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
@@ -220,6 +237,7 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
             let start = graphics.clone();
             filmcraft_ui_egui::graphics_notice::GraphicsNotice::new(graphics.mode().label(), Box::new(move || start.reset_to_default()))
         });
+        let backend_gpu = graphics.mode() == graphics::Mode::Default;
         let confirmed = AtomicBool::new(false);
         cc.egui_ctx.on_end_pass(
             "graphics-start",
@@ -230,6 +248,11 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
             }),
         );
         let mut session = Session::default();
+        match std::env::current_exe() {
+            Ok(executable) => session.backend.enable(executable),
+            Err(error) => session.backend.unavailable(format!("native backend unavailable: {error}; reinstall FilmCraft to restore background rendering")),
+        }
+        session.backend.set_gpu_rendering(backend_gpu);
         if let Some(dir) = data_dir.clone().or_else(default_data_dir) {
             let mut cfg = AutosaveConfig::new(dir);
             cfg.local_offset = local_offset;
@@ -446,9 +469,11 @@ impl filmcraft_export::FrameRenderer for GpuFrameRenderer {
 }
 
 fn register_gpu_frame_renderer() {
-    filmcraft_export::register_frame_renderer(|| {
-        filmcraft_gpu::ExportRenderer::new().map(|r| Box::new(GpuFrameRenderer(r)) as Box<dyn filmcraft_export::FrameRenderer>)
-    });
+    filmcraft_export::register_frame_renderer(build_gpu_frame_renderer);
+}
+
+fn build_gpu_frame_renderer() -> Option<Box<dyn filmcraft_export::FrameRenderer>> {
+    filmcraft_gpu::ExportRenderer::new().map(|r| Box::new(GpuFrameRenderer(r)) as Box<dyn filmcraft_export::FrameRenderer>)
 }
 
 /// Put the OS hardware video decoders in front of our own. Registered in a statement of its own:

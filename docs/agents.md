@@ -143,8 +143,11 @@ progress and stop it:
   other export's files beside them) and sends no response, as the MCP cancellation utility asks.
 - Without `wait` the command returns `{job, path, poll: "jobs.list", cancel: "jobs.cancel"}` at
   once: poll `jobs.list` for the job's `progress`, `etaSeconds`, `finished` and `result`, and stop it
-  with `jobs.cancel` (`export.queue.list` lists the Export Queue only, not direct exports, #1544). Other exports (`file.exportFrame`, interchange formats, …) finish quickly and
-  ignore the token.
+  with `jobs.cancel` (`export.queue.list` lists the Export Queue only, not direct exports, #1544).
+  Desktop AAF/OMF exports and preview renders also return asynchronous jobs, including video mixdown;
+  follow their job until completion rather than reporting an acknowledgement as success. Desktop
+  `wait: true` never blocks the render loop. See [native backend processes](backend-processes.md).
+  Other quick exports retain their existing token behavior.
 - An image sequence (PNG, TIFF, DPX, ... stills) never writes the path it is given: `a.png` becomes
   `a000.png`, `a001.png` and so on. `file.exportMedia`, `export.quick` and the job's `result` then
   name the first still as `path`, the name `file.import` takes for the sequence, and the two commands

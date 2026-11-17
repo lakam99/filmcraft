@@ -28,6 +28,13 @@ use filmcraft_time::{Tick, TimeRange};
 use crate::commands::{bad, bool_p, str_p, u64_p};
 use crate::{EngineError, Result, Session};
 
+fn check_cancel(s: &Session) -> Result<()> {
+    if s.worker_progress.as_ref().is_some_and(|p| p.cancel.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err(EngineError::Other("cancelled".into()));
+    }
+    Ok(())
+}
+
 /// Where exported audio goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioMode {
@@ -187,6 +194,7 @@ fn decode(s: &Session, need: &AudioNeed, sample_rate: u32) -> Result<Vec<Vec<f32
     let chunk = sample_rate as usize * 10;
     let mut done = 0usize;
     while done < frames {
+        check_cancel(s)?;
         let n = chunk.min(frames - done);
         let b = src.audio_stream(need.audio_stream, start + done as i64, n, sample_rate).map_err(|e| EngineError::Other(e.to_string()))?;
         for (c, o) in out.iter_mut().enumerate() {
@@ -269,6 +277,7 @@ fn render_clip(s: &Session, seq: ItemId, need: &AudioNeed, sample_rate: u32, pre
             t.items = isolated.items.clone();
         }
         for at in (start..stop).step_by(chunk_frames) {
+            check_cancel(s)?;
             let n = (stop - at).min(chunk_frames as i64) as usize;
             let b = if preserve_mix {
                 filmcraft_render::mixer::mix_graph(&s.project, &mixer, at, n, &checked, None)
@@ -293,6 +302,7 @@ fn render_clip(s: &Session, seq: ItemId, need: &AudioNeed, sample_rate: u32, pre
         }
         isolated.items = vec![filmcraft_render::audio::with_handles(c, tr.start, tr.end())];
         for at in (start..stop).step_by(chunk_frames) {
+            check_cancel(s)?;
             let n = (stop - at).min(chunk_frames as i64) as usize;
             let b = filmcraft_render::audio::track_input(&s.project, &isolated, at, n, sample_rate, &checked);
             let offset = (at - first) as usize;
@@ -389,7 +399,15 @@ pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str
     let mut essence = Vec::new();
     let mut files = Vec::new();
     let mut used = std::collections::HashSet::new();
-    for need in &mut needs {
+    let total = needs.len() as u64;
+    for (index, need) in needs.iter_mut().enumerate() {
+        check_cancel(s)?;
+        if let Some(progress) = &s.worker_progress {
+            use std::sync::atomic::Ordering;
+            progress.total.store(total.max(1), Ordering::Relaxed);
+            progress.done.store(index as u64, Ordering::Relaxed);
+            *progress.status.lock().unwrap_or_else(|e| e.into_inner()) = format!("Preparing audio {} of {total}", index + 1);
+        }
         let nest = s.project.sequence(need.item).is_some();
         let timing = match need.key {
             EssenceKey::Clip(id) => audio_clip(&s.project, seq, id).is_some_and(|(_, _, c)| filmcraft_interchange::essence::retimed(c)),
@@ -511,7 +529,7 @@ fn mixdown(s: &Session, seq: ItemId, path: &str) -> Result<MixdownVideo> {
         path: path.to_string(),
         range: Some(TimeRange::new(Tick::ZERO, dur)),
         include_audio: false,
-        part_of_batch: true,
+        part_of_batch: false,
         dnx_profile: "hq".into(),
         ..Default::default()
     };
@@ -519,9 +537,13 @@ fn mixdown(s: &Session, seq: ItemId, path: &str) -> Result<MixdownVideo> {
         let services = s.services.clone();
         settings.sink = Some(filmcraft_export::OutputSink(Arc::new(move |p: &str, d: Vec<u8>| services.write_file(p, &d))));
     }
+    if !s.worker_gpu {
+        settings.gpu_rendering = filmcraft_export::GpuRendering::Off;
+    }
     let project = s.project.clone();
     let provider = s.media.full_res_provider(project.clone(), s.services.clone());
-    filmcraft_export::export(&project, seq, &settings, &provider, &Default::default()).map_err(|e| EngineError::Other(format!("video mixdown: {e}")))?;
+    let progress = s.worker_progress.clone().unwrap_or_default();
+    filmcraft_export::export(&project, seq, &settings, &provider, &progress).map_err(|e| EngineError::Other(format!("video mixdown: {e}")))?;
     Ok(MixdownVideo { path: path.to_string(), start: Tick::ZERO, duration: dur, width: q.settings.width, height: q.settings.height })
 }
 
@@ -604,11 +626,20 @@ fn prepare_mixdown_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: 
             .map(|inner| Arc::new(RenderAudioSource { inner, error: error.clone() }) as filmcraft_media::SharedSource)
     };
     let mut out = vec![Vec::with_capacity(frames); channels];
+    if let Some(progress) = &s.worker_progress {
+        progress.total.store(frames as u64, std::sync::atomic::Ordering::Relaxed);
+        progress.done.store(0, std::sync::atomic::Ordering::Relaxed);
+        *progress.status.lock().unwrap_or_else(|e| e.into_inner()) = "Rendering audio mix".into();
+    }
     for at in (0..frames).step_by(4096) {
+        check_cancel(s)?;
         let n = (frames - at).min(4096);
         let b = filmcraft_render::mixer::mix_graph(&s.project, &q, at as i64, n, &checked, None);
         for (dst, src) in out.iter_mut().zip(b.channels) {
             dst.extend(src);
+        }
+        if let Some(progress) = &s.worker_progress {
+            progress.done.store((at + n) as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
     if !provider.offline_used().is_empty() {
@@ -653,13 +684,23 @@ fn prepare_mixdown_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: 
 
 /// `file.exportAaf`
 pub fn export_aaf(s: &mut Session, p: &Value) -> Result<Value> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::backend::enabled(s) {
+        let seq = crate::export_tools::sequence_param(s, p, "file.exportAaf")?;
+        plan_from(s, p, seq, "file.exportAaf", false)?;
+        return crate::backend::start_interchange(s, false, p);
+    }
+    export_aaf_at(s, p, None)
+}
+
+pub(crate) fn export_aaf_at(s: &mut Session, p: &Value, media_override: Option<&str>) -> Result<Value> {
     let cmd = "file.exportAaf";
     let path = str_p(p, "path").ok_or_else(|| bad(cmd, "need `path`"))?.to_string();
     let seq = crate::export_tools::sequence_param(s, p, cmd)?;
     let plan = plan_from(s, p, seq, cmd, false)?;
     check_linked_streams(s, seq, &plan)?;
     let (dir, stem) = split(&path);
-    let media_dir = join(&dir, &format!("{stem} Media"));
+    let media_dir = media_override.map(str::to_string).unwrap_or_else(|| join(&dir, &format!("{stem} Media")));
     let mut files = Vec::new();
     if plan.mode != AudioMode::Embedded || bool_p(p, "mixdownVideo").unwrap_or(false) {
         ensure_dir(s, &media_dir);
@@ -694,6 +735,7 @@ pub fn export_aaf(s: &mut Session, p: &Value) -> Result<Value> {
     } else if !plan.preserve_mix {
         report.warn("mix matching is disabled: track, bus and master mixer processing is not preserved");
     }
+    check_cancel(s)?;
     s.services.write_file(&path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     Ok(json!({"path": path, "bytes": bytes.len(), "mediaFiles": files, "report": report_json(&report),
         "preserveMix": plan.preserve_mix, "audioLayout": if full_mix { "mixdown" } else { "clips" }}))
@@ -701,12 +743,22 @@ pub fn export_aaf(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// `file.exportOmf`
 pub fn export_omf(s: &mut Session, p: &Value) -> Result<Value> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::backend::enabled(s) {
+        let seq = crate::export_tools::sequence_param(s, p, "file.exportOmf")?;
+        plan_from(s, p, seq, "file.exportOmf", true)?;
+        return crate::backend::start_interchange(s, true, p);
+    }
+    export_omf_at(s, p, None)
+}
+
+pub(crate) fn export_omf_at(s: &mut Session, p: &Value, media_override: Option<&str>) -> Result<Value> {
     let cmd = "file.exportOmf";
     let path = str_p(p, "path").ok_or_else(|| bad(cmd, "need `path`"))?.to_string();
     let seq = crate::export_tools::sequence_param(s, p, cmd)?;
     let plan = plan_from(s, p, seq, cmd, true)?;
     let (dir, stem) = split(&path);
-    let media_dir = join(&dir, &format!("{stem} Audio Files"));
+    let media_dir = media_override.map(str::to_string).unwrap_or_else(|| join(&dir, &format!("{stem} Audio Files")));
     if plan.mode == AudioMode::Separate {
         ensure_dir(s, &media_dir);
     }

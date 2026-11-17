@@ -353,7 +353,9 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   with effects, opacity masks, frame blending, colour management, or a picture that is not placed
   one to one on the output takes the general path.
 - **Frame scheduling.** `crates/ui-egui/src/frames.rs` runs a small pool of worker threads with
-  prioritised jobs: the frame on screen first, then playback prefetch, then thumbnails. The UI never
+  prioritised jobs: the frame on screen first, then playback prefetch, then thumbnails. In the native
+  desktop host these threads coordinate persistent preview processes; export/mixdown jobs use
+  separate backend processes ([boundary and job contract](backend-processes.md)). The UI never
   decodes. It shows the exact frame when it is ready and holds the nearest cached frame meanwhile.
   Play waits for the first frames (`PREROLL_FRAMES`, at most 0.5 s) before starting the clock.
   Every refresh, `schedule_playback` asks for the next frames and drops (or cancels, through
