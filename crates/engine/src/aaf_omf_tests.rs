@@ -54,6 +54,265 @@ fn path_of(s: &Session, item: ItemId) -> String {
 }
 
 #[test]
+fn aaf_retimed_audio_matches_the_original_clip_samples() {
+    use filmcraft_time::Tick;
+    for (speed, reverse, pitch, handles) in
+        [(0.5, false, false, 0), (1.5, false, false, 6), (0.85, false, true, 0), (1.25, false, true, 6), (0.5, true, false, 6), (1.5, true, true, 6)]
+    {
+        let (mut s, _, seq, dir) = setup("aaf-retimed-samples");
+        let mut p = (*s.project).clone();
+        let track = &mut p.sequence_mut(seq).unwrap().audio_tracks[0];
+        track.items.truncate(1);
+        track.transitions.clear();
+        let c = &mut track.items[0];
+        c.start = Tick::from_units(130, 48_000);
+        c.speed = speed;
+        c.reverse = reverse;
+        c.maintain_pitch = pitch;
+        c.gain_db = -3.0;
+        let start = c.start.to_units_floor(48_000);
+        let frames = c.duration.to_units_floor(48_000) as usize;
+        s.project = Arc::new(p);
+        let provider = s.media.full_res_provider(s.project.clone(), s.services.clone());
+        let wanted = filmcraft_render::audio::track_input(&s.project, &s.project.sequence(seq).unwrap().audio_tracks[0], start, frames, 48_000, &provider);
+        assert!(wanted.channels.iter().flatten().any(|v| v.abs() > 0.01));
+        let path = dir.join("retimed.aaf").to_string_lossy().into_owned();
+        s.execute("file.exportAaf", json!({"path":path,"sequence":seq.0,"audio":"embedded","trimAudio":true,"handles":handles,"bitDepth":24})).unwrap();
+        let imported = s.execute("file.importAaf", json!({"path":path})).unwrap();
+        let imported = imported_seq(&imported);
+        let q = s.project.sequence(imported).unwrap();
+        let c = &q.audio_tracks[0].items[0];
+        assert_eq!((c.start.to_units_floor(48_000), c.duration.to_units_floor(48_000)), (start, frames as i64));
+        assert_eq!((c.speed, c.reverse), (1.0, false), "timing is baked into portable PCM");
+        let provider = s.media.full_res_provider(s.project.clone(), s.services.clone());
+        let got = filmcraft_render::audio::track_input(&s.project, &q.audio_tracks[0], start, frames, 48_000, &provider);
+        let error = wanted.channels.iter().zip(&got.channels).flat_map(|(a, b)| a.iter().zip(b).map(|(a, b)| (a - b).abs())).fold(0.0f32, f32::max);
+        assert!(error < 2e-6, "speed={speed}, reverse={reverse}, maintain pitch={pitch}, handles={handles}: max sample error {error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Compare audible samples, rather than merely checking that speed flags disappeared.
+fn assert_aaf_audio_matches(s: &mut Session, seq: ItemId, params: serde_json::Value, command: &str) {
+    let original = s.project.sequence(seq).unwrap().audio_tracks[0].clone();
+    let start = original.items.iter().map(|c| c.start.to_units_floor(48_000)).min().unwrap();
+    let end = original.items.iter().map(|c| c.end().to_units_floor(48_000)).max().unwrap();
+    let provider = s.media.full_res_provider(s.project.clone(), s.services.clone());
+    let wanted = filmcraft_render::audio::track_input(&s.project, &original, start, (end - start) as usize, 48_000, &provider);
+    let result = s.execute(command, params.clone()).unwrap();
+    assert!(result["report"].to_string().contains("retimed audio"), "{result}");
+    let result = s.execute("file.importAaf", json!({"path":params["path"]})).unwrap();
+    let q = s.project.sequence(imported_seq(&result)).unwrap();
+    let provider = s.media.full_res_provider(s.project.clone(), s.services.clone());
+    let got = filmcraft_render::audio::track_input(&s.project, &q.audio_tracks[0], start, (end - start) as usize, 48_000, &provider);
+    assert_eq!(wanted.channels.len(), got.channels.len());
+    let peak = wanted.channels.iter().flatten().fold(0.0f32, |a, b| a.max(b.abs()));
+    let error = wanted
+        .channels
+        .iter()
+        .zip(&got.channels)
+        .flat_map(|(a, b)| {
+            assert_eq!(a.len(), b.len());
+            a.iter().zip(b).map(|(a, b)| (a - b).abs())
+        })
+        .fold(0.0f32, f32::max);
+    assert!(peak > 0.01 && error < peak.max(1.0) * 2e-6, "peak {peak}, max sample error {error}");
+}
+
+#[test]
+fn aaf_retiming_preserves_automated_hot_audio_and_linked_straight_clips() {
+    use filmcraft_time::Tick;
+    for mode in ["embedded", "separate", "linked"] {
+        let (mut s, items, seq, dir) = setup("aaf-retimed-gain");
+        let mut p = (*s.project).clone();
+        let c = &mut p.sequence_mut(seq).unwrap().audio_tracks[0].items[0];
+        c.start = Tick::from_units(130, 48_000);
+        c.duration -= c.start;
+        c.speed = 0.85;
+        c.maintain_pitch = true;
+        c.gain_db = 20.0;
+        let mt = c.source_in;
+        let level = c.effect_mut("volume").unwrap().params.get_mut("level").unwrap();
+        level.put_keyframe(mt, ParamValue::Float(-4.0));
+        level.put_keyframe(mt + Tick::from_units(24_000, 48_000), ParamValue::Float(6.0));
+        s.project = Arc::new(p);
+        let path = dir.join("hot.aaf").to_string_lossy().into_owned();
+        assert_aaf_audio_matches(&mut s, seq, json!({"path":path,"sequence":seq.0,"audio":mode,"trimAudio":false,"handles":6,"bitDepth":24}), "file.exportAaf");
+        if mode == "linked" {
+            let imported = s.active_sequence().unwrap();
+            let straight = &imported.audio_tracks[0].items[1];
+            assert_eq!(
+                std::path::Path::new(&path_of(&s, straight.item)),
+                std::path::Path::new(&path_of(&s, items[1])),
+                "straight clips keep their linked source"
+            );
+            assert!(path_of(&s, imported.audio_tracks[0].items[0].item).ends_with(".wav"));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn aaf_generic_export_renders_retimed_audio() {
+    let (mut s, _, seq, dir) = setup("aaf-generic-retiming");
+    let mut p = (*s.project).clone();
+    let track = &mut p.sequence_mut(seq).unwrap().audio_tracks[0];
+    track.items.truncate(1);
+    track.items[0].speed = 0.85;
+    track.items[0].maintain_pitch = true;
+    s.project = Arc::new(p);
+    let path = dir.join("generic.aaf").to_string_lossy().into_owned();
+    assert_aaf_audio_matches(&mut s, seq, json!({"format":"aaf","path":path,"sequence":seq.0,"bitDepth":24}), "file.exportInterchange");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aaf_retimed_nested_audio_matches_playback() {
+    let (mut s, _, seq, _, dir) = setup_nested("aaf-retimed-nest");
+    let mut p = (*s.project).clone();
+    let c = &mut p.sequence_mut(seq).unwrap().audio_tracks[0].items[0];
+    c.speed = 0.85;
+    c.reverse = true;
+    c.maintain_pitch = true;
+    s.project = Arc::new(p);
+    let path = dir.join("nest.aaf").to_string_lossy().into_owned();
+    assert_aaf_audio_matches(&mut s, seq, json!({"path":path,"sequence":seq.0,"bitDepth":24,"handles":6}), "file.exportAaf");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aaf_retiming_rejects_hostile_speed_without_writing_a_document() {
+    for speed in [0.0, f64::NAN, f64::INFINITY, 1e30] {
+        let (mut s, _, seq, dir) = setup("aaf-hostile-speed");
+        let mut p = (*s.project).clone();
+        p.sequence_mut(seq).unwrap().audio_tracks[0].items[0].speed = speed;
+        s.project = Arc::new(p);
+        let path = dir.join("bad.aaf");
+        let result = s.execute("file.exportAaf", json!({"path":path.to_string_lossy(),"sequence":seq.0}));
+        assert!(result.is_err(), "{speed}: {result:?}");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn aaf_retimed_breakout_keeps_output_channel_mapping() {
+    let (mut s, _, seq, dir) = setup("aaf-retimed-channel-map");
+    let mut p = (*s.project).clone();
+    let t = &mut p.sequence_mut(seq).unwrap().audio_tracks[0];
+    t.items.truncate(1);
+    t.items[0].speed = 0.85;
+    t.items[0].maintain_pitch = true;
+    t.items[0].source_channels = vec![1, 0];
+    s.project = Arc::new(p);
+    let provider = s.media.full_res_provider(s.project.clone(), s.services.clone());
+    let wanted = filmcraft_render::audio::track_input(&s.project, &s.project.sequence(seq).unwrap().audio_tracks[0], 0, 48_000, 48_000, &provider);
+    assert!(wanted.channels[0].iter().zip(&wanted.channels[1]).any(|(a, b)| (a - b).abs() > 0.01), "fixture channels must differ");
+    let path = dir.join("channels.aaf").to_string_lossy().into_owned();
+    s.execute("file.exportAaf", json!({"path":path,"sequence":seq.0,"breakoutToMono":true,"bitDepth":24})).unwrap();
+    let result = s.execute("file.importAaf", json!({"path":path})).unwrap();
+    let q = s.project.sequence(imported_seq(&result)).unwrap();
+    assert_eq!(q.audio_tracks.len(), 2);
+    let provider = s.media.full_res_provider(s.project.clone(), s.services.clone());
+    for (track, want) in q.audio_tracks.iter().zip(&wanted.channels) {
+        let got = filmcraft_render::audio::track_input(&s.project, track, 0, 48_000, 48_000, &provider);
+        assert!(want.iter().zip(&got.channels[0]).all(|(a, b)| (a - b).abs() < 2e-6));
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aaf_retimed_crossfade_preserves_pitch_stretch_edge_grains_without_requested_handles() {
+    let (mut s, _, seq, dir) = setup("aaf-retimed-crossfade");
+    let mut p = (*s.project).clone();
+    for c in &mut p.sequence_mut(seq).unwrap().audio_tracks[0].items {
+        c.speed = 0.85;
+        c.maintain_pitch = true;
+    }
+    s.project = Arc::new(p);
+    let clip = s.project.sequence(seq).unwrap().audio_tracks[0].items[1].id;
+    s.execute("sequence.applyAudioTransition", json!({"clip":clip.0,"effect":"constant_power","frames":6,"edge":"in","align":"center"})).unwrap();
+    assert!(!s.project.sequence(seq).unwrap().audio_tracks[0].transitions.is_empty());
+    let path = dir.join("fade.aaf").to_string_lossy().into_owned();
+    assert_aaf_audio_matches(&mut s, seq, json!({"path":path,"sequence":seq.0,"bitDepth":24,"handles":0}), "file.exportAaf");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aaf_retimed_decode_failure_is_reported_instead_of_baking_silence() {
+    struct BrokenAudio(filmcraft_media::MediaInfo);
+    impl filmcraft_media::MediaSource for BrokenAudio {
+        fn info(&self) -> &filmcraft_media::MediaInfo {
+            &self.0
+        }
+        fn video_frame(&self, _: filmcraft_media::FrameRequest) -> filmcraft_media::Result<Arc<filmcraft_frame::VideoFrame>> {
+            Err(filmcraft_media::MediaError::NoStream("video"))
+        }
+        fn audio(&self, _: i64, _: usize, _: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+            Err(filmcraft_media::MediaError::Decode("test audio failure".into()))
+        }
+    }
+    let (mut s, items, seq, dir) = setup("aaf-retimed-decode-error");
+    let info = s.project.item(items[0]).unwrap().as_media().unwrap().info.clone();
+    s.media.insert_file(items[0], &path_of(&s, items[0]), Arc::new(BrokenAudio(info)));
+    let mut p = (*s.project).clone();
+    p.sequence_mut(seq).unwrap().audio_tracks[0].items[0].speed = 0.5;
+    p.sequence_mut(seq).unwrap().audio_tracks[0].items[0].maintain_pitch = false;
+    s.project = Arc::new(p);
+    let path = dir.join("bad.aaf");
+    let error = s.execute("file.exportAaf", json!({"path":path.to_string_lossy(),"sequence":seq.0})).unwrap_err();
+    assert!(error.to_string().contains("test audio failure"), "{error}");
+    assert!(!path.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aaf_retimed_subsample_duration_has_complete_pcm() {
+    use filmcraft_time::Tick;
+    let (mut s, _, seq, dir) = setup("aaf-retimed-subsample");
+    let mut p = (*s.project).clone();
+    let t = &mut p.sequence_mut(seq).unwrap().audio_tracks[0];
+    t.items.truncate(1);
+    let c = &mut t.items[0];
+    c.start = Tick::from_units(130, 48_000) + Tick(Tick::from_units(1, 48_000).0 / 5);
+    c.duration = Tick::from_units(48_000, 48_000) + Tick(Tick::from_units(1, 48_000).0 * 3 / 5);
+    c.speed = 0.5;
+    s.project = Arc::new(p);
+    let path = dir.join("fractional.aaf").to_string_lossy().into_owned();
+    s.execute("file.exportAaf", json!({"path":path,"sequence":seq.0,"bitDepth":24,"handles":0})).unwrap();
+    let result = s.execute("file.importAaf", json!({"path":path})).unwrap();
+    let c = &s.project.sequence(imported_seq(&result)).unwrap().audio_tracks[0].items[0];
+    assert_eq!(c.duration.to_units_floor(48_000), 48_001);
+    let source = s.media.full_res_source(&s.project, c.item, &*s.services).unwrap();
+    assert!(source.info().duration >= c.source_in + c.duration, "rounded AAF duration must fit the actual PCM");
+    let samples = source.audio(c.source_in.to_units_floor(48_000), 48_001, 48_000).unwrap();
+    assert_eq!(samples.channels[0][48_000], 0.0, "pad the fractional trailing sample");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aaf_reverse_audio_keeps_timeline_handles_at_source_zero() {
+    use filmcraft_time::Tick;
+    let (mut s, _, seq, dir) = setup("aaf-reverse-zero-handles");
+    let mut p = (*s.project).clone();
+    let t = &mut p.sequence_mut(seq).unwrap().audio_tracks[0];
+    t.items.truncate(1);
+    t.items[0].source_in = Tick::ZERO;
+    t.items[0].speed = 0.85;
+    t.items[0].reverse = true;
+    t.items[0].maintain_pitch = true;
+    s.project = Arc::new(p);
+    let path = dir.join("reverse.aaf").to_string_lossy().into_owned();
+    s.execute("file.exportAaf", json!({"path":path,"sequence":seq.0,"bitDepth":24,"handles":6})).unwrap();
+    let result = s.execute("file.importAaf", json!({"path":path})).unwrap();
+    let c = &s.project.sequence(imported_seq(&result)).unwrap().audio_tracks[0].items[0];
+    assert_eq!(c.source_in.to_units_floor(48_000), 12_000, "rendered handles use timeline coordinates, not the original source in-point");
+    let samples = audio_of(&s, c.item, 0, 12_000);
+    assert!(samples.iter().flatten().any(|v| v.abs() > 0.01), "reverse leading handles have usable source audio");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn aaf_embedded_trimmed_audio_round_trips_sample_exact() {
     let (mut s, items, seq, dir) = setup("aaf-embed");
     let path = dir.join("cut.aaf").to_string_lossy().into_owned();

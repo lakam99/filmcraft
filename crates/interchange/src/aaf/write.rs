@@ -283,6 +283,11 @@ fn write_media(doc: &Document, w: &mut W<'_>, ids: &mut IdGen) -> Result<MediaOu
         if source.nested.is_some() {
             continue;
         }
+        // Each exposed channel needs a slot. Bound hostile media metadata before allocating
+        // those objects, and reject a channel that cannot exist in the referenced essence.
+        if source.kind == CKind::Sound && (source.file_channels > 64 || source.channel.is_some_and(|channel| channel >= source.file_channels.max(1))) {
+            return Err(Error::Other("AAF audio supports at most 64 channels and requires valid source channel indices".into()));
+        }
         // Some importers resolve the first source in a master, ignoring the requested
         // slot. Isolate essence files and exposed channels as well as media kinds,
         // so split audio never resolves to a picture or to the first audio channel.
@@ -377,16 +382,22 @@ impl GroupSlotBuilder<'_, '_> {
             }
         };
         let file_id = self.files[file_index].1;
-        add_file_slot(FileSlotInput {
-            source,
-            file_slot,
-            length: len_units,
-            has_timecode,
-            tape_id: self.tape_id,
-            member_index,
-            slots: &mut self.files[file_index].2,
-            rate,
-        });
+        // Studio Pro determines the imported layout from these file slots, even for an
+        // interleaved WAVE descriptor. One slot silently turns stereo into a mono channel
+        // and applies its center-pan attenuation. Preserve each channel in the graph.
+        let last_slot = if source.kind == CKind::Sound && source.channel.is_none() { source.file_channels.max(1) } else { file_slot };
+        for exposed_slot in file_slot..=last_slot {
+            add_file_slot(FileSlotInput {
+                source,
+                file_slot: exposed_slot,
+                length: len_units,
+                has_timecode,
+                tape_id: self.tape_id,
+                member_index,
+                slots: &mut self.files[file_index].2,
+                rate,
+            });
+        }
         if has_timecode {
             let tape_slot_id = 2 + member_index as u32;
             self.tape_slots.push(timeline_slot(
@@ -398,13 +409,13 @@ impl GroupSlotBuilder<'_, '_> {
             ));
         }
         let master_slot = member_index as u32 + 1;
-        self.master_slots.push(timeline_slot(
-            master_slot,
-            &slot_name(source.kind, master_slot),
-            master_slot,
-            rate,
-            source_clip(source.kind, len_units, file_id, file_slot, 0),
-        ));
+        let mut clip = source_clip(source.kind, len_units, file_id, file_slot, 0);
+        if source.kind == CKind::Sound && source.channel.is_none() {
+            // MS-01 v1.1 section 7.6: channel IDs are one-based. Make the whole-file
+            // reference explicit so readers can distinguish it from a mono breakout.
+            clip.set(pid::CHANNEL_IDS, Value::Data((1..=source.file_channels.max(1)).flat_map(u32::to_le_bytes).collect()));
+        }
+        self.master_slots.push(timeline_slot(master_slot, &slot_name(source.kind, master_slot), master_slot, rate, clip));
         self.master_ref.insert(source_index, (self.master_id, master_slot));
     }
 }

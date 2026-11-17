@@ -220,6 +220,7 @@ pub(crate) mod pid {
     // SourceReference / SourceClip
     pub const SOURCE_ID: u16 = 0x1101;
     pub const SOURCE_MOB_SLOT_ID: u16 = 0x1102;
+    pub const CHANNEL_IDS: u16 = 0x1103;
     pub const START_TIME: u16 = 0x1201;
     // Event
     pub const POSITION: u16 = 0x0601;

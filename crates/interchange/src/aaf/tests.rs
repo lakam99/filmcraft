@@ -127,7 +127,19 @@ fn rich_export(small_sectors: bool) -> Vec<u8> {
         .map(|n| {
             let frames = ((n.end - n.start).0 / (filmcraft_time::TICKS_PER_SECOND / 48_000)) as u64;
             let data = EssenceData::Embedded(vec![0; frames as usize * 2 * 3]);
-            AudioEssence { key: n.key, channel: None, start: n.start, frames, sample_rate: 48_000, bits: 24, channels: 2, data, effects_rendered: false }
+            AudioEssence {
+                key: n.key,
+                channel: None,
+                start: n.start,
+                frames,
+                sample_rate: 48_000,
+                bits: 24,
+                channels: 2,
+                data,
+                effects_rendered: false,
+                timing_rendered: false,
+                render_gain: 1.0,
+            }
         })
         .collect();
     let opts = AafOptions { small_sectors, media: MediaOptions { essence, ..Default::default() }, ..Default::default() };
@@ -544,6 +556,8 @@ fn separate_wave_essence_declares_its_wave_codec() {
             channels: 2,
             data: EssenceData::File { path: "/audio/consolidated.wav".into() },
             effects_rendered: false,
+            timing_rendered: false,
+            render_gain: 1.0,
         })
         .collect();
     let opts = AafOptions { media: MediaOptions { essence, ..Default::default() }, ..Default::default() };
@@ -1045,6 +1059,44 @@ fn audio_tracks_keep_their_names() {
     for name in ["é", "音声", "🎤 Dialogue", "Ä1"] {
         p.sequence_mut(s).unwrap().audio_tracks[0].name = name.into();
         assert_eq!(names(&p, &AafOptions::default()), [name]);
+    }
+}
+
+#[test]
+fn interleaved_audio_exposes_every_file_channel_and_round_trips_as_stereo() {
+    let (p, s) = project();
+    for bytes in [export(&p, s, &AafOptions::default()).unwrap().0, rich_export(false)] {
+        let root = store::read(&bytes).unwrap();
+        let content = root.strong(pid::ROOT_HEADER).unwrap().strong(pid::CONTENT).unwrap();
+        let file = content
+            .objs(pid::MOBS)
+            .iter()
+            .find(|m| {
+                m.class == cls::SOURCE_MOB && m.strong(pid::ESSENCE_DESCRIPTION).is_some_and(|d| matches!(d.class, cls::PCM_DESCRIPTOR | cls::WAVE_DESCRIPTOR))
+            })
+            .unwrap();
+        let slots = file.objs(pid::SLOTS);
+        assert_eq!(slots.len(), 2, "a single file slot makes Studio Pro import stereo essence as mono");
+        assert_eq!(slots.iter().map(|slot| slot.u32(pid::PHYSICAL_TRACK_NUMBER)).collect::<Vec<_>>(), [Some(1), Some(2)]);
+        let (imported, _, _) = import(&bytes, &ImportOptions::default()).unwrap();
+        let seq = imported.project.sequence(imported.sequences[0]).unwrap();
+        assert_eq!(seq.audio_tracks[0].channels, filmcraft_project::AudioChannels::Stereo);
+        let doc = super::read::read(&bytes, &mut Report::default()).unwrap();
+        assert!(doc.sources.iter().filter(|s| s.kind == crate::comp::CKind::Sound).all(|s| s.channel.is_none() && s.channels == 2));
+    }
+}
+
+#[test]
+fn audio_channel_slot_expansion_rejects_hostile_metadata() {
+    let (p, s) = project();
+    let bytes = export(&p, s, &AafOptions::default()).unwrap().0;
+    let original = super::read::read(&bytes, &mut Report::default()).unwrap();
+    for (channels, channel) in [(65, None), (u32::MAX, None), (2, Some(u32::MAX))] {
+        let mut doc = original.clone();
+        let source = doc.sources.iter_mut().find(|s| s.kind == crate::comp::CKind::Sound).unwrap();
+        source.file_channels = channels;
+        source.channel = channel;
+        assert!(write::write(&doc, filmcraft_cfb::Version::V4, &mut Report::default()).unwrap_err().to_string().contains("channels"));
     }
 }
 

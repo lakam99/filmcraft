@@ -48,7 +48,7 @@ pub fn open(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str) -> Result<Val
         audio: "embedded",
         format: "wav",
         sample_rate: sr,
-        bits: 16,
+        bits: if omf { 16 } else { 24 },
         trim: omf,
         handles: if omf { 30 } else { 0 },
         render_effects: false,
@@ -154,6 +154,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             elems.push((format!("{p}.breakoutToMono"), r.rect, d.breakout.to_string()));
             ui.end_row();
         });
+        ui.label(tl!("Retimed audio is always rendered with its clip effects to preserve playback."));
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             let c = ui.button(tl!("Cancel"));

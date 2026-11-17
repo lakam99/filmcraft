@@ -311,6 +311,7 @@ pub(crate) const CLASSES: &[Class] = &[
     c("SourceReference", 0x10, 0x03, false, &[
         p("SourceID", 0x1101, 0x060E2B34_01010102_06010103_01000000, T_MOB_ID_TYPE, Opt),
         p("SourceMobSlotID", 0x1102, 0x060E2B34_01010102_06010103_02000000, T_UINT32, Req),
+        p("ChannelIDs", 0x1103, 0x060E2B34_01010107_06010103_07000000, T_UINT32_ARRAY, Opt),
     ]),
     c("SourceClip", 0x11, 0x10, true, &[
         p("StartTime", 0x1201, 0x060E2B34_01010102_07020103_01040000, T_POSITION_TYPE, Opt),
@@ -364,6 +365,7 @@ const T_VERSION_TYPE: Auid = u(0x060E2B34_01040101_03010300_00000000);
 const T_UINT8_ARRAY12: Auid = u(0x060E2B34_01040101_04010200_00000000);
 const T_UINT8_ARRAY8: Auid = u(0x060E2B34_01040101_04010800_00000000);
 const T_INT32_ARRAY: Auid = u(0x060E2B34_01040101_04010300_00000000);
+const T_UINT32_ARRAY: Auid = u(0x060E2B34_01040101_04010900_00000000);
 const T_BOOLEAN: Auid = u(0x060E2B34_01040101_01040100_00000000);
 const T_EDIT_HINT_TYPE: Auid = u(0x060E2B34_01040101_02010106_00000000);
 const T_LAYOUT_TYPE: Auid = u(0x060E2B34_01040101_02010108_00000000);
@@ -474,6 +476,7 @@ pub(crate) const TYPES: &[Type] = &[
     t("UInt8Array12", T_UINT8_ARRAY12, FixedArray(T_UINT8, 12)),
     t("UInt8Array8", T_UINT8_ARRAY8, FixedArray(T_UINT8, 8)),
     t("Int32Array", T_INT32_ARRAY, VariableArray(T_INT32)),
+    t("UInt32Array", T_UINT32_ARRAY, VariableArray(T_UINT32)),
     t("Boolean", T_BOOLEAN, Enumeration(T_UINT8, &[("False", 0), ("True", 1)])),
     t("EditHintType", T_EDIT_HINT_TYPE, Enumeration(T_UINT8, &[("NoEditHint", 0), ("Proportional", 1), ("RelativeLeft", 2), ("RelativeRight", 3), ("RelativeFixed", 4)])),
     t("LayoutType", T_LAYOUT_TYPE, Enumeration(T_UINT8, &[("FullFrame", 0), ("SeparateFields", 1), ("OneField", 2), ("MixedFields", 3), ("SegmentedFrame", 4)])),

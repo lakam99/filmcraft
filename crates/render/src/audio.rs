@@ -155,7 +155,7 @@ pub(crate) fn track_input_at(
 /// `item` lengthened to cover `[t0, t1)` with its media timing unchanged: the part before its in
 /// point and after its out point plays the source's handles (silent where the source has none).
 /// Remixed clips have no linear media to extend and stay as they are.
-fn with_handles(item: &TrackItem, t0: Tick, t1: Tick) -> TrackItem {
+pub fn with_handles(item: &TrackItem, t0: Tick, t1: Tick) -> TrackItem {
     let mut ext = item.clone();
     if crate::remix::is_remixed(item) {
         return ext;
@@ -394,13 +394,27 @@ fn raw_channels(item: &TrackItem, src: SourceAudio, x0: i64, len: usize, sr: u32
         Some(stretched)
     } else {
         // varispeed: read a longer span and resample linearly
-        let span = ((n as f64) * speed).ceil() as usize + 2;
-        let s0 = if item.reverse { src_start_ticks.to_units_floor(sr as i64) - span as i64 } else { src_start_ticks.to_units_floor(sr as i64) };
-        src(s0, span).map(|raw| {
+        let Some(span) = (((n as f64) * speed).ceil() as usize).checked_add(2) else { return out };
+        let Ok(back_span) = i64::try_from(span) else { return out };
+        let Some(read_frames) = span.checked_add(usize::from(item.reverse)) else { return out };
+        let source_sample = src_start_ticks.to_units_floor(sr as i64);
+        // Keep the fractional source phase at the absolute timeline position. Dropping
+        // it here restarts interpolation at every device/export buffer boundary.
+        let phase = (i128::from(src_start_ticks.0) * i128::from(sr)).rem_euclid(i128::from(filmcraft_time::TICKS_PER_SECOND)) as f64
+            / filmcraft_time::TICKS_PER_SECOND as f64;
+        let s0 = if item.reverse {
+            let Some(start) = source_sample.checked_sub(back_span).and_then(|s| s.checked_add(1)) else { return out };
+            start
+        } else {
+            source_sample
+        };
+        // Reverse interpolation also needs the sample above its first (fractional)
+        // source position; otherwise the first sample of every read loses its phase.
+        src(s0, read_frames).map(|raw| {
             let mut b = AudioBuffer::silence(sr, raw.channel_count(), n);
             for (c, ch) in raw.channels.iter().enumerate() {
                 for i in 0..n {
-                    let pos = if item.reverse { span as f64 - 1.0 - i as f64 * speed } else { i as f64 * speed };
+                    let pos = if item.reverse { span as f64 - 1.0 + phase - i as f64 * speed } else { phase + i as f64 * speed };
                     let i0 = pos.floor().max(0.0) as usize;
                     let fr = (pos - i0 as f64) as f32;
                     let a = ch.get(i0).copied().unwrap_or(0.0);
