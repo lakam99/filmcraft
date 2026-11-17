@@ -747,9 +747,26 @@ nested sequences. Rendering keeps the original timeline coordinate system and vi
 boundaries so automation blocks and pitch-preserving grains match playback. Handles remain
 available for trimming; transitions retain their separate AAF/OMF edit operations. Hot rendered
 audio is scaled into integer PCM headroom and restored by a gain operation to avoid clipping.
-Use 24-bit audio at the sequence sample rate for the closest sample match. Track/submix/master
-effects are not baked into individual clips. The generic `file.exportInterchange` command uses
-the same media preparation for AAF/OMF.
+Use 24-bit audio at the sequence sample rate for the closest sample match. The generic
+`file.exportInterchange` command uses the same media preparation for AAF/OMF.
+
+AAF defaults to `preserveMix: true` (**Match FilmCraft audio mix** in the dialog) and 24-bit
+audio. For a separable stereo mixer, each clip is printed through its original channel mapping,
+clip effects, track fader/mute/solo/pan and master fader automation. Events remain individually
+editable. Their boundaries use playback's sample grid, and the exported tracks are stereo so
+the receiving DAW cannot apply another mono pan law. These settings are baked into the audio;
+the receiving track faders start at unity. Original projects and media are unchanged.
+
+Track inserts, submixes, sends, routed outputs, master inserts, overlapping events, transitions
+and surround mixes require a complete mixer print: summing independently processed clips would
+change nonlinear effects or shared state. Such exports contain one **FilmCraft Mix** audio track;
+the dialog announces this and automation returns `audioLayout: "mixdown"` rather than `"clips"`.
+The print is bounded to 64 million samples and WAV/AIFF; an unsupported size or format returns
+an error instead of a partial AAF. Export reports identify the chosen path. `preserveMix: false`
+retains legacy editable interchange, separate transition operations, original-media linking and
+mono breakout, with a warning that mixer processing is omitted. Mix matching requires
+interleaved audio and writes rendered sidecars even in linked mode. Video retiming requires
+the existing `mixdownVideo: true` option.
 
 ## 7. Automation surfaces
 

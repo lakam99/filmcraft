@@ -108,6 +108,7 @@ fn aaf_and_omf_export_dialogs() {
     let ids = d.ids("aafExport.");
     for id in [
         "mixdownVideo",
+        "preserveMix",
         "breakoutToMono",
         "audio.embedded",
         "audio.separate",
@@ -131,6 +132,21 @@ fn aaf_and_omf_export_dialogs() {
     assert!(d.ids("aafExport.").is_empty(), "the dialog closes");
     let aaf = std::fs::read(dir.join("Mix.aaf")).expect("Mix.aaf written");
     assert!(filmcraft_interchange::aaf::sniff(&aaf));
+    let (imp, extracted, _) = filmcraft_interchange::aaf::import(&aaf, &Default::default()).unwrap();
+    assert_eq!(extracted.len(), 1, "mix matching keeps interleaved audio despite clicking disabled mono breakout");
+    let (_, ch, sr, bits) = filmcraft_interchange::wav::parse_wav(&extracted[0].wav).unwrap();
+    assert_eq!((ch, sr, bits), (2, 48_000, 24));
+    assert_eq!(imp.sequences.len(), 1);
+
+    // Explicit legacy interchange still offers mono breakout.
+    d.ok("ui.menu.invoke", json!({"id": "file.exportAaf"}));
+    d.frames(3);
+    d.ok("ui.click", json!({"id": "aafExport.preserveMix"}));
+    d.frames(2);
+    d.ok("ui.click", json!({"id": "aafExport.breakoutToMono"}));
+    d.ok("ui.click", json!({"id": "aafExport.ok"}));
+    d.frames(4);
+    let aaf = std::fs::read(dir.join("Mix.aaf")).expect("legacy AAF written");
     let (imp, extracted, _) = filmcraft_interchange::aaf::import(&aaf, &Default::default()).unwrap();
     assert_eq!(extracted.len(), 2, "embedded, broken out to two mono essences");
     let (_, ch, sr, bits) = filmcraft_interchange::wav::parse_wav(&extracted[0].wav).unwrap();

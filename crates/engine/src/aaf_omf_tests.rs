@@ -53,6 +53,143 @@ fn path_of(s: &Session, item: ItemId) -> String {
     }
 }
 
+/// AAF must reproduce the mixer output, rather than merely retain clip metadata.
+fn assert_aaf_mix_matches(s: &mut Session, seq: ItemId, path: &std::path::Path) -> serde_json::Value {
+    let frames = 96_000;
+    let provider = s.media.full_res_provider(s.project.clone(), s.services.clone());
+    let want = filmcraft_render::mixer::mix_graph(&s.project, s.project.sequence(seq).unwrap(), 0, frames, &provider, None);
+    let before = serde_json::to_value(&s.project).unwrap();
+    let result = s.execute("file.exportAaf", json!({"path":path,"sequence":seq.0})).unwrap();
+    assert_eq!(result["preserveMix"], true, "the command defaults to matching playback");
+    assert_eq!(serde_json::to_value(&s.project).unwrap(), before, "export cannot alter the editor project");
+    let imported = s.execute("file.importAaf", json!({"path":path})).unwrap();
+    let q = s.project.sequence(imported_seq(&imported)).unwrap();
+    let provider = s.media.full_res_provider(s.project.clone(), s.services.clone());
+    let got = filmcraft_render::mixer::mix_graph(&s.project, q, 0, frames, &provider, None);
+    let error = want.channels.iter().zip(&got.channels).flat_map(|(a, b)| a.iter().zip(b).map(|(a, b)| (a - b).abs())).fold(0.0f32, f32::max);
+    assert!(want.channels.iter().flatten().any(|v| v.abs() > 0.001));
+    assert!(error < 2e-6, "full mix sample error {error}");
+    result
+}
+
+#[test]
+fn aaf_preserves_track_gain_mute_pan_and_sample_grid_without_flattening_edits() {
+    use filmcraft_project::{AudioChannels, TrackId};
+    use filmcraft_time::Tick;
+    let (mut s, _, seq, dir) = setup("aaf-mixer-fidelity");
+    let mut p = (*s.project).clone();
+    let q = p.sequence_mut(seq).unwrap();
+    let mut muted = q.audio_tracks[0].clone();
+    muted.id = TrackId(900_001);
+    muted.muted = true;
+    for c in &mut muted.items {
+        c.id.0 += 900_000;
+    }
+    let t = &mut q.audio_tracks[0];
+    t.volume_db = -13.067522525787354;
+    t.pan = -35.0;
+    t.channels = AudioChannels::Mono;
+    t.items[0].start = Tick::from_units(130, 48_000) + Tick::from_units(3, 480_000);
+    let first_start = t.items[0].start;
+    t.items[0].duration -= first_start;
+    t.items[0].gain_db = 4.0;
+    q.audio_tracks.push(muted);
+    q.master_volume_db = -2.0;
+    s.project = Arc::new(p);
+    assert_aaf_mix_matches(&mut s, seq, &dir.join("mix.aaf"));
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.audio_tracks.len(), 2);
+    assert_eq!(q.audio_tracks[0].items.len(), 2, "editable events survive a simple mixer");
+    assert_eq!(q.audio_tracks[0].channels, AudioChannels::Stereo, "printed pan must not be panned twice");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aaf_prints_nonportable_master_processing_once_after_summing() {
+    use filmcraft_project::{TrackId, find_effect};
+    let (mut s, _, seq, dir) = setup("aaf-master-fidelity");
+    let mut p = (*s.project).clone();
+    let q = p.sequence_mut(seq).unwrap();
+    let mut other = q.audio_tracks[0].clone();
+    other.id = TrackId(900_002);
+    for c in &mut other.items {
+        c.id.0 += 800_000;
+    }
+    q.audio_tracks.push(other);
+    let effect = find_effect("hard_limiter").expect("a dynamics effect");
+    let mut limiter = effect.instance();
+    limiter.params.insert("boost".into(), Param::new(ParamValue::Float(20.0)));
+    q.master_effects.push(limiter);
+    s.project = Arc::new(p);
+    let result = assert_aaf_mix_matches(&mut s, seq, &dir.join("master.aaf"));
+    assert_eq!(result["audioLayout"], "mixdown");
+    assert_eq!(s.active_sequence().unwrap().audio_tracks.len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aaf_mix_matching_preserves_solo_and_sequence_time_automation() {
+    use filmcraft_project::{TrackId, mixer::InputMap};
+    use filmcraft_time::Tick;
+    let (mut s, _, seq, dir) = setup("aaf-mix-automation");
+    let mut p = (*s.project).clone();
+    let q = p.sequence_mut(seq).unwrap();
+    let mut other = q.audio_tracks[0].clone();
+    other.id = TrackId(900_003);
+    for c in &mut other.items {
+        c.id.0 += 700_000;
+    }
+    q.audio_tracks.push(other);
+    let t = &mut q.audio_tracks[0];
+    t.solo = true;
+    t.mixer.input_map = InputMap::Left;
+    for (lane, a, b) in [("volume", -15.0, 3.0), ("pan", -75.0, 60.0), ("mute", 0.0, 1.0)] {
+        let mut param = Param::new(ParamValue::Float(a));
+        param.put_keyframe(Tick::ZERO, ParamValue::Float(a));
+        param.put_keyframe(Tick::from_units(72_000, 48_000), ParamValue::Float(b));
+        t.mixer.lanes.insert(lane.into(), param);
+    }
+    s.project = Arc::new(p);
+    assert_aaf_mix_matches(&mut s, seq, &dir.join("automation.aaf"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aaf_mix_matching_rejects_mono_breakout_before_writing() {
+    let (mut s, _, seq, dir) = setup("aaf-mix-breakout");
+    let path = dir.join("must-not-exist.aaf");
+    let error = s.execute("file.exportAaf", json!({"path":path,"sequence":seq.0,"breakoutToMono":true})).unwrap_err();
+    assert!(error.to_string().contains("mono pan law"));
+    assert!(!path.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aaf_mix_matching_keeps_prepared_generator_audio() {
+    let (mut s, items, seq, dir) = setup("aaf-mix-generator");
+    let mut p = (*s.project).clone();
+    p.item_mut(items[0]).unwrap().as_media_mut().unwrap().media = MediaRef::Generator(filmcraft_media::Generator::Demo(filmcraft_media::DemoScene::Aurora));
+    s.project = Arc::new(p);
+    assert_aaf_mix_matches(&mut s, seq, &dir.join("generator.aaf"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aaf_mix_matching_bounds_complete_prints_before_allocating_or_writing() {
+    use filmcraft_project::find_effect;
+    let (mut s, _, seq, dir) = setup("aaf-mix-budget");
+    let mut p = (*s.project).clone();
+    let q = p.sequence_mut(seq).unwrap();
+    q.audio_tracks[0].items[0].duration = filmcraft_time::Tick::from_units(100_000_000, 48_000);
+    q.master_effects.push(find_effect("hard_limiter").unwrap().instance());
+    s.project = Arc::new(p);
+    let path = dir.join("must-not-exist.aaf");
+    let error = s.execute("file.exportAaf", json!({"path":path,"sequence":seq.0})).unwrap_err();
+    assert!(error.to_string().contains("sample budget"));
+    assert!(!path.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn aaf_retimed_audio_matches_the_original_clip_samples() {
     use filmcraft_time::Tick;
@@ -77,7 +214,11 @@ fn aaf_retimed_audio_matches_the_original_clip_samples() {
         let wanted = filmcraft_render::audio::track_input(&s.project, &s.project.sequence(seq).unwrap().audio_tracks[0], start, frames, 48_000, &provider);
         assert!(wanted.channels.iter().flatten().any(|v| v.abs() > 0.01));
         let path = dir.join("retimed.aaf").to_string_lossy().into_owned();
-        s.execute("file.exportAaf", json!({"path":path,"sequence":seq.0,"audio":"embedded","trimAudio":true,"handles":handles,"bitDepth":24})).unwrap();
+        s.execute(
+            "file.exportAaf",
+            json!({"preserveMix":false,"path":path,"sequence":seq.0,"audio":"embedded","trimAudio":true,"handles":handles,"bitDepth":24}),
+        )
+        .unwrap();
         let imported = s.execute("file.importAaf", json!({"path":path})).unwrap();
         let imported = imported_seq(&imported);
         let q = s.project.sequence(imported).unwrap();
@@ -93,7 +234,8 @@ fn aaf_retimed_audio_matches_the_original_clip_samples() {
 }
 
 /// Compare audible samples, rather than merely checking that speed flags disappeared.
-fn assert_aaf_audio_matches(s: &mut Session, seq: ItemId, params: serde_json::Value, command: &str) {
+fn assert_aaf_audio_matches(s: &mut Session, seq: ItemId, mut params: serde_json::Value, command: &str) {
+    params["preserveMix"] = json!(false);
     let original = s.project.sequence(seq).unwrap().audio_tracks[0].clone();
     let start = original.items.iter().map(|c| c.start.to_units_floor(48_000)).min().unwrap();
     let end = original.items.iter().map(|c| c.end().to_units_floor(48_000)).max().unwrap();
@@ -188,7 +330,7 @@ fn aaf_retiming_rejects_hostile_speed_without_writing_a_document() {
         p.sequence_mut(seq).unwrap().audio_tracks[0].items[0].speed = speed;
         s.project = Arc::new(p);
         let path = dir.join("bad.aaf");
-        let result = s.execute("file.exportAaf", json!({"path":path.to_string_lossy(),"sequence":seq.0}));
+        let result = s.execute("file.exportAaf", json!({"preserveMix":false,"path":path.to_string_lossy(),"sequence":seq.0}));
         assert!(result.is_err(), "{speed}: {result:?}");
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(dir);
@@ -209,7 +351,7 @@ fn aaf_retimed_breakout_keeps_output_channel_mapping() {
     let wanted = filmcraft_render::audio::track_input(&s.project, &s.project.sequence(seq).unwrap().audio_tracks[0], 0, 48_000, 48_000, &provider);
     assert!(wanted.channels[0].iter().zip(&wanted.channels[1]).any(|(a, b)| (a - b).abs() > 0.01), "fixture channels must differ");
     let path = dir.join("channels.aaf").to_string_lossy().into_owned();
-    s.execute("file.exportAaf", json!({"path":path,"sequence":seq.0,"breakoutToMono":true,"bitDepth":24})).unwrap();
+    s.execute("file.exportAaf", json!({"preserveMix":false,"path":path,"sequence":seq.0,"breakoutToMono":true,"bitDepth":24})).unwrap();
     let result = s.execute("file.importAaf", json!({"path":path})).unwrap();
     let q = s.project.sequence(imported_seq(&result)).unwrap();
     assert_eq!(q.audio_tracks.len(), 2);
@@ -260,7 +402,7 @@ fn aaf_retimed_decode_failure_is_reported_instead_of_baking_silence() {
     p.sequence_mut(seq).unwrap().audio_tracks[0].items[0].maintain_pitch = false;
     s.project = Arc::new(p);
     let path = dir.join("bad.aaf");
-    let error = s.execute("file.exportAaf", json!({"path":path.to_string_lossy(),"sequence":seq.0})).unwrap_err();
+    let error = s.execute("file.exportAaf", json!({"preserveMix":false,"path":path.to_string_lossy(),"sequence":seq.0})).unwrap_err();
     assert!(error.to_string().contains("test audio failure"), "{error}");
     assert!(!path.exists());
     let _ = std::fs::remove_dir_all(dir);
@@ -279,7 +421,7 @@ fn aaf_retimed_subsample_duration_has_complete_pcm() {
     c.speed = 0.5;
     s.project = Arc::new(p);
     let path = dir.join("fractional.aaf").to_string_lossy().into_owned();
-    s.execute("file.exportAaf", json!({"path":path,"sequence":seq.0,"bitDepth":24,"handles":0})).unwrap();
+    s.execute("file.exportAaf", json!({"preserveMix":false,"path":path,"sequence":seq.0,"bitDepth":24,"handles":0})).unwrap();
     let result = s.execute("file.importAaf", json!({"path":path})).unwrap();
     let c = &s.project.sequence(imported_seq(&result)).unwrap().audio_tracks[0].items[0];
     assert_eq!(c.duration.to_units_floor(48_000), 48_001);
@@ -303,7 +445,7 @@ fn aaf_reverse_audio_keeps_timeline_handles_at_source_zero() {
     t.items[0].maintain_pitch = true;
     s.project = Arc::new(p);
     let path = dir.join("reverse.aaf").to_string_lossy().into_owned();
-    s.execute("file.exportAaf", json!({"path":path,"sequence":seq.0,"bitDepth":24,"handles":6})).unwrap();
+    s.execute("file.exportAaf", json!({"preserveMix":false,"path":path,"sequence":seq.0,"bitDepth":24,"handles":6})).unwrap();
     let result = s.execute("file.importAaf", json!({"path":path})).unwrap();
     let c = &s.project.sequence(imported_seq(&result)).unwrap().audio_tracks[0].items[0];
     assert_eq!(c.source_in.to_units_floor(48_000), 12_000, "rendered handles use timeline coordinates, not the original source in-point");
@@ -316,7 +458,9 @@ fn aaf_reverse_audio_keeps_timeline_handles_at_source_zero() {
 fn aaf_embedded_trimmed_audio_round_trips_sample_exact() {
     let (mut s, items, seq, dir) = setup("aaf-embed");
     let path = dir.join("cut.aaf").to_string_lossy().into_owned();
-    let r = s.execute("file.exportAaf", json!({"path": path, "audio": "embedded", "trimAudio": true, "handles": 6, "sequence": seq.0})).unwrap();
+    let r = s
+        .execute("file.exportAaf", json!({"preserveMix":false,"path": path, "audio": "embedded", "trimAudio": true, "handles": 6, "sequence": seq.0}))
+        .unwrap();
     assert!(r["mediaFiles"].as_array().unwrap().is_empty(), "{r}");
     let r = s.execute("file.import", json!({"paths": [path]})).unwrap();
     let n = imported_seq(&r);
@@ -397,7 +541,7 @@ fn aaf_separate_aiff_breakout_and_linked() {
     let r = s
         .execute(
             "file.exportAaf",
-            json!({"path": path, "audio": "separate", "audioFormat": "aiff", "bitDepth": 24, "breakoutToMono": true, "trimAudio": true, "handles": 0}),
+            json!({"preserveMix":false,"path": path, "audio": "separate", "audioFormat": "aiff", "bitDepth": 24, "breakoutToMono": true, "trimAudio": true, "handles": 0}),
         )
         .unwrap();
     let files: Vec<String> = r["mediaFiles"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
@@ -417,7 +561,12 @@ fn aaf_separate_aiff_breakout_and_linked() {
 
     // Avid-style consolidated OP-Atom MXF audio: our MXF reader opens every file
     let path = dir.join("mxf.aaf").to_string_lossy().into_owned();
-    let r = s.execute("file.exportAaf", json!({"path": path, "audio": "separate", "audioFormat": "mxf", "breakoutToMono": true, "trimAudio": true})).unwrap();
+    let r = s
+        .execute(
+            "file.exportAaf",
+            json!({"preserveMix":false,"path": path, "audio": "separate", "audioFormat": "mxf", "breakoutToMono": true, "trimAudio": true}),
+        )
+        .unwrap();
     let files: Vec<String> = r["mediaFiles"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
     assert_eq!(files.len(), 4);
     for f in &files {
@@ -435,7 +584,7 @@ fn aaf_separate_aiff_breakout_and_linked() {
 
     // linked: no media is written, the document points at the original movies
     let path = dir.join("linked.aaf").to_string_lossy().into_owned();
-    let r = s.execute("file.exportAaf", json!({"path": path, "audio": "linked", "sequence": seq.0})).unwrap();
+    let r = s.execute("file.exportAaf", json!({"preserveMix":false,"path": path, "audio": "linked", "sequence": seq.0})).unwrap();
     assert!(r["mediaFiles"].as_array().unwrap().is_empty());
     let r = s.execute("file.import", json!({"paths": [path]})).unwrap();
     let n = imported_seq(&r);
@@ -451,7 +600,7 @@ fn aaf_separate_aiff_breakout_and_linked() {
 fn aaf_video_mixdown() {
     let (mut s, _items, seq, dir) = setup("aaf-mixdown");
     let path = dir.join("mix.aaf").to_string_lossy().into_owned();
-    let r = s.execute("file.exportAaf", json!({"path": path, "mixdownVideo": true, "audio": "linked", "sequence": seq.0})).unwrap();
+    let r = s.execute("file.exportAaf", json!({"preserveMix":false,"path": path, "mixdownVideo": true, "audio": "linked", "sequence": seq.0})).unwrap();
     let files = r["mediaFiles"].as_array().unwrap();
     assert_eq!(files.len(), 1);
     let mov = files[0].as_str().unwrap();
@@ -567,7 +716,9 @@ fn omf_renders_the_sound_of_a_nested_sequence() {
 fn aaf_keeps_a_nested_sequence_as_a_sequence() {
     let (mut s, items, seq, inner, dir) = setup_nested("aaf-nest");
     let path = dir.join("nest.aaf").to_string_lossy().into_owned();
-    let r = s.execute("file.exportAaf", json!({"path": path, "audio": "embedded", "trimAudio": true, "handles": 6, "sequence": seq.0})).unwrap();
+    let r = s
+        .execute("file.exportAaf", json!({"preserveMix":false,"path": path, "audio": "embedded", "trimAudio": true, "handles": 6, "sequence": seq.0}))
+        .unwrap();
     assert!(!r["report"].to_string().contains("gap"), "{r}");
     let r = s.execute("file.import", json!({"paths": [path]})).unwrap();
     let q = s.project.sequence(imported_seq(&r)).unwrap().clone();
@@ -608,8 +759,8 @@ fn commands_are_registered_with_menus_and_validate_params() {
     }
     let (mut s, _, seq, dir) = setup("aaf-params");
     let path = dir.join("x.aaf").to_string_lossy().into_owned();
-    assert!(s.execute("file.exportAaf", json!({"sequence": seq.0})).is_err(), "path is required");
-    assert!(s.execute("file.exportAaf", json!({"path": path, "bitDepth": 20})).is_err());
+    assert!(s.execute("file.exportAaf", json!({"preserveMix":false,"sequence": seq.0})).is_err(), "path is required");
+    assert!(s.execute("file.exportAaf", json!({"preserveMix":false,"path": path, "bitDepth": 20})).is_err());
     assert!(s.execute("file.exportOmf", json!({"path": path, "audio": "linked"})).is_err(), "OMF has no linked mode");
     assert!(s.execute("file.importAaf", json!({"path": dir.join("a.mov").to_string_lossy()})).is_err());
     let _ = std::fs::remove_dir_all(dir);
@@ -786,6 +937,7 @@ mod selected_streams {
             trim: true,
             handles: Tick::ZERO,
             render_effects: false,
+            preserve_mix: false,
             breakout: false,
             nests: NestNeeds::Inside,
         };
@@ -829,8 +981,12 @@ mod selected_streams {
         }
         assert!(calls.lock().unwrap().iter().any(|call| call.0 == 2));
         assert!(files.writes.lock().unwrap().is_empty());
-        let error =
-            s.execute("file.exportAaf", json!({"path": "must-not-be-written.aaf", "sequence": sequence.0, "audio": "linked", "trimAudio": false})).unwrap_err();
+        let error = s
+            .execute(
+                "file.exportAaf",
+                json!({"preserveMix":false,"path": "must-not-be-written.aaf", "sequence": sequence.0, "audio": "linked", "trimAudio": false}),
+            )
+            .unwrap_err();
         assert!(error.to_string().contains("embedded") || error.to_string().contains("separate"));
         assert!(files.writes.lock().unwrap().is_empty());
     }
