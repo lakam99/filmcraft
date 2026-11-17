@@ -52,6 +52,16 @@ sequences and media. Mapping details (what each FilmCraft feature becomes) are i
 `omf` module docs. Times are kept in ticks in the model; compositions use the sequence frame rate
 for picture and the sample rate for sound slots, so audio edits are sample-exact.
 
+Incoming AAF slot edit clocks are kept separate from the editor's display frame rate.
+Studio Pro audio-only exports can include empty picture and timecode slots at 44 100 Hz,
+with a 25 fps `Timecode::FPS` value ([AAF Object Specification v1.1 §7.12](https://static.amwa.tv/ms-01-aaf-object-spec.pdf)). The reader prefers
+a usable nonempty picture rate, then a usable timecode rate or its FPS/drop metadata, then
+remaining usable slot rates. When no display rate is available it reports a 25 fps fallback.
+Every segment and marker still uses its original slot clock; audio sample rate and source
+in-points are not converted to video frames. Synthetic third-party-layout regressions cover
+sample clocks, missing/invalid timecode, drop-frame and fractional rates, placeholder ordering,
+and frame-based audio-only files. Existing Premiere-style nested/layered fixtures remain covered.
+
 Embedded / consolidated audio (`essence`): `audio_needs` lists the media ranges an export
 references (per media item or per clip, with handles); the engine decodes or renders them and
 passes `AudioEssence` (embedded PCM or a written file) back in `MediaOptions`.

@@ -210,18 +210,49 @@ fn rate_of(o: &Obj, p: u16) -> Option<(i64, i64)> {
     o.rational(p).filter(|r| r.0 > 0 && r.1 > 0)
 }
 
+/// Slot edit clocks may be audio-sample clocks even on empty picture/timecode
+/// slots. Only a rate accepted by editor settings can become its display frame rate.
+fn sequence_rate_of(slot: &Obj) -> Option<FrameRate> {
+    let (num, den) = rate_of(slot, pid::EDIT_RATE)?;
+    let rate = FrameRate::new(num, den);
+    let settings = filmcraft_project::SequenceSettings { frame_rate: rate, ..Default::default() };
+    settings.validate().ok().map(|()| rate)
+}
+
+fn timecode_frame_rate(slot: &Obj) -> Option<FrameRate> {
+    let tc = find_class(slot.strong(pid::SEGMENT)?, cls::TIMECODE)?;
+    let fps = tc.u16(pid::TC_FPS).filter(|fps| (1..=1000).contains(fps))?;
+    Some(match (fps, tc.u8(pid::TC_DROP).unwrap_or(0) != 0) {
+        (30, true) => FrameRate::FPS_29_97,
+        (60, true) => FrameRate::FPS_59_94,
+        _ => FrameRate::new(i64::from(fps), 1),
+    })
+}
+
+fn composition_frame_rate(slots: &[Obj]) -> Option<FrameRate> {
+    let slots_of =
+        |kind| slots.iter().filter(move |slot| slot.class == cls::TIMELINE_MOB_SLOT && slot.strong(pid::SEGMENT).is_some_and(|seg| data_kind(seg) == kind));
+    // Real picture takes priority over placeholder slots and rounded nominal
+    // timecode clocks. Preserve fractional rates rather than snapping them to FPS.
+    slots_of(DataKind::Picture)
+        .filter(|slot| slot.strong(pid::SEGMENT).is_some_and(|seg| len_of(seg) > 0))
+        .find_map(sequence_rate_of)
+        .or_else(|| slots_of(DataKind::Timecode).find_map(sequence_rate_of))
+        .or_else(|| slots_of(DataKind::Timecode).find_map(timecode_frame_rate))
+        .or_else(|| slots_of(DataKind::Picture).find_map(sequence_rate_of))
+        // Some frame-based audio-only files omit both picture and timecode.
+        .or_else(|| slots.iter().filter(|s| s.class == cls::TIMELINE_MOB_SLOT).find_map(sequence_rate_of))
+}
+
 impl R<'_> {
     fn composition(&mut self, c: &Obj) -> Composition {
         let name = c.string(pid::MOB_NAME).unwrap_or_else(|| "Sequence".into());
         let slots = c.objs(pid::SLOTS);
-        let pic_rate = slots
-            .iter()
-            .filter(|s| s.class == cls::TIMELINE_MOB_SLOT)
-            .find(|s| s.strong(pid::SEGMENT).is_some_and(|g| matches!(data_kind(g), DataKind::Picture | DataKind::Timecode)))
-            .and_then(|s| rate_of(s, pid::EDIT_RATE))
-            .or_else(|| slots.iter().find_map(|s| rate_of(s, pid::EDIT_RATE)))
-            .unwrap_or((25, 1));
-        let rate = FrameRate::new(pic_rate.0, pic_rate.1);
+        let rate = composition_frame_rate(slots).unwrap_or_else(|| {
+            self.report.info("AAF has no usable picture/timecode frame rate; 25 fps used for display, with slot timing unchanged");
+            FrameRate::FPS_25
+        });
+        let pic_rate = (rate.num, rate.den);
         let tags = tagged_values(c, pid::MOB_USER_COMMENTS);
         let tag = |n: &str| tags.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
         let (mut width, mut height) = tag("FilmCraft Frame Size")
