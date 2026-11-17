@@ -83,7 +83,9 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 ui.end_row();
             } else {
                 ui.label("");
-                let r = ui.checkbox(&mut d.mixdown_video, tl!("Mixdown video"));
+                let r = ui
+                    .checkbox(&mut d.mixdown_video, tl!("Mixdown video"))
+                    .on_hover_text(tl!("Renders one H.264 MP4 reference for DAW playback at the sequence frame rate."));
                 elems.push((format!("{p}.mixdownVideo"), r.rect, d.mixdown_video.to_string()));
                 ui.end_row();
             }

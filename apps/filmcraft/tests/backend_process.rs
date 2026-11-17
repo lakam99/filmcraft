@@ -192,6 +192,9 @@ fn aaf_video_mixdown_uses_snapshot_and_publishes_decodable_media() {
     session.execute("timeline.place", json!({"item":item,"track":"V1","seconds":0,"audio":false})).unwrap();
     enable(&mut session);
     let destination = directory.path("video.aaf");
+    let error = session.execute("file.exportAaf", json!({"path":destination,"mixdownVideo":true,"mixdownFormat":17})).unwrap_err();
+    assert!(error.to_string().contains("mixdownFormat"));
+    assert!(!destination.exists(), "invalid frontend parameters must not start an export");
     let ack = session.execute("file.exportAaf", json!({"path":destination,"mixdownVideo":true,"preserveMix":false})).unwrap();
     session.execute("project.matteColor", json!({"item":item,"color":"#c02020"})).unwrap();
     let done = finish(&mut session, ack["job"].as_u64().unwrap(), Duration::from_secs(45));

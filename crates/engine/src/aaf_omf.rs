@@ -6,7 +6,7 @@
 //! plus handles (or whole), with clip effects rendered in, broken out to mono; and for AAF an
 //! optional video mixdown rendered to one file.
 //!
-//! `file.exportAaf {path, sequence?, mixdownVideo?, breakoutToMono?, audio?: "embedded"|"separate"|
+//! `file.exportAaf {path, sequence?, mixdownVideo?, mixdownFormat?: "mp4"|"mov"|"mxf", breakoutToMono?, audio?: "embedded"|"separate"|
 //! "linked", audioFormat?: "wav"|"aiff"|"mxf" (OP-Atom, AAF only), sampleRate?, bitDepth?, trimAudio?, handles? (frames),
 //! renderAudioEffects?, smallSectors?}`
 //! AAF defaults to `preserveMix: true`: render clip and mixer processing, retaining edits
@@ -512,18 +512,28 @@ pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str
     Ok((essence, files))
 }
 
+fn mixdown_format(p: &Value) -> Result<(filmcraft_export::Format, &'static str)> {
+    use filmcraft_export::Format;
+    let invalid = || bad("file.exportAaf", "`mixdownFormat` must be mp4 (H.264), mov (DNxHR), or mxf (DNxHR OP-Atom)");
+    match p.get("mixdownFormat") {
+        None | Some(Value::Null) => Ok((Format::H264, "mp4")),
+        Some(Value::String(value)) => match value.to_ascii_lowercase().as_str() {
+            "mp4" => Ok((Format::H264, "mp4")),
+            "mov" => Ok((Format::DnxHr, "mov")),
+            "mxf" => Ok((Format::MxfOpAtom, "mxf")),
+            _ => Err(invalid()),
+        },
+        _ => Err(invalid()),
+    }
+}
+
 /// Render the video of `seq` to one file for an AAF video mixdown.
-fn mixdown(s: &Session, seq: ItemId, path: &str) -> Result<MixdownVideo> {
+fn mixdown(s: &Session, seq: ItemId, path: &str, format: filmcraft_export::Format) -> Result<MixdownVideo> {
     let q = s.project.sequence(seq).ok_or(EngineError::NoSequence)?;
     let dur = q.duration();
     if dur <= Tick::ZERO {
         return Err(EngineError::Other("the sequence is empty".into()));
     }
-    let format = if path.to_ascii_lowercase().ends_with(".mxf") {
-        filmcraft_export::Format::from_name("mxf-opatom").unwrap_or(filmcraft_export::Format::DnxHr)
-    } else {
-        filmcraft_export::Format::DnxHr
-    };
     let mut settings = filmcraft_export::ExportSettings {
         format,
         path: path.to_string(),
@@ -531,6 +541,11 @@ fn mixdown(s: &Session, seq: ItemId, path: &str) -> Result<MixdownVideo> {
         include_audio: false,
         part_of_batch: false,
         dnx_profile: "hq".into(),
+        // DAW picture references need ordinary 8-bit AVC, not HDR/High 10 or a DNxHR
+        // decoder absent from common native video players (including Studio Pro on Windows).
+        h264_profile: filmcraft_export::H264Profile::High,
+        sdr: format == filmcraft_export::Format::H264,
+        hardware_encoding: filmcraft_export::HardwareEncoding::Auto,
         ..Default::default()
     };
     if s.services.export_in_memory() {
@@ -688,6 +703,9 @@ pub fn export_aaf(s: &mut Session, p: &Value) -> Result<Value> {
     if crate::backend::enabled(s) {
         let seq = crate::export_tools::sequence_param(s, p, "file.exportAaf")?;
         plan_from(s, p, seq, "file.exportAaf", false)?;
+        if bool_p(p, "mixdownVideo").unwrap_or(false) {
+            mixdown_format(p)?;
+        }
         return crate::backend::start_interchange(s, false, p);
     }
     export_aaf_at(s, p, None)
@@ -698,6 +716,7 @@ pub(crate) fn export_aaf_at(s: &mut Session, p: &Value, media_override: Option<&
     let path = str_p(p, "path").ok_or_else(|| bad(cmd, "need `path`"))?.to_string();
     let seq = crate::export_tools::sequence_param(s, p, cmd)?;
     let plan = plan_from(s, p, seq, cmd, false)?;
+    let video_format = bool_p(p, "mixdownVideo").unwrap_or(false).then(|| mixdown_format(p)).transpose()?;
     check_linked_streams(s, seq, &plan)?;
     let (dir, stem) = split(&path);
     let media_dir = media_override.map(str::to_string).unwrap_or_else(|| join(&dir, &format!("{stem} Media")));
@@ -714,9 +733,8 @@ pub(crate) fn export_aaf_at(s: &mut Session, p: &Value, media_override: Option<&
         (essence, None, files)
     };
     files.extend(written);
-    let mixdown_video = if bool_p(p, "mixdownVideo").unwrap_or(false) {
-        let ext = if str_p(p, "mixdownFormat") == Some("mxf") { "mxf" } else { "mov" };
-        let m = mixdown(s, seq, &join(&media_dir, &format!("{} Video Mixdown.{ext}", safe_name(&stem))))?;
+    let mixdown_video = if let Some((format, ext)) = video_format {
+        let m = mixdown(s, seq, &join(&media_dir, &format!("{} Video Mixdown.{ext}", safe_name(&stem))), format)?;
         files.push(m.path.clone());
         Some(m)
     } else {

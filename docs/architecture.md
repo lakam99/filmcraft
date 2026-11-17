@@ -768,7 +768,10 @@ an error instead of a partial AAF. Export reports identify the chosen path. `pre
 retains legacy editable interchange, separate transition operations, original-media linking and
 mono breakout, with a warning that mixer processing is omitted. Mix matching requires
 interleaved audio and writes rendered sidecars even in linked mode. Video retiming requires
-the existing `mixdownVideo: true` option.
+the existing `mixdownVideo: true` option. Video mixdowns default to an 8-bit SDR H.264 MP4
+reference at the sequence's exact frame rate, for native DAW video playback without a DNxHR
+decoder. `mixdownFormat: "mov"` or `"mxf"` explicitly retains DNxHR HQ for workflows that need it;
+`"mp4"` selects the default explicitly. Video mixdown format does not change the audio export.
 
 ## 7. Automation surfaces
 
