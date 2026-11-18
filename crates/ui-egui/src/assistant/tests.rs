@@ -5,6 +5,53 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 #[test]
+fn large_observations_reach_normal_editor_actions_without_restarting_inspection() {
+    let mut app = FilmcraftApp::new(Session::default());
+    app.session.prefs.ai.attach_frames = false;
+    let bins: Vec<_> = (0..300)
+        .map(|i| {
+            let name = format!("Folder {i} {}", "description ".repeat(36));
+            let id = app.session.execute("file.newBin", json!({"name":name})).unwrap()["bin"].as_u64().unwrap();
+            (id, name)
+        })
+        .collect();
+    let target = bins[150].0;
+    let inspection = app.session.execute("project.inspect", json!({})).unwrap();
+    assert!(serde_json::to_vec(&inspection).unwrap().len() > 96 * 1024);
+    let offset = inspection["root"]["children"].as_array().unwrap().iter().position(|bin| bin["id"] == target).unwrap();
+    *app.assistant.panel.prompt_mut() = "Rename the identified folder using the current project observation".into();
+    let mut request = 0;
+    begin_with(&mut app, &egui::Context::default(), move |body| {
+        request += 1;
+        assert!(!body["tools"].as_array().unwrap().is_empty(), "One inspection must not restart the task through summarization");
+        assert!(body["input"].as_array().unwrap().iter().all(|item|item["type"] != "craft_tool_result"));
+        assert!(serde_json::to_vec(body).unwrap().len() < 96 * 1024);
+        let (name, args, id) = match request {
+            1 => ("filmcraft", json!({"method":"engine.commands","params_json":json!({"filters":["project.inspect","project.renameBin"],"exact":true}).to_string()}), "schemas"),
+            2 => ("filmcraft", json!({"method":"engine.execute","params_json":"{\"command\":\"project.inspect\",\"params\":{}}"}), "observed"),
+            3 => ("read_tool_result", json!({"call_id":"observed","queries":[{"path":"/result/root/children","offset":offset,"limit":1,"fields":["id","name"]}]}), "detail"),
+            4 => {
+                let data:Value=serde_json::from_str(body["input"].as_array().unwrap().last().unwrap()["output"].as_str().unwrap()).unwrap();
+                let bin=data["results"][0]["items"][0]["id"].as_u64().unwrap();
+                assert_eq!(bin,target);
+                ("filmcraft",json!({"method":"engine.execute","params_json":json!({"command":"project.renameBin","params":{"bin":bin,"name":"Finished folder"}}).to_string()}),"edit")
+            }
+            5 => return Ok(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Renamed the folder."}]}]})),
+            _ => panic!("The editor workflow repeated instead of completing"),
+        };
+        Ok(json!({"status":"completed","output":[{"type":"function_call","call_id":id,"name":name,"arguments":args.to_string()}]}))
+    }).unwrap();
+    turn(&mut app);
+    for (id, name) in &bins {
+        let got = &app.session.project.root.find_bin(filmcraft_project::BinId(*id)).unwrap().name;
+        assert_eq!(got, if *id == target { "Finished folder" } else { name.as_str() });
+    }
+    assert!(app.assistant.panel.transcript().iter().any(|(role, text)| role == "Assistant" && text == "Renamed the folder."));
+    app.session.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(app.session.project.root.find_bin(filmcraft_project::BinId(target)).unwrap().name, bins[150].1);
+}
+
+#[test]
 fn batch_renames_forty_bins_in_one_tool_call_with_normal_undo() {
     let mut app = FilmcraftApp::new(Session::default());
     app.session.prefs.ai.attach_frames = false;
