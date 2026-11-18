@@ -45,6 +45,12 @@ media start timecodes beyond 360 000 000 000 frames are reset the same way. Cove
 
 ## AAF and OMF
 
+AAF import also accepts Studio One file locators that omit the separator after a Windows
+drive colon (`file:///D:Media/clip.wav`). It restores the absolute drive path before media
+resolution, including percent-encoded names; standard file URLs, network shares and plain
+paths retain their existing handling. Synthetic locator fixtures check that the imported
+project, including edit timing, transitions and gain, matches the canonical-URL version.
+
 `comp` holds a format-neutral mob-style model (compositions of slots whose sequences of fillers,
 source clips and overlapping transitions reference media through master and file source mobs).
 `aaf` and `omf` serialise it; both import back into the same model and from there into FilmCraft

@@ -1194,6 +1194,56 @@ fn audio_tracks_keep_their_names() {
 }
 
 #[test]
+fn studio_one_drive_locators_resolve_without_changing_the_edit() {
+    let (p, s) = project();
+    let bytes = export(&p, s, &AafOptions::default()).unwrap().0;
+    for (url, canonical, expected) in [
+        ("file:///D:Media/Clip%20A.wav", "file:///D:/Media/Clip%20A.wav", "D:/Media/Clip A.wav"),
+        ("file:///c:Media/caf%C3%A9%20%231.wav", "file:///c:/Media/caf%C3%A9%20%231.wav", "c:/Media/café #1.wav"),
+        ("FILE://localhost/Z:Video/Clip.mp4", "file:///Z:/Video/Clip.mp4", "Z:/Video/Clip.mp4"),
+        ("file:///D:/Media/Clip%20A.wav", "file:///D:/Media/Clip%20A.wav", "D:/Media/Clip A.wav"),
+        ("file://nas/share/Clip%20A.wav", "file://nas/share/Clip%20A.wav", "//nas/share/Clip A.wav"),
+        ("file:///media/Clip%20A.wav", "file:///media/Clip%20A.wav", "/media/Clip A.wav"),
+        ("file://localhost/media/Clip.wav", "file://localhost/media/Clip.wav", "/media/Clip.wav"),
+        ("file:///1:Clip.wav", "file:///1:Clip.wav", "/1:Clip.wav"),
+        ("file:///%C3%A9:Clip.wav", "file:///%C3%A9:Clip.wav", "/é:Clip.wav"),
+        ("file:///D:", "file:///D:", "/D:"),
+        ("/D:Clip.wav", "/D:Clip.wav", "/D:Clip.wav"),
+    ] {
+        let with_locator = |url: &str| {
+            let mut root = store::read(&bytes).unwrap();
+            let content = strong_mut(strong_mut(&mut root, pid::ROOT_HEADER), pid::CONTENT);
+            let mut count = 0;
+            for mob in objs_mut(content, pid::MOBS) {
+                if mob.strong(pid::ESSENCE_DESCRIPTION).is_none() {
+                    continue;
+                }
+                let descriptor = strong_mut(mob, pid::ESSENCE_DESCRIPTION);
+                if descriptor.objs(pid::LOCATOR).is_empty() {
+                    continue;
+                }
+                for locator in objs_mut(descriptor, pid::LOCATOR) {
+                    locator.set(pid::URL_STRING, Value::Data(super::store::utf16z(url)));
+                    count += 1;
+                }
+            }
+            assert_eq!(count, 2, "both the picture and sound file locators are rewritten");
+            store::write(&root, filmcraft_cfb::Version::V4).unwrap()
+        };
+        let opts = ImportOptions { base_dir: Some("E:/Other Project".into()), ..Default::default() };
+        let (got, _, report) = import(&with_locator(url), &opts).unwrap();
+        let (want, _, _) = import(&with_locator(canonical), &opts).unwrap();
+        assert!(!report.has_warnings(), "{url}: {report}");
+        for item in got.project.items.values() {
+            if let Some(media) = item.as_media() {
+                assert_eq!(media.media, filmcraft_project::MediaRef::File { path: expected.into() }, "{url}");
+            }
+        }
+        assert_eq!(serde_json::to_value(&got.project).unwrap(), serde_json::to_value(&want.project).unwrap(), "{url}");
+    }
+}
+
+#[test]
 fn interleaved_audio_exposes_every_file_channel_and_round_trips_as_stereo() {
     let (p, s) = project();
     for bytes in [export(&p, s, &AafOptions::default()).unwrap().0, rich_export(false)] {
