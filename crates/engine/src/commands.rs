@@ -3230,6 +3230,40 @@ fn build() -> Vec<CommandSpec> {
             s.set_playhead(t);
             Ok(json!({"time": s.playhead().0}))
         }),
+        cmd!(
+            "playhead.toSelectionStart",
+            "Go to Clip Selection Start",
+            [],
+            None,
+            r#"{"clip":id?} (otherwise the earliest selected timeline clip)"#,
+            has_seq,
+            |s, p| {
+                const CMD: &str = "playhead.toSelectionStart";
+                if !p.as_object().is_some_and(|fields| fields.keys().all(|key| key == "clip")) {
+                    return Err(bad(CMD, "expected an object with optional `clip` id"));
+                }
+                let sid = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
+                let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
+                let time = match p.get("clip") {
+                    Some(value) => {
+                        let clip = value.as_u64().map(ClipId).ok_or_else(|| bad(CMD, "`clip` must be an integer id"))?;
+                        q.find_item(clip).map(|(_, item)| item.start).ok_or_else(|| bad(CMD, "clip is not in the active sequence"))?
+                    }
+                    None => s
+                        .state
+                        .selection
+                        .iter()
+                        .filter_map(|clip| q.find_item(*clip).map(|(_, item)| item.start))
+                        .min()
+                        .ok_or_else(|| bad(CMD, "select a timeline clip first"))?,
+                }
+                .max(Tick::ZERO);
+                // Selection-driven navigation must retain audio-sample timing and the user's
+                // selection. set_playhead rounds to video frames and can select other clips.
+                s.state.playheads.insert(sid, time);
+                Ok(json!({"time": time.0}))
+            }
+        ),
         cmd!("playhead.step", "Step Frames", [], None, r#"{"frames":i64}"#, has_seq, |s, p| {
             let n = p.get("frames").and_then(Value::as_i64).unwrap_or(1);
             let r = s.sequence_rate();

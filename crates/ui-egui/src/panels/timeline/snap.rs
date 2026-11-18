@@ -8,6 +8,36 @@ pub(in super::super) fn snap(app: &mut FilmcraftApp, seq: &Sequence, layout: &La
     snap_to(app, seq, layout, t, exclude, true)
 }
 
+/// A track change should keep its original time through small sideways hand movement.
+/// Moving clips are excluded from ordinary targets, so retain their original placement
+/// explicitly. Beyond that magnet, choose the closest end rather than alternating ends
+/// when one already lands exactly on a target.
+pub(super) fn snap_move(app: &mut FilmcraftApp, seq: &Sequence, layout: &Layout, raw: Tick, clips: &[ClipId]) -> Tick {
+    let Some(first) = clips.iter().filter_map(|clip| seq.find_item(*clip).map(|(_, item)| item.start)).min() else {
+        return raw;
+    };
+    let last = clips.iter().filter_map(|clip| seq.find_item(*clip).map(|(_, item)| item.end())).max().unwrap_or(first);
+    if app.session.state.snapping && (layout.x_of(first + raw) - layout.x_of(first)).abs() < super::SNAP_PX {
+        app.tl.snap_x = Some(layout.x_of(first));
+        return Tick::ZERO;
+    }
+    let mut best: Option<(f32, Tick, Tick)> = None;
+    for edge in [first, last] {
+        if let Some(&(distance, target)) = targets(app, seq, layout, edge + raw, clips, true).first()
+            && best.is_none_or(|(old, _, _)| distance < old)
+        {
+            best = Some((distance, target - edge, target));
+        }
+    }
+    let offset = if let Some((_, offset, target)) = best {
+        app.tl.snap_x = Some(layout.x_of(target));
+        offset
+    } else {
+        raw
+    };
+    offset.max(-first)
+}
+
 /// Where a dragged playhead lands: [`snap`], but not onto itself, or it would stick where it is
 /// and only move in jumps of `SNAP_PX` (#164).
 pub(super) fn snap_playhead(app: &mut FilmcraftApp, seq: &Sequence, layout: &Layout, t: Tick) -> Tick {

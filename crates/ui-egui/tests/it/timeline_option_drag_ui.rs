@@ -61,6 +61,168 @@ fn clip_count(d: &mut Driver) -> usize {
     d.harness.state().session.active_sequence().map(|q| q.all_tracks().map(|t| t.items.len()).sum()).unwrap_or(0)
 }
 
+fn isolated_audio(d: &mut Driver) -> (filmcraft_project::ClipId, filmcraft_time::Tick) {
+    let sid = d.harness.state().session.state.active_sequence.unwrap();
+    let q = std::sync::Arc::make_mut(&mut d.harness.state_mut().session.project).sequence_mut(sid).unwrap();
+    let mut clip = q.audio_tracks[0].items[0].clone();
+    clip.start = q.settings.frame_rate.tick_of(96) + filmcraft_time::Tick(filmcraft_time::TICKS_PER_SECOND / 48_000);
+    clip.duration = q.settings.frame_rate.tick_of(48);
+    clip.link = None;
+    clip.group = None;
+    let out = (clip.id, clip.start);
+    for track in q.video_tracks.iter_mut().chain(q.audio_tracks.iter_mut()) {
+        track.items.clear();
+        track.transitions.clear();
+    }
+    q.audio_tracks[0].items.push(clip);
+    q.markers.clear();
+    q.mark_in = None;
+    q.mark_out = None;
+    d.harness.state_mut().session.state.linked_selection = false;
+    d.harness.state_mut().session.set_playhead(filmcraft_time::Tick(7 * filmcraft_time::TICKS_PER_SECOND));
+    let view = &mut d.harness.state_mut().ui.timeline;
+    view.pps = 72.0;
+    view.target_pps = 72.0;
+    view.scroll = 0.0;
+    view.target_scroll = 0.0;
+    view.fit_pending = false;
+    view.split = 0.15;
+    d.frames(4);
+    out
+}
+
+#[test]
+fn a_clip_click_places_the_playhead_at_its_exact_start() {
+    let mut d = Driver::demo();
+    let (clip, start) = isolated_audio(&mut d);
+    let scroll = d.harness.state().ui.timeline.scroll;
+    let rect = d.rect(&format!("timeline.clip.{}", clip.0));
+    d.ok("ui.click", json!({"x":rect[0]+rect[2]*0.5,"y":rect[1]+rect[3]*0.25}));
+    assert_eq!(d.harness.state().session.playhead(), start, "Selecting audio must not round its start to a video frame");
+    assert_eq!(d.harness.state().session.state.selection, vec![clip]);
+    assert_eq!(d.harness.state().ui.timeline.scroll, scroll, "Selection must not scroll the view under the pointer");
+    if let Some(dir) = std::env::var_os("CRAFT_TIMELINE_FIXTURES") {
+        std::fs::create_dir_all(&dir).unwrap();
+        d.harness.render().unwrap().save(std::path::Path::new(&dir).join("clip-selection-playhead.png")).unwrap();
+    }
+}
+
+#[test]
+fn a_cross_track_drag_keeps_exact_time_despite_horizontal_hand_jitter() {
+    let mut d = Driver::demo();
+    let (clip, start) = isolated_audio(&mut d);
+    let source = d.rect(&format!("timeline.clip.{}", clip.0));
+    let target = d.rect("timeline.track.A2.target");
+    let destination = d.harness.state().session.active_sequence().unwrap().audio_tracks[1].id;
+    d.ok("ui.drag",json!({"from":{"x":source[0]+source[2]*0.5,"y":source[1]+source[3]*0.25},"to":{"x":source[0]+source[2]*0.5+6.0,"y":target[1]+target[3]*0.5},"steps":12}));
+    let q = d.harness.state().session.active_sequence().unwrap();
+    let (track, item) = q.find_item(clip).unwrap();
+    assert_eq!(track, destination);
+    assert_eq!(item.start, start, "Changing tracks must keep the original audio-sample position through small sideways movement");
+    d.exec("edit.undo", json!({}));
+    assert_eq!(d.harness.state().session.active_sequence().unwrap().audio_tracks[0].items[0].start, start);
+}
+
+#[test]
+fn dragging_an_existing_selection_keeps_a_parked_playhead_as_a_snap_target() {
+    let mut d = Driver::demo();
+    let (clip, start) = isolated_audio(&mut d);
+    d.exec("timeline.select", json!({"clips":[clip.0]}));
+    d.exec("playhead.set", json!({"frame":120}));
+    let parked = d.harness.state().session.playhead();
+    let dx = (parked - start).seconds() * 72.0;
+    let source = d.rect(&format!("timeline.clip.{}", clip.0));
+    let target = d.rect("timeline.track.A2.target");
+    d.ok(
+        "ui.drag",
+        json!({"from":{"x":source[0]+source[2]*0.5,"y":source[1]+source[3]*0.25},"to":{"x":source[0]+source[2]*0.5+dx,"y":target[1]+target[3]*0.5},"steps":12}),
+    );
+    assert_eq!(d.harness.state().session.playhead(), parked);
+    let q = d.harness.state().session.active_sequence().unwrap();
+    assert_eq!(q.find_item(clip).unwrap().0, q.audio_tracks[1].id);
+    assert_eq!(q.find_item(clip).unwrap().1.start, parked);
+}
+
+#[test]
+fn original_time_snapping_works_with_playhead_follow_disabled_and_allows_free_moves() {
+    for (snap, dx, stays) in [(true, 6.0, true), (true, 50.0, false), (false, 6.0, false)] {
+        let mut d = Driver::demo();
+        let (clip, start) = isolated_audio(&mut d);
+        d.exec("prefs.set", json!({"key":"timeline.playheadFollowsSelection","value":false}));
+        d.exec("sequence.snap", json!({"on":snap}));
+        let source = d.rect(&format!("timeline.clip.{}", clip.0));
+        let target = d.rect("timeline.track.A2.target");
+        d.ok("ui.drag",json!({"from":{"x":source[0]+source[2]*0.5,"y":source[1]+source[3]*0.25},"to":{"x":source[0]+source[2]*0.5+dx,"y":target[1]+target[3]*0.5},"steps":12}));
+        let q = d.harness.state().session.active_sequence().unwrap();
+        let (track, item) = q.find_item(clip).unwrap();
+        assert_eq!(track, q.audio_tracks[1].id);
+        if stays {
+            assert_eq!(item.start, start);
+        } else {
+            assert!(item.start > start, "Deliberate or unsnapped moves must remain free");
+        }
+    }
+}
+
+#[test]
+fn playhead_follow_can_be_disabled_without_moving_the_cursor() {
+    let mut d = Driver::demo();
+    let (clip, _) = isolated_audio(&mut d);
+    d.exec("prefs.set", json!({"key":"timeline.playheadFollowsSelection","value":false}));
+    let before = d.harness.state().session.playhead();
+    let rect = d.rect(&format!("timeline.clip.{}", clip.0));
+    d.ok("ui.click", json!({"x":rect[0]+rect[2]*0.5,"y":rect[1]+rect[3]*0.25}));
+    assert_eq!(d.harness.state().session.playhead(), before);
+    assert_eq!(d.harness.state().session.state.selection, vec![clip]);
+}
+
+#[test]
+fn original_time_magnet_keeps_drag_previews_stable_before_drop() {
+    let mut d = Driver::demo();
+    let (clip, start) = isolated_audio(&mut d);
+    d.exec("prefs.set", json!({"key":"timeline.playheadFollowsSelection","value":false}));
+    let source = d.rect(&format!("timeline.clip.{}", clip.0));
+    let target = d.rect("timeline.track.A2.target");
+    let origin = egui::pos2((source[0] + source[2] * 0.5) as f32, (source[1] + source[3] * 0.25) as f32);
+    d.harness.input_mut().events.push(egui::Event::PointerMoved(origin));
+    d.frames(1);
+    d.harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: origin,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    d.frames(1);
+    let y = (target[1] + target[3] * 0.5) as f32;
+    for dx in [2.0, 5.0, -3.0, 6.0] {
+        d.harness.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(origin.x + dx, y)));
+        d.frames(1);
+        match &d.harness.state().tl.drag {
+            Some(filmcraft_ui_egui::panels::timeline::Drag::Move { offset, .. }) => assert_eq!(*offset, filmcraft_time::Tick::ZERO),
+            other => panic!("Expected a move preview, got {other:?}"),
+        }
+        assert_eq!(d.harness.state().session.active_sequence().unwrap().find_item(clip).unwrap().1.start, start, "Preview must not edit the project");
+    }
+    if let Some(dir) = std::env::var_os("CRAFT_TIMELINE_FIXTURES") {
+        std::fs::create_dir_all(&dir).unwrap();
+        d.harness.render().unwrap().save(std::path::Path::new(&dir).join("track-move-preview.png")).unwrap();
+    }
+    let release = egui::pos2(origin.x + 6.0, y);
+    d.harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: release,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    d.frames(2);
+    let q = d.harness.state().session.active_sequence().unwrap();
+    assert_eq!(q.find_item(clip).unwrap().0, q.audio_tracks[1].id);
+    assert_eq!(q.find_item(clip).unwrap().1.start, start);
+    if let Some(dir) = std::env::var_os("CRAFT_TIMELINE_FIXTURES") {
+        d.harness.render().unwrap().save(std::path::Path::new(&dir).join("track-move-dropped.png")).unwrap();
+    }
+}
+
 #[test]
 fn option_drag_copies_a_clip_and_a_plain_drag_moves_it() {
     let mut d = Driver::demo();
