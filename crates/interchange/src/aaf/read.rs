@@ -11,6 +11,24 @@ use crate::{Error, Report, Result};
 
 type MobId = [u8; 32];
 
+/// Studio One can omit the separator after a drive colon in an absolute file locator
+/// (`file:///D:Media/clip.wav`). Recover it here so existing media does not import offline;
+/// keep this compatibility rule out of other interchange formats and plain relative paths.
+fn locator_path(url: &str) -> String {
+    let path = crate::common::file_url_to_path(url);
+    if url.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"))
+        && let Some(local) = path.strip_prefix('/')
+        && let Some((drive, rest)) = local.split_at_checked(2)
+        && drive.as_bytes().first().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && drive.ends_with(':')
+        && !rest.is_empty()
+        && !rest.starts_with(['/', '\\'])
+    {
+        return format!("{drive}/{rest}");
+    }
+    path
+}
+
 fn multiply_gains(outer: &Gain, inner: &Gain) -> Option<Gain> {
     match (outer, inner) {
         (Gain::Constant(a), Gain::Constant(b)) => {
@@ -642,7 +660,7 @@ impl R<'_> {
             DataKind::Sound => CKind::Sound,
             _ => kind,
         };
-        let path = d.objs(pid::LOCATOR).iter().find_map(|l| l.string(pid::URL_STRING)).map(|u| crate::common::file_url_to_path(&u));
+        let path = d.objs(pid::LOCATOR).iter().find_map(|l| l.string(pid::URL_STRING)).map(|u| locator_path(&u));
         let file_rate = rate_of(d, pid::SAMPLE_RATE).unwrap_or(rate);
         let length =
             d.i64(pid::FILE_LENGTH).map(|l| units_to_ticks(l, file_rate.0, file_rate.1)).unwrap_or_else(|| units_to_ticks(len_of(seg), rate.0, rate.1));
