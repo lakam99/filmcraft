@@ -28,6 +28,17 @@ into a continuation summary while the readable transcript stays separate. This
 uses the selected model and counts as API usage; a failed summary preserves the
 existing context for retry.
 
+Large inspections now provide compact previews instead of repeatedly triggering
+context compression. The assistant can retrieve exact fields and pages from a bounded
+local observation cache using `read_tool_result`, including several queries at once.
+Recent observations survive compaction; changed editor state still requires a fresh
+inspection. The cache follows the existing remember-history setting.
+
+Repeated unchanged inspections, discovery calls or identical errors trigger recovery.
+If the assistant remains stuck, it explains completed work and the blocker with further
+tools disabled. Successful edits are not deduplicated and pending job polling is allowed.
+The 32-call safety limit remains, with a final explanation instead of blind continuation.
+
 ## Highlighted controls
 
 Ask “Guide me step by step” for one highlighted control at a time. The assistant
