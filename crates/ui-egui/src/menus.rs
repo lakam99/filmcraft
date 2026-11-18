@@ -1024,6 +1024,7 @@ fn engine_toggle(session: &filmcraft_engine::Session, id: &str) -> Option<bool> 
         "sequence.snap" => st.snapping,
         "sequence.linkedSelection" => st.linked_selection,
         "sequence.selectionFollowsPlayhead" => st.selection_follows_playhead,
+        "sequence.playheadFollowsSelection" => session.prefs.timeline.playhead_follows_selection,
         "sequence.showThroughEdits" => st.show_through_edits,
         "markers.rippleSequenceMarkers" => st.ripple_sequence_markers,
         "markers.copyPasteIncludesSequenceMarkers" => st.copy_paste_sequence_markers,

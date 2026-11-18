@@ -10,6 +10,37 @@ fn demo() -> Session {
     s
 }
 
+#[test]
+fn selection_navigation_is_exact_and_does_not_select_other_clips_or_edit() {
+    let mut s = demo();
+    let sid = s.state.active_sequence.unwrap();
+    let q = std::sync::Arc::make_mut(&mut s.project).sequence_mut(sid).unwrap();
+    let clip = q.audio_tracks[0].items[0].id;
+    let time = q.audio_tracks[0].items[0].start + Tick(filmcraft_time::TICKS_PER_SECOND / 48_000);
+    q.audio_tracks[0].items[0].start = time;
+    q.audio_tracks[0].items[0].duration -= Tick(filmcraft_time::TICKS_PER_SECOND / 48_000);
+    s.state.selection = vec![clip];
+    s.state.selection_follows_playhead = true;
+    let before = s.project.clone();
+    let undo = s.history.undo.len();
+    assert_eq!(s.execute("playhead.toSelectionStart", json!({})).unwrap()["time"], json!(time.0));
+    assert_eq!(s.playhead(), time);
+    assert_eq!(s.state.selection, vec![clip]);
+    assert_eq!(s.project, before);
+    assert_eq!(s.history.undo.len(), undo);
+    for bad in [json!(null), json!([]), json!({"clip":-1}), json!({"clip":"bad"}), json!({"clip":u64::MAX}), json!({"extra":true})] {
+        assert!(s.execute("playhead.toSelectionStart", bad).is_err());
+        assert_eq!(s.playhead(), time);
+        assert_eq!(s.state.selection, vec![clip]);
+        assert_eq!(s.project, before);
+    }
+    s.state.selection.clear();
+    assert!(s.execute("playhead.toSelectionStart", json!({})).is_err());
+    assert_eq!(s.playhead(), time);
+    s.execute("playhead.toSelectionStart", json!({"clip":clip.0})).unwrap();
+    assert!(s.state.selection.is_empty(), "An explicit target must not select clips as a side effect");
+}
+
 /// An empty 23.976 sequence and a 20 s Bars and Tone item (video + audio).
 fn fresh() -> (Session, u64) {
     let mut s = Session::default();

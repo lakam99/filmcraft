@@ -1,7 +1,7 @@
 use super::clips::paint_hatch;
 use super::layout::{Layout, max_scroll, min_pps, new_track_at};
 use super::menus::{CLIP_MENU, EditPointTarget, edit_point_menu, gap_menu, marker_menu, multicam_menu, ruler_menu};
-use super::snap::{snap, snap_playhead, snap_transition};
+use super::snap::{snap, snap_move, snap_playhead, snap_transition};
 use super::{
     Align2, ClipId, Color32, CursorIcon, Drag, EdgeKind, FilmcraftApp, Grab, HashMap, Hit, MarkerId, MarqueeAnchor, Pos2, Pressed, Rect, Sense, Sequence,
     Stroke, StrokeKind, Tick, Tokens, Tool, TrackId, TrackItem, TrackKind, Value, edge_geometry, grab_at, hit, json, marker_at, marker_under_pointer, pos2,
@@ -516,12 +516,14 @@ fn start_drag(
         (_, Grab::Other(Hit::Clip { clip, track, .. })) => {
             // select (shift toggles; alt selects one side of a link)
             let sel = &app.session.state.selection;
+            let was_selected = sel.contains(&clip);
             if mods.shift {
                 let _ = app.session.execute("timeline.select", json!({"clips": [clip.0], "toggle": true, "linked": !mods.alt}));
             } else if !sel.contains(&clip) || (mods.alt && resp.clicked()) {
                 // Alt-click isolates one side; Alt-drag keeps the selected group to copy.
                 let _ = app.session.execute("timeline.select", json!({"clips": [clip.0], "linked": !mods.alt}));
             }
+            follow_clip_selection(app, clip, was_selected, resp.clicked());
             if resp.drag_started() {
                 let clips = app.session.state.selection.clone();
                 Some(Drag::Move { clips, grab_tick: t, start_track: track, offset: Tick::ZERO, track_delta: 0, new_track: None, copy: mods.alt })
@@ -588,6 +590,24 @@ fn start_drag(
         if resp.drag_started() {
             app.tl.drag = Some(d);
         }
+    }
+}
+
+/// Follow clip selection while stopped without disturbing a drag's destination cursor or view.
+fn follow_clip_selection(app: &mut FilmcraftApp, clip: ClipId, was_selected: bool, clicked: bool) {
+    // Preserve a manually parked destination cursor when dragging an existing selection.
+    if !app.session.prefs.timeline.playhead_follows_selection || app.playback.playing || (was_selected && !clicked) {
+        return;
+    }
+    if !app.session.state.selection.contains(&clip) {
+        return;
+    }
+    match app.session.execute("playhead.toSelectionStart", json!({"clip":clip.0})) {
+        Ok(_) => {
+            // A selection moves the cursor, not the viewport under an active drag.
+            app.ui.timeline.seen_playhead = app.session.state.active_sequence.map(|sid| (sid, app.session.playhead().seconds()));
+        }
+        Err(error) => app.ui.status = error.to_string(),
     }
 }
 
@@ -684,12 +704,7 @@ fn drag_update(app: &mut FilmcraftApp, ui: &mut egui::Ui, resp: &egui::Response,
             }
             Drag::Move { clips, grab_tick, start_track, .. } => {
                 let raw = rate.snap_nearest(t_here - grab_tick);
-                // snap the moved block's start or end
-                let first = clips.iter().filter_map(|c| seq.find_item(*c).map(|(_, i)| i.start)).min().unwrap_or_default();
-                let last = clips.iter().filter_map(|c| seq.find_item(*c).map(|(_, i)| i.end())).max().unwrap_or_default();
-                let s1 = snap(app, seq, layout, first + raw, &clips) - first;
-                let offset = if s1 != raw { s1 } else { snap(app, seq, layout, last + raw, &clips) - last };
-                let offset = offset.max(-first);
+                let offset = snap_move(app, seq, layout, raw, &clips);
                 let cur_row = layout.row_at(p.y);
                 let start_row = layout.rows.iter().find(|r| r.track == start_track);
                 let track_delta = match (cur_row, start_row) {

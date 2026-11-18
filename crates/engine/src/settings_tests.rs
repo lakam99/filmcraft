@@ -18,6 +18,23 @@ fn demo() -> Session {
     s
 }
 
+#[test]
+fn playhead_follows_selection_defaults_and_remembers_the_disabled_choice() {
+    let mut s = Session::default();
+    assert_eq!(s.prefs.get("timeline.playheadFollowsSelection"), Some(json!(true)));
+    s.execute("sequence.playheadFollowsSelection", json!({"on":false})).unwrap();
+    let restored: Preferences = serde_json::from_value(serde_json::to_value(&s.prefs).unwrap()).unwrap();
+    assert!(!restored.timeline.playhead_follows_selection);
+    let migrated: Preferences = serde_json::from_value(json!({"timeline":{}})).unwrap();
+    assert!(migrated.timeline.playhead_follows_selection);
+    for args in [json!({"on":"yes"}), json!({"on":null}), json!({"on":5}), json!({"other":true}), json!([])] {
+        assert!(s.execute("sequence.playheadFollowsSelection", args).is_err());
+        assert!(!s.prefs.timeline.playhead_follows_selection);
+    }
+    s.execute("sequence.playheadFollowsSelection", json!({})).unwrap();
+    assert!(s.prefs.timeline.playhead_follows_selection);
+}
+
 fn set(s: &mut Session, key: &str, value: Value) {
     s.execute("prefs.set", json!({"key": key, "value": value})).unwrap_or_else(|e| panic!("{key}: {e}"));
 }

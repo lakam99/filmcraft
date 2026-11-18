@@ -154,6 +154,18 @@ step (Track Select Forward / Backward drags use it so subtitles stay with the di
 as far as the clips (they would overlap captions that stay, or one is on a locked track) the call fails and
 nothing moves; it cannot be combined with `copy`, and the result lists them as `captions`.
 
+With Snap enabled, a timeline drag retains the selection's original timing through small sideways
+movement while changing tracks. Drag farther horizontally to move in time, or turn Snap off for a
+free move. Either end of the selection snaps to the nearest eligible edit, marker or playhead.
+Selecting a clip while stopped moves the playhead to its exact start, including audio starts between
+video frames, without scrolling the timeline or changing the selection. Disable **Sequence ▸
+Playhead Follows Clip Selection**, or `timeline.playheadFollowsSelection` in Timeline preferences,
+to keep the cursor in place. Dragging an already-selected clip retains a manually parked cursor
+so it remains available as a destination snap target.
+`sequence.playheadFollowsSelection {on?: bool}` changes this saved preference (omitting `on` toggles).
+`playhead.toSelectionStart {clip?: id}` navigates explicitly to a clip in the active sequence, or to
+the earliest selected clip when omitted, without changing the project or undo history.
+
 **Trim mode** (`crates/engine/src/trim.rs`): `trim.selectEditPoint` / `trim.selectNearest` enter trim
 mode (the Program monitor becomes the Trim Monitor, ids `trimMonitor.*`); `trim.monitor` returns what
 it shows. With Linked Selection on, selecting an edge includes its unlocked linked partners, even

@@ -111,6 +111,20 @@ fn groups() -> Vec<(&'static str, Vec<CommandSpec>)> {
                     }
                     Ok(json!({"selectionFollowsPlayhead": s.state.selection_follows_playhead}))
                 }),
+                spec("sequence.playheadFollowsSelection", "Playhead Follows Clip Selection", &["Sequence"], None, r#"{"on":bool?}"#, always, |s, p| {
+                    const CMD: &str = "sequence.playheadFollowsSelection";
+                    if !p.as_object().is_some_and(|fields| fields.keys().all(|key| key == "on")) {
+                        return Err(bad(CMD, "expected an object with optional `on` boolean"));
+                    }
+                    let on = match p.get("on") {
+                        Some(value) => value.as_bool().ok_or_else(|| bad(CMD, "`on` must be a boolean"))?,
+                        None => !s.prefs.timeline.playhead_follows_selection,
+                    };
+                    let mut next = s.prefs.clone();
+                    next.timeline.playhead_follows_selection = on;
+                    s.set_prefs(next).map_err(|e| EngineError::Other(format!("saving preferences: {e}")))?;
+                    Ok(json!({"playheadFollowsSelection": on}))
+                }),
                 spec("sequence.showThroughEdits", "Show Through Edits", &["Sequence"], None, r#"{"on":bool?}"#, always, |s, p| {
                     s.state.show_through_edits = bool_p(p, "on").unwrap_or(!s.state.show_through_edits);
                     Ok(json!({"showThroughEdits": s.state.show_through_edits}))

@@ -373,6 +373,8 @@ pub struct TimelinePrefs {
     pub multichannel_mono_media_tracks: String,
     pub focus_timeline_on_edit: bool,
     pub snap_playhead: bool,
+    /// Follow a timeline clip selection while stopped, without scrolling the view.
+    pub playhead_follows_selection: bool,
     pub return_to_beginning: bool,
     pub out_of_sync_unlinked: bool,
     pub play_after_rendering: bool,
@@ -404,6 +406,7 @@ impl Default for TimelinePrefs {
             multichannel_mono_media_tracks: "useFile".into(),
             focus_timeline_on_edit: false,
             snap_playhead: true,
+            playhead_follows_selection: true,
             return_to_beginning: true,
             out_of_sync_unlinked: false,
             play_after_rendering: true,

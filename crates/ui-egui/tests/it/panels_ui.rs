@@ -750,7 +750,7 @@ fn info_follows_the_timeline_item_and_keeps_sequence_information() {
     let (mut d, _, b, _) = inspector_selection_driver();
     let name = d.app().session.project.item(b).unwrap().name.clone();
     d.click("panel.tab.Info");
-    assert!(d.harness.query_by_label(&name).is_some(), "Info must show the selected Timeline item's name");
+    // Seeking on selection can show the same filename in other panels; identify Info itself.
     assert_eq!(d.label("info.item"), name, "the item header belongs to Info, not another panel");
     assert!(!d.label("info.sequence").is_empty());
     assert!(d.harness.query_by_label("Settings:").is_some(), "Info keeps its lower sequence-information section");
