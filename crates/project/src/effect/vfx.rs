@@ -1122,6 +1122,11 @@ pub(super) fn extend_core(v: &mut [EffectDef]) {
 pub(super) fn apply_badges(v: &mut [EffectDef]) {
     for e in v.iter_mut().filter(|e| e.kind == EffectKind::Video && !e.intrinsic) {
         let id = e.id;
+        // This original CPU/f32 effect is outside the compatibility catalog below. Preserve
+        // its own capability declaration instead of inventing a GPU acceleration badge.
+        if id == "focus_recovery" {
+            continue;
+        }
         let folder = e.category.get(1).copied().unwrap_or("");
         let a32 = matches!(
             id,
@@ -1271,10 +1276,10 @@ mod tests {
         }
         assert_eq!(n, 93);
         assert_eq!(CATALOGUE.len(), 16);
-        // nothing else sits in the current folders
+        // Compatibility catalog stays complete; original Focus Recovery extends these folders.
         for d in effect_defs().iter().filter(|d| d.kind == EffectKind::Video && d.category.first() == Some(&"Video Effects")) {
             let f = d.category[1];
-            if f == "Obsolete" {
+            if f == "Obsolete" || d.id == "focus_recovery" {
                 continue;
             }
             let listed = CATALOGUE.iter().any(|(cf, names)| *cf == f && names.contains(&d.name));

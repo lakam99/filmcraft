@@ -443,7 +443,8 @@ fn resolve_effect_name(s: &Session, p: &Value, name: &str) -> Option<&'static fi
     let n = name.to_ascii_lowercase();
     let cands: Vec<_> = filmcraft_project::effect_defs().iter().filter(|e| e.name.to_ascii_lowercase() == n).collect();
     if cands.len() <= 1 {
-        return cands.first().copied().or_else(|| filmcraft_project::find_effect(&n));
+        // Reuse model aliases (for example Soft focus -> Focus Recovery) in commands too.
+        return cands.first().copied().or_else(|| filmcraft_project::effect::find_effect_by_name(name));
     }
     let on_audio = s.active_sequence().is_some_and(|q| {
         let clips = clips_p(s, p);

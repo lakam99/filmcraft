@@ -29,6 +29,37 @@ const RATE: FrameRate = FrameRate::FPS_24;
 #[path = "support/grading.rs"]
 mod grading;
 
+#[test]
+fn focus_recovery_cpu_effect_matches_actual_gpu_composition() {
+    let Some((device, queue)) = device("focus recovery", true) else {
+        assert!(std::env::var_os("FILMCRAFT_REQUIRE_GRADING_GPU").is_none());
+        return;
+    };
+    let mut gpu = filmcraft_gpu::GpuCompositor::new(&device, &queue);
+    for model in [0, 1] {
+        let mut builder = Builder::new(1);
+        let item = builder.media(Generator::BarsAndTone);
+        let clip = builder.place(0, item, 0, 48);
+        builder.effect(clip, "gaussian_blur", &[("blurriness", ParamValue::Float(2.5))]);
+        builder.effect(clip, "focus_recovery", &[("model", ParamValue::Choice(model))]);
+        let scene = builder.at(24);
+        let cpu = render_cpu(&scene);
+        let mut bypass = scene.project.clone();
+        bypass.sequence_mut(scene.seq).unwrap().video_tracks[0].items[0].effects.iter_mut().find(|e| e.effect == "focus_recovery").unwrap().enabled = false;
+        let plain = render_sequence(&bypass, scene.seq, RATE.tick_of(scene.frame), RenderOptions::default(), &scene.sources);
+        assert_ne!(cpu.px, plain.over_black_rgba8(), "comparison must contain an active recovery effect");
+        let plan =
+            filmcraft_render::plan::plan_frame(&scene.project, scene.seq, RATE.tick_of(scene.frame), RenderOptions::default(), gpu.caps(), &scene.sources);
+        gpu.composite(&plan);
+        let (w, h, mut bytes) = gpu.read_output().unwrap();
+        for p in bytes.as_chunks_mut::<4>().0.iter_mut() {
+            p[3] = 255;
+        }
+        let difference = diff(&cpu, &Rgba8::new(w, h, bytes)).unwrap();
+        assert!(difference.p99 <= 6 && difference.mean_abs * 4.0 / 3.0 < 1.5, "model {model}: {difference}");
+    }
+}
+
 /// A procedurally generated project and the frame to render.
 struct Scene {
     project: Project,

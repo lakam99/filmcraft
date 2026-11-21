@@ -515,6 +515,22 @@ fn build_effects() -> Vec<EffectDef> {
             vec![ang("direction", "Direction", 0.0), fs("length", "Blur Length", 0.0, (0.0, 1000.0), (0.0, 20.0), "", 1)],
         ),
         video("sharpen", "Sharpen", BLUR, vec![fs("amount", "Sharpen Amount", 0.0, (0.0, 4000.0), (0.0, 100.0), "", 0)]),
+        EffectDef {
+            accelerated: false,
+            ..video(
+                "focus_recovery",
+                "Focus Recovery",
+                BLUR,
+                vec![
+                    fs("amount", "Recovery strength", 70.0, (0.0, 100.0), (0.0, 100.0), "%", 0),
+                    fs("radius", "Focus softness", 2.5, (0.5, 6.0), (0.5, 6.0), "px", 2),
+                    fs("noise", "Noise protection", 35.0, (0.0, 100.0), (0.0, 100.0), "%", 0),
+                    fs("halo", "Halo protection", 70.0, (0.0, 100.0), (0.0, 100.0), "%", 0),
+                    ch("model", "Blur model", &["Gentle softness", "Lens defocus"], 0),
+                    ch("quality", "Recovery quality", &["Quick", "Balanced", "Detailed"], 1),
+                ],
+            )
+        },
         video(
             "unsharp_mask",
             "Unsharp Mask",
@@ -901,9 +917,10 @@ pub fn find_effect(id: &str) -> Option<&'static EffectDef> {
 /// Case-insensitive lookup by id or display name.
 pub fn find_effect_by_name(name: &str) -> Option<&'static EffectDef> {
     let n = name.to_ascii_lowercase();
-    // Old human-readable names are import/automation aliases, never display labels.
+    // Human-readable lookup aliases are never written as project effect identities.
     let legacy_id = match n.as_str() {
         "lumetri" | "lumetri color" | "color grade" => Some("lumetri"),
+        "deblur" | "soft focus" | "refocus" | "deconvolution" => Some("focus_recovery"),
         _ => None,
     };
     legacy_id.and_then(find_effect).or_else(|| effect_defs().iter().find(|e| e.id == n || e.name.to_ascii_lowercase() == n))
@@ -915,6 +932,7 @@ pub fn find_effect_by_name(name: &str) -> Option<&'static EffectDef> {
 pub fn search_aliases(def: &EffectDef) -> &'static [&'static str] {
     match def.id {
         "lumetri" => &["Lumetri", "Lumetri Color", "Color Grade"],
+        "focus_recovery" => &["Deblur", "Soft focus", "Refocus", "Deconvolution"],
         _ => &[],
     }
 }
