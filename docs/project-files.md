@@ -1,7 +1,45 @@
 # Project files
 
-FilmCraft projects are `.fcproj` files: UTF-8 JSON with an explicit schema version. Reading and
-writing them is `crates/format` (`filmcraft-format`); the engine's `file.*` commands use it.
+FilmCraft's native projects are `.fcproj` files: UTF-8 JSON with an explicit schema version. Reading
+and writing them is `crates/format` (`filmcraft-format`); the engine's `file.*` commands use it.
+The same Open and Save commands also work with editable `.aaf` documents.
+
+## Editing AAF documents
+
+Use **File ▸ Open Project** to open an AAF as its own document. Edit the timeline, import additional
+media, and press **Save** (Ctrl+S / ⌘S) to write a real AAF to the same path. Opening an AAF from the
+command line, Recent Projects or by dropping it on the editor follows the same workflow.
+**File ▸ Import AAF** still adds the imported sequence to the current project.
+
+For a timeline already imported into a native project, choose **Save As** and an `.aaf` filename
+once; subsequent saves update that AAF. Save As and Save a Copy offer both `.aaf` and `.fcproj`.
+Saving a copy keeps the current document's path and unsaved state.
+
+- The first overwrite preserves the previous file beside it as `<name> (before FilmCraft).aaf`,
+  using a numbered name if necessary. Later saves in the same editing session keep that backup.
+- FilmCraft checks for external changes before replacing an AAF. If another application changed
+  it, reopen it or save to a different filename.
+- Linked media stays linked; documents with embedded audio save with embedded audio. Supported
+  integer PCM WAV samples are retained without re-encoding for ordinary cuts, trims and moves.
+  Reopening reuses an identical extracted WAV; an independently modified WAV is kept and the
+  embedded original is extracted to a separate filename.
+- AAF saves use the native background worker. The document becomes saved only after successful
+  publication; edits made while it saves remain unsaved. Save-before-close waits for completion,
+  and a failure keeps the project open.
+- Auto-save and crash recovery use native `.fcproj` snapshots, including for an open AAF. They
+  never replace an AAF with JSON or automatically overwrite the interchange document.
+  Recovered edits require Save As to a different filename: the recovery snapshot does not hold
+  the original AAF checkpoint needed to verify a safe overwrite.
+
+AAF does not represent every FilmCraft feature or every application's proprietary objects.
+Direct Save currently requires one top-level sequence and rejects unsupported export content,
+track/bus mixer processing and mute/solo state rather than silently flattening them. If import
+reported unsupported foreign content, overwriting that original is blocked; Save As keeps it
+intact. Use a native `.fcproj` to retain FilmCraft-specific editing data, or explicit AAF export
+with mix matching when rendered mixer processing is intended. The original AAF backup retains
+the original bytes; direct Save does not promise a lossless round trip of unknown foreign metadata.
+Document editing is bounded to 256 MiB per AAF and 128 MiB of retained embedded audio; larger
+projects can use native project files and linked media export.
 
 ## Format
 
@@ -114,7 +152,7 @@ to avoid that ([agents.md](agents.md)); the desktop app and `mcp` sessions don't
 | `file.saveAs {path}` | File ▸ Save As… (⇧⌘S) | write and adopt the new path |
 | `file.saveCopy {path}` | File ▸ Save a Copy… (⌥⌘S) | write a copy; the project keeps its path and unsaved state |
 | `file.revert` | File ▸ Revert | reload the last saved version, discarding changes |
-| `file.open {path}` | File ▸ Open Project… (⌘O) | returns `{schemaVersion, migrated}` |
+| `file.open {path}` | File ▸ Open Project… (⌘O) | open `.fcproj` (`schemaVersion`, `migrated`) or `.aaf` (`documentFormat`, import report) |
 
 In the UI, Save / Save As / Save a Copy without a `path` show a file dialog.
 Open Project… shows one too. In the desktop app, when the current project has unsaved changes, it

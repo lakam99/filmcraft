@@ -726,7 +726,11 @@ pub fn invoke_command(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut
     if r.is_ok() {
         let path = save_path.or_else(|| app.session.path.clone());
         if let Some(path) = path {
-            saved_status(app, id, &path);
+            if r.as_ref().is_ok_and(|value| value.get("job").is_some()) && matches!(id, "file.save" | "file.saveAs" | "file.saveCopy" | "file.saveAll") {
+                app.ui.status = "Saving AAF…".into();
+            } else {
+                saved_status(app, id, &path);
+            }
         }
     }
     if r.is_ok() && matches!(id, "playhead.start" | "playhead.end") {

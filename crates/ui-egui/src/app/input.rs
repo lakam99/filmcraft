@@ -139,7 +139,7 @@ impl FilmcraftApp {
 
 /// Whether a dropped file is a FilmCraft project (opened, not imported).
 fn is_project_file(path: &str) -> bool {
-    std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("fcproj"))
+    std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("fcproj") || e.eq_ignore_ascii_case("aaf"))
 }
 
 /// A physical-pixel screen position as a point in the window's UI space, given the window's content origin in points.

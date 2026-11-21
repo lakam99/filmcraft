@@ -10,6 +10,7 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+pub mod aaf_document;
 pub mod aaf_omf;
 pub mod autosave;
 #[cfg(not(target_arch = "wasm32"))]
@@ -462,6 +463,7 @@ pub struct Session {
     pub document_epoch: u64,
     pub saved_revision: u64,
     pub path: Option<String>,
+    pub(crate) aaf_document: aaf_document::State,
     pub state: EditorState,
     pub media: Arc<MediaPool>,
     pub services: Arc<dyn Services>,
@@ -592,6 +594,7 @@ impl Session {
             document_epoch: 0,
             saved_revision: 1,
             path: None,
+            aaf_document: Default::default(),
             state: EditorState {
                 snapping: true,
                 linked_selection: true,
@@ -712,7 +715,8 @@ impl Session {
             return;
         }
         if dirty {
-            let explicit = self.path.as_deref().is_some_and(|path| self.services.requires_explicit_save(path));
+            // Recovery is native JSON. It must never overwrite an AAF with that JSON.
+            let explicit = self.path.as_deref().is_some_and(|path| aaf_document::is_aaf_path(path) || self.services.requires_explicit_save(path));
             p.send_dirty(self.project.clone(), self.revision, self.path.clone(), explicit);
         } else {
             p.send_clean();
@@ -725,6 +729,7 @@ impl Session {
     pub fn poll_persistence(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         backend::poll(self);
+        aaf_document::poll(self);
         linked_compositions::poll(self);
         proxies::poll(self);
         masks::poll(self);
@@ -798,9 +803,17 @@ impl Session {
 
     /// Run a command by id.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
-        #[cfg(not(target_arch = "wasm32"))]
         if self.exec_depth == 0 {
+            #[cfg(not(target_arch = "wasm32"))]
             backend::poll(self);
+            aaf_document::poll(self);
+        }
+        // Keep the document available if its background save fails. The UI's save-before-close
+        // continuation retries these commands after the save acknowledgement.
+        if aaf_document::saving(self)
+            && matches!(id, "file.open" | "file.revert" | "file.newProject" | "file.openDemoProject" | "file.closeProject" | "file.recover")
+        {
+            return Err(EngineError::Other("An AAF save is still running; wait before replacing the open document".into()));
         }
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         // headless sessions (CLI, MCP, control channel) have no UI frame loop calling

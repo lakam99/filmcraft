@@ -416,7 +416,8 @@ fn body(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &View, actions
         let parent = parent_bin(&app.session.project.root, v.bin);
         navigate(app, v.inst, parent.map(|b| b.0));
     }
-    let mut crumb = format!("{}.fcproj", app.session.project.name);
+    let extension = if app.session.path.as_deref().is_some_and(filmcraft_engine::aaf_document::is_aaf_path) { "aaf" } else { "fcproj" };
+    let mut crumb = format!("{}.{extension}", app.session.project.name);
     for b in bin_path(&app.session.project.root, v.bin) {
         crumb.push_str(" / ");
         crumb.push_str(&b);

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// `filmcraft --help`.
 pub const USAGE: &str = "\
-Usage: filmcraft [options] [project.fcproj | media files...]
+Usage: filmcraft [options] [project.fcproj | project.aaf | media files...]
 
 Options:
   --control <port>   start the localhost JSON-lines control server
@@ -122,7 +122,7 @@ pub fn parse(env_control_port: Option<String>, args: impl IntoIterator<Item = Os
 /// Whether a launch file is a FilmCraft project. The extension's case does not matter: Windows file
 /// associations and the Linux MIME glob start the app for `CUT.FCPROJ` too (#850).
 pub fn is_project(path: &str) -> bool {
-    Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("fcproj"))
+    Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("fcproj") || e.eq_ignore_ascii_case("aaf"))
 }
 
 /// `path` made absolute against the working directory, so a project or media file named relative
@@ -268,7 +268,7 @@ mod tests {
     /// imported as a media file instead of opened (#850).
     #[test]
     fn a_project_is_recognised_whatever_the_case_of_its_extension() {
-        for p in ["cut.fcproj", "CUT.FCPROJ", "Cut.FcProj", "/edits/a b.fcproj", r"C:\Edits\CUT.FCPROJ"] {
+        for p in ["cut.fcproj", "CUT.FCPROJ", "Cut.FcProj", "/edits/a b.fcproj", r"C:\Edits\CUT.FCPROJ", "cut.aaf", "CUT.AAF", "/edits/Aligned lav.Aaf"] {
             assert!(is_project(p), "{p}");
         }
         for p in ["cut.mp4", "fcproj", ".fcproj", "a.fcproj.mov", "a.fcprojx", ""] {

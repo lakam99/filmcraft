@@ -15,6 +15,59 @@ use filmcraft_ui_egui::native_dialogs::FileDialog;
 use filmcraft_ui_egui::state::Mode;
 use serde_json::{Value, json};
 
+#[test]
+fn project_breadcrumb_identifies_an_open_aaf_document() {
+    let mut d = Driver::new();
+    d.app().session.path = Some("Synced.AAF".into());
+    Arc::make_mut(&mut d.app().session.project).name = "Synced".into();
+    d.frames(3);
+    let elements = d.ok("ui.elements", json!({"prefix":"project.breadcrumb"}));
+    assert_eq!(elements[0]["label"], "Synced.aaf");
+}
+
+#[test]
+fn open_project_waits_for_background_save_and_keeps_the_prompt_after_failure() {
+    use std::sync::atomic::Ordering;
+    for succeeds in [false, true] {
+        let mut d = Driver::new();
+        let (dir, current, other) = projects(&mut d, if succeeds { "aafSaveSuccess" } else { "aafSaveFailure" });
+        d.edit();
+        d.open_project(&other);
+        let progress = Arc::new(filmcraft_export::Progress::default());
+        d.app().session.jobs.push(filmcraft_engine::Job { id: 9001, label: "Save AAF".into(), progress: progress.clone(), result: Arc::new(Mutex::new(None)) });
+        d.app().ui.clip_dialog.as_mut().unwrap().params["__saveJob"] = json!(9001);
+        d.frames(3);
+        assert_eq!(d.path(), Some(current.clone()), "a running save must not open the next project");
+        assert!(d.app().ui.clip_dialog.is_some());
+        if let Some(folder) = std::env::var_os("FILMCRAFT_AAF_UI_SHOTS") {
+            let folder = PathBuf::from(folder);
+            std::fs::create_dir_all(&folder).unwrap();
+            d.harness.render().unwrap().save(folder.join(if succeeds { "aaf-save-wait.png" } else { "aaf-save-running.png" })).unwrap();
+        }
+        if succeeds {
+            let revision = d.app().session.revision;
+            d.app().session.saved_revision = revision;
+        } else {
+            *progress.error.lock().unwrap() = Some("disk full".into());
+        }
+        progress.finished.store(true, Ordering::Release);
+        d.frames(3);
+        if succeeds {
+            assert_eq!(d.path(), Some(other));
+            assert!(d.app().ui.clip_dialog.is_none());
+        } else {
+            assert_eq!(d.path(), Some(current));
+            assert!(d.app().session.is_dirty());
+            assert_eq!(d.app().ui.clip_dialog.as_ref().unwrap().error, "disk full");
+            assert!(d.has("openProject.save"));
+            if let Some(folder) = std::env::var_os("FILMCRAFT_AAF_UI_SHOTS") {
+                d.harness.render().unwrap().save(PathBuf::from(folder).join("aaf-save-failure.png")).unwrap();
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 struct Driver {
     harness: Harness<'static, FilmcraftApp>,
     tx: Sender<ControlRequest>,
