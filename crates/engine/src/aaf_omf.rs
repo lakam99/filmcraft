@@ -384,6 +384,62 @@ fn check_linked_streams(s: &Session, seq: ItemId, plan: &AudioPlan) -> Result<()
 
 /// Prepare the audio essence of an export; returns the essence and the files written.
 pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str) -> Result<(Vec<AudioEssence>, Vec<String>)> {
+    prepare_audio_document(s, seq, plan, media_dir, false)
+}
+
+fn original_wav(s: &Session, need: &AudioNeed) -> Result<Option<AudioEssence>> {
+    if need.start != Tick::ZERO || need.audio_stream != 0 {
+        return Ok(None);
+    }
+    let Some(path) = need.path.as_deref().filter(|path| std::path::Path::new(path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))) else {
+        return Ok(None);
+    };
+    let source = crate::aaf_document::read(&*s.services, path)?;
+    let (pcm, channels, sample_rate, bits) = filmcraft_interchange::wav::parse_wav(&source).ok_or_else(|| {
+        EngineError::Other("This WAV encoding cannot be preserved by AAF Save; use Save As .fcproj or Export AAF for explicit conversion".into())
+    })?;
+    if !(1..=64).contains(&channels) || !(8_000..=192_000).contains(&sample_rate) || !matches!(bits, 8 | 16 | 24 | 32) {
+        return Err(EngineError::Other("Invalid embedded WAV dimensions".into()));
+    }
+    let block = usize::from(channels).saturating_mul(usize::from(bits / 8));
+    let frames = (pcm.len() / block) as u64;
+    if pcm.is_empty()
+        || !pcm.len().is_multiple_of(block)
+        || pcm.len() > 128 * 1024 * 1024
+        || frames < need.end.to_units_floor(i64::from(sample_rate)).max(0) as u64
+    {
+        return Err(EngineError::Other("Embedded WAV data exceeds the AAF Save budget or has a partial sample frame".into()));
+    }
+    Ok(Some(AudioEssence {
+        key: need.key,
+        channel: None,
+        start: Tick::ZERO,
+        frames,
+        sample_rate,
+        bits,
+        channels: u32::from(channels),
+        data: EssenceData::Embedded(pcm),
+        effects_rendered: false,
+        timing_rendered: false,
+        render_gain: 1.0,
+    }))
+}
+
+fn check_document_audio_budget(needs: &[AudioNeed], sample_rate: u32) -> Result<()> {
+    // Bound the whole collection before decoding any clip, rather than retaining an
+    // unbounded number of individually bounded PCM buffers.
+    let mut bytes = 0u64;
+    for need in needs {
+        let frames = Tick(need.end.0.saturating_sub(need.start.0)).to_units_floor(i64::from(sample_rate.max(need.sample_rate))).max(0) as u64;
+        bytes = bytes.saturating_add(frames.saturating_add(1).saturating_mul(u64::from(need.channels)).saturating_mul(4));
+        if bytes > 128 * 1024 * 1024 {
+            return Err(EngineError::Other("Embedded AAF Save exceeds the audio memory budget; use Save As .fcproj or export linked audio".into()));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_audio_document(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str, document: bool) -> Result<(Vec<AudioEssence>, Vec<String>)> {
     check_linked_streams(s, seq, plan)?;
     let mut needs = audio_needs(
         &s.project,
@@ -398,6 +454,10 @@ pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str
     );
     let mut essence = Vec::new();
     let mut files = Vec::new();
+    let mut document_pcm_bytes = 0usize;
+    if document && plan.mode == AudioMode::Embedded {
+        check_document_audio_budget(&needs, plan.sample_rate)?;
+    }
     let mut used = std::collections::HashSet::new();
     let total = needs.len() as u64;
     for (index, need) in needs.iter_mut().enumerate() {
@@ -417,6 +477,22 @@ pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str
             continue;
         }
         let rendered = plan.render_effects || plan.preserve_mix || nest || timing;
+        if document
+            && plan.mode == AudioMode::Embedded
+            && !rendered
+            && let Some(original) = original_wav(s, need)?
+        {
+            let bytes = match &original.data {
+                EssenceData::Embedded(pcm) => pcm.len(),
+                EssenceData::File { .. } => 0,
+            };
+            document_pcm_bytes = document_pcm_bytes.saturating_add(bytes);
+            if document_pcm_bytes > 128 * 1024 * 1024 {
+                return Err(EngineError::Other("Embedded AAF Save exceeds the audio memory budget".into()));
+            }
+            essence.push(original);
+            continue;
+        }
         if rendered
             && let EssenceKey::Clip(id) = need.key
             && let Some((_, _, c)) = audio_clip(&s.project, seq, id)
@@ -447,6 +523,12 @@ pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str
         };
         for (ch, chans) in groups {
             let pcm = quantize(&chans, plan.bits);
+            if document && plan.mode == AudioMode::Embedded {
+                document_pcm_bytes = document_pcm_bytes.saturating_add(pcm.len());
+                if document_pcm_bytes > 128 * 1024 * 1024 {
+                    return Err(EngineError::Other("Embedded AAF Save exceeds the audio memory budget".into()));
+                }
+            }
             let n = chans.len() as u32;
             let data = match plan.mode {
                 AudioMode::Embedded => EssenceData::Embedded(pcm),
@@ -729,7 +811,7 @@ pub(crate) fn export_aaf_at(s: &mut Session, p: &Value, media_override: Option<&
         let (mix, files) = prepare_mixdown_audio(s, seq, &plan, &media_dir)?;
         (Vec::new(), Some(mix), files)
     } else {
-        let (essence, files) = prepare_audio(s, seq, &plan, &media_dir)?;
+        let (essence, files) = prepare_audio_document(s, seq, &plan, &media_dir, bool_p(p, "documentSave").unwrap_or(false))?;
         (essence, None, files)
     };
     files.extend(written);
@@ -748,15 +830,27 @@ pub(crate) fn export_aaf_at(s: &mut Session, p: &Value, media_override: Option<&
     let printed = if plan.preserve_mix && !full_mix { Some(printed_clip_project(s, seq, plan.sample_rate)?) } else { None };
     let project = printed.as_ref().unwrap_or(&s.project);
     let (bytes, mut report) = filmcraft_interchange::aaf::export(project, seq, &opts).map_err(|e| EngineError::Other(e.to_string()))?;
+    if bool_p(p, "documentSave").unwrap_or(false) && bytes.len() as u64 > crate::aaf_document::MAX_DOCUMENT_BYTES {
+        return Err(EngineError::Other("The saved AAF would exceed the 256 MiB editing limit; use Save As .fcproj".into()));
+    }
     if printed.is_some() {
         report.info("clip effects, track levels, mute, solo, pan and master level were rendered; editable audio events are preserved");
-    } else if !plan.preserve_mix {
+    } else if !plan.preserve_mix && !bool_p(p, "documentSave").unwrap_or(false) {
         report.warn("mix matching is disabled: track, bus and master mixer processing is not preserved");
     }
+    if bool_p(p, "documentSave").unwrap_or(false) && report.warnings().next().is_some() {
+        let warnings = report.warnings().take(8).map(|entry| entry.message.chars().take(512).collect::<String>()).collect::<Vec<_>>().join("; ");
+        return Err(EngineError::Other(format!("AAF cannot retain all current edits: {warnings}. Use Save As .fcproj to keep them")));
+    }
     check_cancel(s)?;
+    crate::aaf_document::check_expected(&*s.services, p)?;
     s.services.write_file(&path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-    Ok(json!({"path": path, "bytes": bytes.len(), "mediaFiles": files, "report": report_json(&report),
-        "preserveMix": plan.preserve_mix, "audioLayout": if full_mix { "mixdown" } else { "clips" }}))
+    let mut output = json!({"path": path, "bytes": bytes.len(), "mediaFiles": files, "report": report_json(&report),
+        "preserveMix": plan.preserve_mix, "audioLayout": if full_mix { "mixdown" } else { "clips" }});
+    if bool_p(p, "documentSave").unwrap_or(false) {
+        output["documentFingerprint"] = json!(crate::aaf_document::fingerprint(&bytes));
+    }
+    Ok(output)
 }
 
 /// `file.exportOmf`

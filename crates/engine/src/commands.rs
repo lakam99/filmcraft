@@ -1995,7 +1995,7 @@ fn build() -> Vec<CommandSpec> {
             let path = s.path.clone().ok_or_else(|| bad("file.revert", "project was never saved"))?;
             let keep = s.state.active_sequence;
             let r = open_project(s, &path)?;
-            if let Some(k) = keep.filter(|k| s.project.sequence(*k).is_some()) {
+            if let Some(k) = keep.filter(|k| !crate::aaf_document::is_aaf_path(&path) && s.project.sequence(*k).is_some()) {
                 s.state.active_sequence = Some(k);
                 s.state.open_sequences = vec![k];
             }
@@ -5379,6 +5379,9 @@ fn name_project(p: &mut filmcraft_project::Project, name: String) {
 }
 
 fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
+    if crate::aaf_document::is_aaf_path(path) {
+        return crate::aaf_document::save(s, path, adopt);
+    }
     let t0 = web_time::Instant::now();
     // Save As renames the project after its new file (not an edit: no undo step, not dirty).
     if adopt
@@ -5402,6 +5405,7 @@ fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
     }
     s.services.write_file(path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     if adopt {
+        s.aaf_document = Default::default();
         s.path = Some(path.to_string());
         s.previews_follow_path();
         s.note_recent_project();
@@ -5418,6 +5422,7 @@ fn schema_backup_path(path: &str, schema: u32) -> String {
 
 /// Make `proj` the session's project (fresh history, media pool and editor state).
 pub(crate) fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Option<String>, clean: bool) {
+    s.aaf_document = Default::default();
     let proxies = s.media.use_proxies();
     s.media = std::sync::Arc::new(crate::MediaPool::default());
     s.media.set_use_proxies(proxies);
@@ -5447,6 +5452,9 @@ pub(crate) fn install_project(s: &mut Session, proj: filmcraft_project::Project,
 }
 
 fn open_project(s: &mut Session, path: &str) -> Result<Value> {
+    if crate::aaf_document::is_aaf_path(path) {
+        return crate::aaf_document::open(s, path);
+    }
     let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let loaded = filmcraft_format::decode(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let (from, migrated) = (loaded.schema_version, loaded.migrated());

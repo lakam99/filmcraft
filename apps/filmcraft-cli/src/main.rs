@@ -103,11 +103,11 @@ SUBCOMMANDS
   --version                     print the version
 
 OPTIONS
-  --project <p.fcproj>          open this project first (headless)
+  --project <p.fcproj|p.aaf>    open this project first (headless)
   --demo                        open the built-in demo project (headless)
   --save                        save the project back to --project when done; runs saving one
                                 project take turns, so each edits what the last one saved
-  --save-as <p.fcproj>          save the project to this path when done
+  --save-as <p.fcproj|p.aaf>    save the project to this path when done
   --bridge <127.0.0.1:PORT>     send commands to the running app (`filmcraft --control PORT`)
   --data-dir <dir>              FilmCraft data directory for user export presets (headless;
                                 default: the app's data directory)

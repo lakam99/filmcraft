@@ -30,7 +30,7 @@ fn is_file_media(item: &filmcraft_project::ProjectItem) -> bool {
 
 /// Write embedded audio without replacing an occupied path; return the path used. A numbered
 /// name changes only the file name: the folder keeps its separators as written (`/` or `\`).
-fn write_embedded_audio(s: &Session, path: &str, wav: &[u8]) -> Result<String> {
+fn write_embedded_audio(s: &Session, path: &str, wav: &[u8], reuse_identical: bool) -> Result<String> {
     let (folder, name) = path.split_at(path.rfind(['/', '\\']).map_or(0, |i| i + 1));
     if matches!(name, "" | "." | "..") {
         return Err(EngineError::Other(format!("{path}: missing audio file name")));
@@ -43,7 +43,16 @@ fn write_embedded_audio(s: &Session, path: &str, wav: &[u8]) -> Result<String> {
         let candidate = if number == 1 { path.to_owned() } else { format!("{folder}{stem} ({number}){extension}") };
         match s.services.write_file_new(&candidate, wav) {
             Ok(()) => return Ok(candidate),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Reopening a document is frequent. Reuse only an exact byte match; modified
+                // or unrelated audio is never replaced or adopted as the embedded original.
+                if reuse_identical
+                    && s.services.file_size(&candidate).ok() == Some(wav.len() as u64)
+                    && s.services.read_range(&candidate, 0, wav.len().saturating_add(1)).is_ok_and(|bytes| bytes == wav)
+                {
+                    return Ok(candidate);
+                }
+            }
             Err(e) => return Err(EngineError::Other(format!("{candidate}: {e}"))),
         }
     }
@@ -55,6 +64,14 @@ fn write_embedded_audio(s: &Session, path: &str, wav: &[u8]) -> Result<String> {
 /// into `bin` (the Project panel's current bin, as for media files); the root when it is `None`
 /// or no longer exists.
 pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format, bin: Option<BinId>) -> Result<Value> {
+    import_inner(s, path, bytes, format, bin, false)
+}
+
+pub(crate) fn open_aaf_document(s: &mut Session, path: &str, bytes: &[u8]) -> Result<Value> {
+    import_inner(s, path, bytes, Format::Aaf, None, true)
+}
+
+fn import_inner(s: &mut Session, path: &str, bytes: &[u8], format: Format, bin: Option<BinId>, reuse_identical: bool) -> Result<Value> {
     let p = std::path::Path::new(path);
     // A relative document is taken from the working directory, as `doc_path::resolve` takes it.
     // Its media paths then come out absolute, and following them as paths stored in the document
@@ -65,18 +82,20 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format, bin: Op
         name: p.file_stem().map(|n| n.to_string_lossy().to_string()),
         ..Default::default()
     };
+    let mut extracted_count = 0;
     let (fragment, report) = match format {
         // AAF / OMF may embed audio: write it next to the document (the media items point there)
         Format::Aaf | Format::Omf => {
             let r = if format == Format::Aaf { filmcraft_interchange::aaf::import(bytes, &opts) } else { filmcraft_interchange::omf::import(bytes, &opts) };
             let (mut fragment, extracted, report) = r.map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            extracted_count = extracted.len();
             for m in extracted {
                 let media = fragment
                     .project
                     .item_mut(m.item)
                     .and_then(|item| item.as_media_mut())
                     .ok_or_else(|| EngineError::Other(format!("{}: embedded audio has no media item", m.path)))?;
-                let written_path = write_embedded_audio(s, &m.path, &m.wav)?;
+                let written_path = write_embedded_audio(s, &m.path, &m.wav, reuse_identical)?;
                 if written_path != m.path {
                     media.media = MediaRef::File { path: written_path };
                 }
@@ -166,8 +185,10 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format, bin: Op
         "format": format.name(),
         "sequences": seqs.iter().map(|i| i.0).collect::<Vec<_>>(),
         "linkedMedia": linked,
+        "extractedMedia": extracted_count,
         "offlineMedia": offline,
         "report": report_json(&report),
+        "warnings": report.warnings().map(|entry| entry.message.clone()).collect::<Vec<_>>(),
     }))
 }
 
@@ -247,7 +268,7 @@ mod embedded_audio_tests {
         files.0.lock().unwrap().insert("/files/cut Audio.wav".into(), b"first".to_vec());
         files.0.lock().unwrap().insert("/files/cut Audio (2).wav".into(), b"second".to_vec());
         let session = Session::new(files.clone());
-        let path = write_embedded_audio(&session, "/files/cut Audio.wav", b"new audio").unwrap();
+        let path = write_embedded_audio(&session, "/files/cut Audio.wav", b"new audio", false).unwrap();
         assert_eq!(path, "/files/cut Audio (3).wav");
         let stored = files.0.lock().unwrap();
         assert_eq!(stored["/files/cut Audio.wav"], b"first");
@@ -261,7 +282,7 @@ mod embedded_audio_tests {
             let files = Arc::new(VirtualFiles::default());
             files.0.lock().unwrap().insert(path.into(), b"first".to_vec());
             let session = Session::new(files.clone());
-            let numbered = write_embedded_audio(&session, path, b"new audio").unwrap();
+            let numbered = write_embedded_audio(&session, path, b"new audio", false).unwrap();
             assert_eq!(numbered, path.replace("cut Audio.wav", "cut Audio (2).wav"));
             assert_eq!(files.0.lock().unwrap()[path], b"first");
         }

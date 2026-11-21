@@ -111,7 +111,9 @@ impl FileDialog {
     /// `None` for dialogs that don't save, or that accept any name.
     fn save_extensions(&self) -> Option<Vec<String>> {
         match self {
-            Self::SaveProject { .. } => Some(vec!["fcproj".to_string()]),
+            Self::SaveProject { name } => {
+                Some(if filmcraft_engine::aaf_document::is_aaf_path(name) { strings(&["aaf", "fcproj"]) } else { strings(&["fcproj", "aaf"]) })
+            }
             Self::SaveAs { exts, adds_ext: true, .. } if exts.iter().any(|e| !e.is_empty() && e != "*") => Some(exts.clone()),
             _ => None,
         }
@@ -279,6 +281,14 @@ mod tests {
 
     fn exts(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn aaf_project_dialog_preserves_the_format_and_allows_native_save_as() {
+        let extensions = super::FileDialog::SaveProject { name: "Synced.aaf".into() }.save_extensions().unwrap();
+        assert_eq!(with_save_extension("Synced", &extensions), "Synced.aaf");
+        assert_eq!(with_save_extension("Synced.AAF", &extensions), "Synced.AAF");
+        assert_eq!(with_save_extension("Synced.fcproj", &extensions), "Synced.fcproj");
     }
 
     #[test]

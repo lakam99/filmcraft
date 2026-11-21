@@ -116,6 +116,45 @@ fn wave() -> Vec<u8> {
     bytes
 }
 
+#[test]
+fn aaf_documents_save_through_the_native_worker_and_acknowledge_the_saved_revision() {
+    let directory = Directory::new();
+    let source = directory.path("lav.wav");
+    std::fs::write(&source, wave()).unwrap();
+    let path = directory.path("session.aaf");
+    let mut original = Session::default();
+    original.execute("file.newSequence", json!({"fps":25,"sampleRate":8000,"video":0,"audio":1})).unwrap();
+    let item = original.execute("file.import", json!({"paths":[source]})).unwrap()["items"][0].clone();
+    original.execute("timeline.place", json!({"item":item,"track":"A1","seconds":0,"video":false})).unwrap();
+    original.execute("file.saveAs", json!({"path":path})).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let mut session = Session::default();
+    session.execute("file.open", json!({"path":path})).unwrap();
+    enable(&mut session);
+    let sequence = session.state.active_sequence.unwrap();
+    let aligned = filmcraft_time::FrameRate::FPS_25.tick_of(12);
+    session
+        .edit("Sync lav", |project, _| {
+            project.sequence_mut(sequence).unwrap().audio_tracks[0].items[0].start = aligned;
+            Ok(())
+        })
+        .unwrap();
+    let revision = session.revision;
+    let ack = session.execute("file.save", json!({})).unwrap();
+    let id = ack["job"].as_u64().expect("AAF save uses the native worker");
+    assert!(session.is_dirty(), "submission is not a save acknowledgement");
+    let done = finish(&mut session, id, Duration::from_secs(30));
+    assert!(done["result"]["error"].is_null(), "{done}");
+    session.poll_persistence();
+    assert!(!session.is_dirty());
+    assert_eq!(session.saved_revision, revision);
+    assert_eq!(std::fs::read(ack["backup"].as_str().unwrap()).unwrap(), before);
+    let mut reopened = Session::default();
+    reopened.execute("file.open", json!({"path":path})).unwrap();
+    assert_eq!(reopened.active_sequence().unwrap().audio_tracks[0].items[0].start, aligned);
+}
+
 /// The input exists only in this host. This models a LAN/virtual source without handing the
 /// child a token or copying the entire project media to its filesystem.
 struct Host {

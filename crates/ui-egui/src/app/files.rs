@@ -52,13 +52,18 @@ impl FilmcraftApp {
                 r
             }),
             "file.saveAs" | "file.save" | "file.saveCopy" => {
-                let suggested =
-                    if id == "file.saveCopy" { format!("{} copy.fcproj", self.session.project.name) } else { format!("{}.fcproj", self.session.project.name) };
+                let extension = if self.session.path.as_deref().is_some_and(filmcraft_engine::aaf_document::is_aaf_path) { "aaf" } else { "fcproj" };
+                let suggested = if id == "file.saveCopy" {
+                    format!("{} copy.{extension}", self.session.project.name)
+                } else {
+                    format!("{}.{extension}", self.session.project.name)
+                };
                 let cmd = if id == "file.saveCopy" { "file.saveCopy" } else { "file.saveAs" };
                 self.pick(FileDialog::SaveProject { name: suggested }, move |app, paths| {
                     let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
                     let r = app.session.execute(cmd, json!({"path": path})).map_err(|e| e.to_string());
                     match &r {
+                        Ok(value) if value.get("job").is_some() => app.ui.status = "Saving AAF…".into(),
                         Ok(_) => crate::menus::saved_status(app, cmd, &path),
                         Err(e) => app.ui.status = e.clone(),
                     }

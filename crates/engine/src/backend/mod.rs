@@ -181,7 +181,8 @@ pub(crate) fn start_interchange(s: &mut Session, omf: bool, params: &Value) -> R
     let path = params.get("path").and_then(Value::as_str).ok_or_else(|| EngineError::Other("an export path is required".into()))?.to_string();
     let task = Task::Interchange { omf, params: params.clone(), media_dir: None };
     let name = if omf { "OMF" } else { "AAF" };
-    let id = start(s, s.project.clone(), task, format!("Export {name}"))?;
+    let verb = if params["documentSave"].as_bool() == Some(true) { "Save" } else { "Export" };
+    let id = start(s, s.project.clone(), task, format!("{verb} {name}"))?;
     Ok(json!({"job":id, "path":path, "poll":"jobs.list", "cancel":"jobs.cancel", "background":true}))
 }
 
@@ -348,13 +349,17 @@ fn run(mut work: Work, progress: &Arc<Progress>) -> std::result::Result<Completi
     }
     let mut stage = staging::Stage::prepare(&mut work.task)?;
     work.snapshot.stored_paths = work.pool.stored_snapshot();
-    let mut child = client::Client::start(&work.executable, work.services, work.state)?;
+    let mut child = client::Client::start(&work.executable, work.services.clone(), work.state)?;
     child.request(Request::Run { snapshot: work.snapshot, task: work.task.clone() }, &[])?;
     let mut completion = child.finish(progress)?;
     if progress.cancel.load(Ordering::Acquire) {
         return Err("cancelled".into());
     }
     if let Some(stage) = &mut stage {
+        // An editor Save may finish after another program changed its source AAF.
+        if let Task::Interchange { params, .. } = &work.task {
+            crate::aaf_document::check_expected(&*work.services, params).map_err(|error| error.to_string())?;
+        }
         stage.publish(&mut completion)?;
     }
     if let Task::Preview { directory, .. } = &work.task {

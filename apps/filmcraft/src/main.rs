@@ -326,8 +326,9 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
                 .map(|p| p.to_string_lossy().to_string())
         }));
         app.hooks.pick_save = Some(Box::new(|name: &str| {
+            let exts = if filmcraft_engine::aaf_document::is_aaf_path(name) { ["aaf", "fcproj"] } else { ["fcproj", "aaf"] };
             rfd::FileDialog::new()
-                .add_filter(filmcraft_ui_egui::i18n::t("FilmCraft Project"), &file_filters::extensions(&["fcproj"]))
+                .add_filter(filmcraft_ui_egui::i18n::t("FilmCraft Project"), &file_filters::extensions(&exts))
                 .set_file_name(name)
                 .save_file()
                 .map(|p| p.to_string_lossy().to_string())
@@ -376,7 +377,7 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
         }));
         app.hooks.pick_open_project = Some(Box::new(|| {
             rfd::FileDialog::new()
-                .add_filter(filmcraft_ui_egui::i18n::t("FilmCraft Project"), &file_filters::extensions(&["fcproj"]))
+                .add_filter(filmcraft_ui_egui::i18n::t("FilmCraft Project"), &file_filters::extensions(&["fcproj", "aaf"]))
                 // #1644: where the system MIME database doesn't know `.fcproj`, the project
                 // filter hides every saved project; "All files" keeps them reachable.
                 .add_filter(filmcraft_ui_egui::i18n::t("All files"), &file_filters::all_files())
@@ -547,7 +548,14 @@ fn run_dialog_off_thread(dialog: filmcraft_ui_egui::native_dialogs::FileDialog) 
                     .into_iter()
                     .collect(),
                 FileDialog::SaveProject { name } => {
-                    rfd::FileDialog::new().add_filter(&project, &project_exts).set_file_name(name).save_file().map(path).into_iter().collect()
+                    let exts = if filmcraft_engine::aaf_document::is_aaf_path(&name) { ["aaf", "fcproj"] } else { ["fcproj", "aaf"] };
+                    rfd::FileDialog::new()
+                        .add_filter(&project, &file_filters::extensions(&exts))
+                        .set_file_name(name)
+                        .save_file()
+                        .map(path)
+                        .into_iter()
+                        .collect()
                 }
                 FileDialog::SaveAs { filter, exts, name, .. } => {
                     rfd::FileDialog::new().add_filter(&filter, &exts).set_file_name(name).save_file().map(path).into_iter().collect()
@@ -595,7 +603,7 @@ fn prepare_dialog(dialog: filmcraft_ui_egui::native_dialogs::FileDialog) -> film
 /// The project dialogs' filter patterns (`EDIT.FCPROJ` included).
 #[cfg(target_os = "linux")]
 fn project_patterns() -> Vec<String> {
-    file_filters::extensions(&["fcproj"])
+    file_filters::extensions(&["fcproj", "aaf"])
 }
 
 #[cfg(test)]

@@ -370,6 +370,15 @@ fn frames(ui: &mut egui::Ui, elems: &mut Elems, pre: &str, p: &mut Value, key: &
     });
 }
 
+fn remember_save_job(params: &mut Value, result: &Value) {
+    if !params.is_object() {
+        *params = json!({});
+    }
+    if let Some(params) = params.as_object_mut() {
+        params.insert("__saveJob".into(), result["job"].clone());
+    }
+}
+
 /// Draw the open dialog, if any.
 pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let Some(mut d) = app.ui.clip_dialog.clone() else { return };
@@ -383,6 +392,27 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     if d.info["project"].as_u64().is_some_and(|p| p != app.session.document_epoch) {
         app.ui.clip_dialog = None;
         return;
+    }
+    // Save may render in the native backend. Do not close/open/quit until the host has
+    // acknowledged that exact document revision; a failed save must keep the timeline open.
+    let mut saving = false;
+    if let Some(id) = d.params["__saveJob"].as_u64() {
+        let job = app.session.jobs.iter().find(|job| job.id == id).cloned();
+        saving = job.as_ref().is_some_and(|job| !job.progress.finished.load(std::sync::atomic::Ordering::Acquire));
+        if !saving {
+            app.session.poll_persistence();
+            if !app.session.is_dirty() {
+                leave(app, ctx, &d);
+                return;
+            }
+            d.error = job
+                .as_ref()
+                .and_then(|job| job.progress.error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone())
+                .unwrap_or_else(|| "Save did not include the latest edits; save again before closing".into());
+            if let Some(params) = d.params.as_object_mut() {
+                params.remove("__saveJob");
+            }
+        }
     }
     let mut elems: Elems = Vec::new();
     let mut action: Option<&'static str> = None;
@@ -664,6 +694,12 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             }
             "file.closeProject" | "app.quit" | "file.open" => {
                 ui.label(tlf!("Save changes to “{project_name}” before closing?", project_name));
+                if saving {
+                    ui.label("Saving AAF…");
+                }
+                if !d.error.is_empty() {
+                    ui.label(&d.error);
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let r = ui.button(tl!("Cancel"));
@@ -671,12 +707,12 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     if r.clicked() {
                         action = Some("cancel");
                     }
-                    let r = ui.button(tl!("Don't Save"));
+                    let r = ui.add_enabled(!saving, egui::Button::new(tl!("Don't Save")));
                     push(&mut elems, format!("{pre}.dontSave"), &r, "Don't Save");
                     if r.clicked() {
                         action = Some("dontSave");
                     }
-                    let r = ui.add_enabled(can_save, egui::Button::new(tl!("Save")));
+                    let r = ui.add_enabled(can_save && !saving, egui::Button::new(tl!("Save")));
                     push(&mut elems, format!("{pre}.save"), &r, "Save");
                     if r.clicked() {
                         action = Some("save");
@@ -743,10 +779,19 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
         Some("save") => {
             if app.session.path.is_some() {
                 // the save failed: the prompt stays, with the reason in the status bar
-                if let Err(e) = app.session.execute("file.save", json!({})) {
-                    app.ui.status = e.to_string();
-                    app.ui.clip_dialog = Some(d);
-                    return;
+                match app.session.execute("file.save", json!({})) {
+                    Err(e) => {
+                        d.error = e.to_string();
+                        app.ui.status = e.to_string();
+                        app.ui.clip_dialog = Some(d);
+                        return;
+                    }
+                    Ok(value) if value["job"].as_u64().is_some() => {
+                        remember_save_job(&mut d.params, &value);
+                        app.ui.clip_dialog = Some(d);
+                        return;
+                    }
+                    Ok(_) => {}
                 }
                 leave(app, ctx, &d);
                 return;
@@ -766,7 +811,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 // a newer prompt (Quit asked while Close Project's dialog was open) is the one to
                 // finish or to show again
                 let newer = matches!(app.ui.clip_dialog.as_ref().map(|c| c.command.as_str()), Some("app.quit" | "file.closeProject" | "file.open"));
-                let prompt = if newer { app.ui.clip_dialog.take().unwrap_or(prompt) } else { prompt };
+                let mut prompt = if newer { app.ui.clip_dialog.take().unwrap_or(prompt) } else { prompt };
                 let Some(path) = paths.into_iter().next() else {
                     // cancelled: the prompt again, unless another dialog is open now
                     if app.ui.clip_dialog.is_none() {
@@ -776,6 +821,10 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 };
                 let r = app.session.execute("file.saveAs", json!({"path": path})).map_err(|e| e.to_string());
                 match &r {
+                    Ok(value) if value["job"].as_u64().is_some() => {
+                        remember_save_job(&mut prompt.params, value);
+                        app.ui.clip_dialog = Some(prompt);
+                    }
                     Ok(_) if !app.session.is_dirty() => leave(app, &ctx2, &prompt),
                     Ok(_) => app.ui.clip_dialog = Some(prompt),
                     // the save failed: the prompt stays, with the reason in the status bar
