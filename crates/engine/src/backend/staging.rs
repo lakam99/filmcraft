@@ -59,6 +59,12 @@ impl Stage {
         match task {
             Task::Interchange { params, media_dir, .. } => {
                 params["path"] = staged_path.into();
+                // The host checks absence at publication using the original parameters.
+                // Source-broker errors in the child do not preserve NotFound, so it cannot
+                // reliably distinguish a new destination from an inaccessible existing one.
+                if let Some(params) = params.as_object_mut() {
+                    params.remove("documentAbsentPath");
+                }
                 *media_dir = stage.media.as_ref().map(|p| p.to_string_lossy().into_owned());
             }
             Task::Media { settings, .. } => settings.path = staged_path,

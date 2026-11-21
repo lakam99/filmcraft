@@ -710,6 +710,7 @@ pub fn invoke_command(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut
         || (id == "file.importImageSequence" && params.get("path").is_none())
         || (id == "file.saveAs" && params.get("path").is_none())
         || (id == "file.saveCopy" && params.get("path").is_none())
+        || (id == "sequence.saveAaf" && params.get("path").is_none())
         || (id == "file.open" && params.get("path").is_none())
         || (id == "file.save" && params.get("path").is_none() && app.session.path.is_none())
         || (id == "captions.import" && params.get("path").is_none())
@@ -726,12 +727,19 @@ pub fn invoke_command(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut
     if r.is_ok() {
         let path = save_path.or_else(|| app.session.path.clone());
         if let Some(path) = path {
-            if r.as_ref().is_ok_and(|value| value.get("job").is_some()) && matches!(id, "file.save" | "file.saveAs" | "file.saveCopy" | "file.saveAll") {
+            if r.as_ref().is_ok_and(|value| value.get("job").is_some())
+                && matches!(id, "file.save" | "file.saveAs" | "file.saveCopy" | "file.saveAll" | "sequence.saveAaf")
+            {
                 app.ui.status = "Saving AAF…".into();
             } else {
                 saved_status(app, id, &path);
             }
         }
+    }
+    if id == "sequence.saveAaf"
+        && let Ok(value) = &r
+    {
+        sequence_aaf_status(app, value);
     }
     if r.is_ok() && matches!(id, "playhead.start" | "playhead.end") {
         crate::panels::timeline::reveal_playhead(app, ctx);
@@ -754,7 +762,25 @@ pub(crate) fn saved_status(app: &mut FilmcraftApp, id: &str, path: &str) {
     match id {
         "file.save" | "file.saveAs" | "file.saveAll" => app.ui.status = tlf!("Project saved to {path}", path),
         "file.saveCopy" => app.ui.status = tlf!("Copy of the project saved to {path}", path),
+        "sequence.saveAaf" => app.ui.status = tlf!("Sequence saved to AAF: {path}", path),
         _ => {}
+    }
+}
+
+/// A foreign AAF replacement reports the imported objects that will be omitted before writing.
+pub(crate) fn sequence_aaf_status(app: &mut FilmcraftApp, value: &Value) {
+    if value["needsConfirmation"].as_bool() == Some(true) {
+        app.ui.clip_dialog = Some(crate::state::ClipDialogDraft {
+            command: "sequence.saveAaf".into(),
+            params: json!({"path":value["path"],"sequence":value["sequence"],"expectedTarget":value["expectedTarget"],"replaceUnsupported":true}),
+            info: json!({"project":app.session.document_epoch,"warnings":value["warnings"]}),
+            error: String::new(),
+        });
+        app.ui.status = "Confirm AAF replacement".into();
+    } else if value["job"].as_u64().is_some() {
+        app.ui.status = "Saving sequence to AAF…".into();
+    } else if let Some(path) = value["path"].as_str() {
+        saved_status(app, "sequence.saveAaf", path);
     }
 }
 

@@ -217,6 +217,121 @@ fn audio_session(directory: &Directory, blocked: bool) -> (Session, Arc<Host>) {
 }
 
 #[test]
+fn sequence_aaf_save_uses_the_worker_snapshot_without_cleaning_the_project() {
+    let directory = Directory::new();
+    let (mut session, _) = audio_session(&directory, false);
+    let selected = session.state.active_sequence.unwrap();
+    session.execute("file.newSequence", json!({"name":"Other sequence"})).unwrap();
+    let other = session.state.active_sequence;
+    let native = directory.path("multiple.fcproj");
+    session.execute("file.saveAs", json!({"path":native})).unwrap();
+    let aligned = filmcraft_time::FrameRate::FPS_25.tick_of(12);
+    session
+        .edit("Align lav", |project, _| {
+            project.sequence_mut(selected).unwrap().audio_tracks[0].items[0].start = aligned;
+            Ok(())
+        })
+        .unwrap();
+    let saved_revision = session.saved_revision;
+    let destination = directory.path("selected.aaf");
+    let ack = session.execute("sequence.saveAaf", json!({"path":destination,"sequence":selected.0})).unwrap();
+    session.state.active_sequence = other;
+    session
+        .edit("Continue editing", |project, _| {
+            project.sequence_mut(selected).unwrap().audio_tracks[0].items[0].start = filmcraft_time::Tick::ZERO;
+            Ok(())
+        })
+        .unwrap();
+    let done = finish(&mut session, ack["job"].as_u64().unwrap(), Duration::from_secs(30));
+    assert!(done["result"]["error"].is_null(), "{done}");
+    session.poll_persistence();
+    assert_eq!(session.path.as_deref(), native.to_str());
+    assert_eq!(session.saved_revision, saved_revision);
+    assert!(session.is_dirty());
+    assert_eq!(session.project.sequences().count(), 2);
+    assert_eq!(session.state.active_sequence, other);
+    let mut reopened = Session::default();
+    reopened.execute("file.open", json!({"path":destination})).unwrap();
+    assert_eq!(reopened.project.sequences().count(), 1);
+    assert_eq!(reopened.active_sequence().unwrap().audio_tracks[0].items[0].start, aligned);
+}
+
+#[test]
+fn sequence_aaf_save_does_not_replace_a_destination_created_during_the_worker_job() {
+    struct DestinationGate {
+        path: String,
+        checks: AtomicU64,
+        entered: AtomicBool,
+        blocked: Mutex<bool>,
+        wake: Condvar,
+    }
+    impl DestinationGate {
+        fn release(&self) {
+            *self.blocked.lock().unwrap() = false;
+            self.wake.notify_all();
+        }
+    }
+    impl Services for DestinationGate {
+        fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+            FsServices.read_file(path)
+        }
+        fn write_file(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+            FsServices.write_file(path, bytes)
+        }
+        fn file_size(&self, path: &str) -> std::io::Result<u64> {
+            // The frontend's first check permits a new filename. Pause the host's final
+            // publication check, regardless of whether linked audio needs any source reads.
+            if path == self.path && self.checks.fetch_add(1, Ordering::AcqRel) > 0 {
+                self.entered.store(true, Ordering::Release);
+                let mut blocked = self.blocked.lock().unwrap();
+                while *blocked {
+                    blocked = self.wake.wait(blocked).unwrap();
+                }
+            }
+            FsServices.file_size(path)
+        }
+    }
+    struct Unblock(Arc<DestinationGate>);
+    impl Drop for Unblock {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    let directory = Directory::new();
+    let destination = directory.path("new.aaf");
+    let host = Arc::new(DestinationGate {
+        path: destination.to_string_lossy().into_owned(),
+        checks: AtomicU64::new(0),
+        entered: AtomicBool::new(false),
+        blocked: Mutex::new(true),
+        wake: Condvar::new(),
+    });
+    let source = directory.path("lav.wav");
+    std::fs::write(&source, wave()).unwrap();
+    let mut session = Session::new(host.clone());
+    let _release = Unblock(host.clone());
+    session.execute("file.newSequence", json!({"fps":25,"sampleRate":8000,"video":0,"audio":1})).unwrap();
+    let item = session.execute("file.import", json!({"paths":[source]})).unwrap()["items"][0].clone();
+    session.execute("timeline.place", json!({"item":item,"track":"A1","seconds":0,"video":false})).unwrap();
+    enable(&mut session);
+    let ack = session.execute("sequence.saveAaf", json!({"path":destination})).unwrap();
+    let id = ack["job"].as_u64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !host.entered.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "worker never reached publication: {}", job(&mut session, id));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(&destination, b"Saved by another application").unwrap();
+    host.release();
+    let done = finish(&mut session, id, Duration::from_secs(30));
+    assert!(done["result"]["error"].as_str().unwrap().contains("appeared"), "{done}");
+    session.poll_persistence();
+    assert_eq!(std::fs::read(destination).unwrap(), b"Saved by another application");
+    assert!(session.is_dirty());
+    assert_eq!(session.path, None);
+}
+
+#[test]
 fn blocked_backend_source_does_not_block_frontend_or_cancel_or_replace_previous_aaf() {
     let directory = Directory::new();
     let (mut session, host) = audio_session(&directory, true);
