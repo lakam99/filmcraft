@@ -90,6 +90,19 @@ fn run(snapshot: Snapshot, task: Task, broker: Arc<services::Broker>, progress: 
     session.worker_progress = Some(progress.clone());
     let started = Instant::now();
     match task {
+        Task::ColorGroup { operation } => {
+            let plan = crate::grading_groups::calculate(&session, &operation, &progress).map_err(|e| e.to_string())?;
+            let output = serde_json::to_value(plan).map_err(|e| e.to_string())?;
+            let report = Report {
+                path: String::new(),
+                frames: progress.done.load(Ordering::Relaxed),
+                seconds: started.elapsed().as_secs_f64(),
+                bytes: 0,
+                render_fps: 0.0,
+                extra_files: Vec::new(),
+            };
+            Ok(Completion { output, report })
+        }
         Task::Interchange { omf, params, media_dir } => {
             let output = if omf {
                 crate::aaf_omf::export_omf_at(&mut session, &params, media_dir.as_deref())
@@ -147,6 +160,7 @@ fn run(snapshot: Snapshot, task: Task, broker: Arc<services::Broker>, progress: 
 }
 
 pub(super) fn apply_snapshot(session: &mut Session, snapshot: Snapshot) -> Result<(), String> {
+    snapshot.project.check_color_groups()?;
     for item in snapshot.project.sequences() {
         if let Some(sequence) = snapshot.project.sequence(item.id) {
             sequence.settings.validate()?;

@@ -346,6 +346,7 @@ fn adjustment_ops(project: &Project, seq: &Sequence, it: &TrackItem, t: Tick, sc
         project: Some(project),
         env: None,
         frame_rate: seq.settings.frame_rate.as_f64(),
+        gamut: seq.settings.color.working_gamut(),
         working: seq.settings.color.working,
     };
     it.effects
@@ -611,6 +612,7 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
                 project: Some(project),
                 env: None,
                 frame_rate: seq.settings.frame_rate.as_f64(),
+                gamut: seq.settings.color.working_gamut(),
                 working: seq.settings.color.working,
             };
             let ops: Option<Vec<FxOp>> = chain.iter().map(|e| FxOp::eval(e, &cx, lw, lh).filter(FxOp::gpu_ok)).collect();

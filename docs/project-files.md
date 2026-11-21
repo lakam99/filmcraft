@@ -8,7 +8,7 @@ writing them is `crates/format` (`filmcraft-format`); the engine's `file.*` comm
 ```json
 {
   "format": "filmcraft.project",
-  "schema_version": 17,
+  "schema_version": 18,
   "generator": "FilmCraft 0.12.0",
   "project": { "name": "…", "settings": { … }, "root": { … }, "items": { … }, "next_id": 48 },
   "view": { "open_sequences": [21, 50], "active_sequence": 50, "sequences": { "21": { "pps": 40.0, "scroll": 0.0, … } } }
@@ -477,3 +477,18 @@ Markers may store an optional `url` independently of their name and notes. Older
 load with an empty URL. Schema v17 prevents older builds from silently dropping links
 on save. Changing marker type retains the address. Project loading never opens it; the
 Edit Marker dialog offers explicit HTTP(S) browser opening for Web Link markers.
+
+## Shared color grading (schema v18)
+
+`project.color_groups` maps allocated project identities to one static Color Grading look,
+its strength, saved working space/primaries, reference statistics and optional Vibes controls.
+A clip's `grading_group` effect carries `color_group`: a group identity, linear RGB gains,
+bounded static tonal/color correction, and matching-distance statistics. This keeps membership
+and calibration attached through ordinary moves and copies; the creative look resolves from
+the project at render time. Loaded groups and references are validated before the project is
+accepted. Schema 18 prevents older versions from silently discarding this relationship.
+
+Older projects migrate with no groups. The group look is applied after each member's individual
+balancing, in the saved grading gamut; rendering converts to/from another sequence's gamut as
+needed. Vibes offsets derive from a saved static base, never the preceding slider result.
+See [Color by feeling](color-vibes.md) and [grading verification](grading-verification.md).

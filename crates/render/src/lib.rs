@@ -12,6 +12,7 @@
 pub mod audio;
 pub mod audio_fx;
 pub mod blend;
+pub mod color_groups;
 pub mod color_match;
 pub mod colorman;
 pub mod effects;
@@ -35,6 +36,7 @@ mod stretch;
 pub mod track;
 pub mod transitions;
 pub mod vfx;
+pub mod vibes;
 
 use std::sync::Arc;
 
@@ -352,6 +354,7 @@ fn adjustment_layer(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick
         project: Some(project),
         env: None,
         frame_rate: seq.settings.frame_rate.as_f64(),
+        gamut: seq.settings.color.working_gamut(),
         working: seq.settings.color.working,
     };
     let ss = &seq.settings;
@@ -607,6 +610,7 @@ pub(crate) fn item_layer_ex(
             project: Some(project),
             env: Some(&env),
             frame_rate: seq.settings.frame_rate.as_f64(),
+            gamut: seq.settings.color.working_gamut(),
             working: seq.settings.color.working,
         };
         for e in item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e)) {

@@ -97,6 +97,7 @@ impl EffectDef {
             post_fader: false,
             essential: false,
             layer: None,
+            color_group: None,
         }
     }
 }
@@ -118,6 +119,9 @@ pub struct EffectInstance {
     /// ([`crate::graphic_design::LayerExtra`]). Schema v12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer: Option<Box<crate::graphic_design::LayerExtra>>,
+    /// A managed group stage: per-clip balance followed by a shared project look (schema v18).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_group: Option<Box<crate::grading::GradeGroupLink>>,
 }
 
 impl EffectInstance {
@@ -416,6 +420,8 @@ fn build_effects() -> Vec<EffectDef> {
                 f("softness", "Softness", 50.0, 0.0, 100.0, "%"),
             ],
         ),
+        // Managed links are not ordinary, independently applicable effects in the catalog.
+        video("grading_group", "Color Grading Group", &["Internal"], vec![]),
         video(
             "lumetri",
             "Color Grading",

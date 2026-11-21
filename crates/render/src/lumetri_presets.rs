@@ -39,6 +39,7 @@ impl LumetriPreset {
                 post_fader: false,
                 essential: false,
                 layer: None,
+                color_group: None,
             },
         };
         for (k, v) in &self.params {
@@ -229,6 +230,7 @@ pub fn thumbnail(preset: &LumetriPreset, w: usize, h: usize) -> Image {
         project: None,
         env: None,
         frame_rate: 24.0,
+        gamut: (filmcraft_color::WorkingSpace::Rec709).output_space().gamut(),
         working: filmcraft_color::WorkingSpace::Rec709,
     };
     apply(&mut img, &preset.instance(), &cx);

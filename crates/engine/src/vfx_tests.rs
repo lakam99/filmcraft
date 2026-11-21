@@ -49,7 +49,11 @@ fn first_v1_clip(s: &Session) -> u64 {
 }
 
 fn video_effects() -> Vec<&'static filmcraft_project::EffectDef> {
-    effect_defs().iter().filter(|d| d.kind == EffectKind::Video && !d.intrinsic && !filmcraft_project::graphic::is_layer_id(d.id)).collect()
+    // Internal stages (such as a calibrated group link) have their own creation commands/tests.
+    effect_defs()
+        .iter()
+        .filter(|d| d.kind == EffectKind::Video && !d.intrinsic && d.category.first() != Some(&"Internal") && !filmcraft_project::graphic::is_layer_id(d.id))
+        .collect()
 }
 
 #[test]
@@ -57,6 +61,7 @@ fn effects_list_reports_folders_and_badges() {
     let mut s = demo();
     let list = s.execute("effects.list", json!({})).unwrap();
     let arr = list.as_array().unwrap();
+    assert!(arr.iter().all(|effect| effect["id"] != "grading_group"), "managed links must not be advertised as generic effects");
     let find = |id: &str| arr.iter().find(|e| e["id"] == id).cloned().unwrap_or_else(|| panic!("{id} not listed"));
     let wsz = find("warp_stabilizer");
     assert_eq!(wsz["folder"], "Distort");

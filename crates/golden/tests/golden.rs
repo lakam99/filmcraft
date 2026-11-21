@@ -26,6 +26,9 @@ const W: u32 = 320;
 const H: u32 = 180;
 const RATE: FrameRate = FrameRate::FPS_24;
 
+#[path = "support/grading.rs"]
+mod grading;
+
 /// A procedurally generated project and the frame to render.
 struct Scene {
     project: Project,

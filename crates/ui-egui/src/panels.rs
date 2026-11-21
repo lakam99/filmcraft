@@ -14,6 +14,7 @@ pub mod events;
 pub mod export_mode;
 pub mod file_dialogs;
 pub mod frame_export;
+mod grading_vibes;
 pub mod graphics;
 pub mod graphics_templates;
 pub mod import_mode;

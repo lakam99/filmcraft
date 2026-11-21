@@ -250,6 +250,7 @@ pub fn transform_fx(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
             project: cx.project,
             env: cx.env,
             frame_rate: cx.frame_rate,
+            gamut: cx.gamut,
             working: cx.working,
         };
         let anchor = crate::effects::point(e, "anchor", &cx2, im);

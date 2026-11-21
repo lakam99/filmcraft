@@ -24,6 +24,7 @@ impl Driver {
     fn demo() -> Self {
         let mut session = Session::default();
         session.execute("file.openDemoProject", json!({})).expect("demo project");
+        session.prefs.color.grading_advanced = true;
         let (tx, rx) = channel();
         let app = FilmcraftApp::new(session).with_control(rx);
         let snapshots = std::env::var_os("FILMCRAFT_UI_SNAPSHOT_DIR").map(std::path::PathBuf::from);
@@ -135,11 +136,102 @@ fn select_first_clip(d: &mut Driver) -> u64 {
     clip
 }
 
+#[test]
+fn grading_vibes_is_the_default_and_shares_its_grade_with_advanced() {
+    assert!(!Session::default().prefs.color.grading_advanced);
+    let mut d = Driver::demo();
+    d.exec("prefs.set", json!({"key":"color.gradingAdvanced","value":false}));
+    d.ok("ui.set", json!({"workspace":"Color"}));
+    let clip = select_first_clip(&mut d);
+    d.frames(3);
+    assert!(d.element("lumetri.group.create").is_some());
+    assert!(d.element("lumetri.vibe.style.warm-cozy").is_some());
+    d.snapshot("color-vibes-start", None);
+    d.click("lumetri.vibe.style.warm-cozy");
+    let groups = d.exec("lumetri.group.list", json!({}));
+    let group = groups["groups"][0]["group"].as_u64().unwrap();
+    assert_eq!(groups["groups"][0]["style"], "warm-cozy");
+    let [left, _, left_width, _] = d.element("lumetri.vibe.style.natural").unwrap();
+    let [right, _, right_width, _] = d.element("lumetri.vibe.style.warm-cozy").unwrap();
+    let slider_width = d.element("lumetri.vibe.brightness").unwrap()[2];
+    assert!(
+        left_width > 0.0 && slider_width >= (right + right_width - left) * 0.85,
+        "the slider rail must fill the mood-card width, rather than remaining a tiny default-length control"
+    );
+    assert!(
+        d.harness
+            .state()
+            .session
+            .active_sequence()
+            .unwrap()
+            .find_item(filmcraft_project::ClipId(clip))
+            .unwrap()
+            .1
+            .effects
+            .iter()
+            .any(|e| e.color_group.is_some())
+    );
+    let expected = d.harness.state().session.render_program(0.125).unwrap();
+    d.snapshot("color-vibes-warm", None);
+    d.click("lumetri.view.advanced");
+    assert!(d.harness.state().session.prefs.color.grading_advanced);
+    assert_eq!(d.harness.state().session.render_program(0.125).unwrap().px, expected.px);
+    d.exec("lumetri.group.setParam", json!({"group":group,"param":"exposure","value":0.5}));
+    let advanced = d.harness.state().session.render_program(0.125).unwrap();
+    assert_ne!(advanced.px, expected.px);
+    d.snapshot("color-vibes-advanced-shared", None);
+    d.click("lumetri.view.vibes");
+    assert_eq!(d.harness.state().session.render_program(0.125).unwrap().px, advanced.px);
+    // A real slider gesture changes the common grade and undoes in one step.
+    d.ok("ui.scroll", json!({"id":"lumetri.vibe.style.warm-cozy","dy":-400.0}));
+    d.frames(5);
+    d.ok("ui.click", json!({"id":"lumetri.vibe.brightness","fx":0.8,"fy":0.5}));
+    d.frames(3);
+    assert_ne!(d.harness.state().session.render_program(0.125).unwrap().px, advanced.px);
+    d.snapshot("color-vibes-adjustments", None);
+    d.exec("edit.undo", json!({}));
+    assert_eq!(d.harness.state().session.render_program(0.125).unwrap().px, advanced.px);
+}
+
 fn lumetri(d: &mut Driver, clip: u64) -> Value {
     let seq = d.exec("sequence.inspect", json!({}));
     let items = seq["video"][0]["items"].as_array().unwrap().clone();
     let it = items.into_iter().find(|i| i["clip"] == clip).unwrap();
     it["effects"].as_array().unwrap().iter().find(|e| e["effect"] == "lumetri").cloned().unwrap_or(Value::Null)
+}
+
+#[test]
+fn grading_basic_controls_are_discoverable_and_edit_the_rendered_frame() {
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"workspace":"Color"}));
+    let clip = select_first_clip(&mut d);
+    d.exec("effects.apply", json!({"clips":[clip],"effect":"lumetri"}));
+    d.frames(3);
+    let before = d.harness.state().session.render_program(0.125).unwrap();
+    for id in ["temperature", "tint", "saturation", "exposure", "contrast", "highlights", "shadows", "whites", "blacks"] {
+        assert!(d.element(&format!("lumetri.param.{id}")).is_some(), "Missing grading control: {id}");
+    }
+    let [x, y, w, h] = d.element("lumetri.param.exposure").unwrap();
+    let pos = egui::pos2(x + w - 70.0, y + h / 2.0);
+    d.harness.input_mut().events.extend([
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+    ]);
+    d.frames(1);
+    d.harness.input_mut().events.push(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    d.frames(3);
+    let after = d.harness.state().session.render_program(0.125).unwrap();
+    assert!(after.px.iter().zip(&before.px).any(|(a, b)| (a - b).abs() > 0.05), "Clicking Exposure must change the picture");
+    d.snapshot("color-grading-exposure-verified", None);
+    d.exec("edit.undo", json!({}));
+    let undo = d.harness.state().session.render_program(0.125).unwrap();
+    assert_eq!(undo.px, before.px, "A slider gesture must undo in one step");
+    d.snapshot("color-grading-basic-verified", None);
 }
 
 #[test]

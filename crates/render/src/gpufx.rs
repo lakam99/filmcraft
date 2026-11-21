@@ -1235,6 +1235,7 @@ mod tests {
             project: None,
             env: None,
             frame_rate: 24.0,
+            gamut: (filmcraft_color::WorkingSpace::Rec709).output_space().gamut(),
             working: filmcraft_color::WorkingSpace::Rec709,
         };
         // Both sides of each cutoff, including samples inside the former artificial fade.
@@ -1284,6 +1285,7 @@ mod tests {
             project: None,
             env: None,
             frame_rate: 24.0,
+            gamut: (filmcraft_color::WorkingSpace::Rec709).output_space().gamut(),
             working: filmcraft_color::WorkingSpace::Rec709,
         };
         let on_gpu = |e: &EffectInstance| FxOp::eval(e, &cx, 64, 36).is_some_and(|op| op.gpu_ok());

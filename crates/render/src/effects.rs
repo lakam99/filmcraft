@@ -34,6 +34,8 @@ pub struct FxCtx<'a> {
     /// The sequence's working colour space: Color Grading grades HDR (PQ / HLG) working spaces in their
     /// own signal, normalised to HDR White ([`filmcraft_color::GradeSpace`]).
     pub working: filmcraft_color::WorkingSpace,
+    /// Actual linear primaries, including the optional wide-gamut Rec.709 workflow.
+    pub gamut: filmcraft_color::Gamut,
 }
 
 pub(crate) fn f(e: &EffectInstance, id: &str, cx: &FxCtx) -> f32 {
@@ -114,6 +116,10 @@ fn median_radius(radius: f32, px_scale: f32, longest_side: usize) -> isize {
 
 pub fn apply(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     if !e.enabled || img.w == 0 || img.h == 0 {
+        return;
+    }
+    if e.effect == "grading_group" {
+        crate::color_groups::apply_group(img, e, cx);
         return;
     }
     if crate::vfx::apply(img, e, cx) {
@@ -964,6 +970,7 @@ mod tests {
             project: None,
             env: None,
             frame_rate: 24.0,
+            gamut: (filmcraft_color::WorkingSpace::Rec709).output_space().gamut(),
             working: filmcraft_color::WorkingSpace::Rec709,
         }
     }
@@ -1775,6 +1782,7 @@ mod lumetri_cpu_parity_tests {
             project: None,
             env: None,
             frame_rate: 24.0,
+            gamut: (filmcraft_color::WorkingSpace::Rec709).output_space().gamut(),
             working: filmcraft_color::WorkingSpace::Rec709,
         };
 
@@ -1815,6 +1823,7 @@ mod lumetri_cpu_parity_tests {
             project: None,
             env: None,
             frame_rate: 24.0,
+            gamut: (filmcraft_color::WorkingSpace::Rec709).output_space().gamut(),
             working: filmcraft_color::WorkingSpace::Rec709,
         };
         let render = |roundness: f64| {

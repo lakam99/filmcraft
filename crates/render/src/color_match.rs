@@ -6,7 +6,7 @@
 //! 2. Each pixel is weighted into three **tonal ranges** by its L — shadows `smoothstep(0.55, 0.15,
 //!    L)`, highlights `smoothstep(0.45, 0.85, L)`, midtones the rest — and per range we take the
 //!    mean L, a and b. A global **chroma** statistic (mean √(a² + b²)) captures saturation.
-//! 3. **Skin-tone protection** ("Face Detection"): pixels near the skin-tone line (Oklab hue
+//! 3. **Skin-tone protection**: pixels near the skin-tone line (Oklab hue
 //!    20°–75°, chroma 0.02–0.2, L 0.25–0.92) are down-weighted (×0.2) in the colour statistics, so
 //!    faces do not drive the cast; afterwards the solved cast is scaled down until the mean hue of
 //!    the current frame's skin pixels moves by at most 8°.
@@ -25,7 +25,9 @@ use crate::effects::{FxCtx, apply};
 
 /// sRGB-primaries linear RGB → Oklab.
 pub fn oklab(c: [f32; 3]) -> [f32; 3] {
-    let [r, g, b] = c.map(|v| v.max(0.0));
+    // Extended linear RGB is intentional: wide-gamut colors can have negative BT.709
+    // components. Ottosson's matrix/cube-root definition preserves these colors.
+    let [r, g, b] = c;
     let l = 0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_995 * b;
     let m = 0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b;
     let s = 0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b;
@@ -73,6 +75,43 @@ pub struct Stats {
     pub bands: [[f32; 4]; 3],
     pub chroma: f32,
     pub skin: [f32; 3],
+}
+
+/// Equally weight clips (or representative samples), accounting for bands absent from a shot.
+pub fn average_stats(samples: &[Stats]) -> Option<Stats> {
+    if samples.is_empty() || samples.len() > 1024 {
+        return None;
+    }
+    let mut bands = [[0.0f64; 4]; 3];
+    let mut chroma = 0.0f64;
+    let mut skin = [0.0f64; 3];
+    for sample in samples {
+        if !sample.bands.iter().flatten().chain(std::iter::once(&sample.chroma)).chain(&sample.skin).all(|v| v.is_finite()) {
+            return None;
+        }
+        for (out, band) in bands.iter_mut().zip(sample.bands) {
+            let weight = f64::from(band[0].max(0.0));
+            out[0] += weight;
+            for k in 1..4 {
+                out[k] += f64::from(band[k]) * weight;
+            }
+        }
+        chroma += f64::from(sample.chroma);
+        let weight = f64::from(sample.skin[2].max(0.0));
+        skin[0] += f64::from(sample.skin[0]) * weight;
+        skin[1] += f64::from(sample.skin[1]) * weight;
+        skin[2] += weight;
+    }
+    let count = samples.len() as f64;
+    Some(Stats {
+        bands: bands.map(|b| [(b[0] / count) as f32, (b[1] / b[0].max(1e-9)) as f32, (b[2] / b[0].max(1e-9)) as f32, (b[3] / b[0].max(1e-9)) as f32]),
+        chroma: (chroma / count) as f32,
+        skin: [(skin[0] / skin[2].max(1e-9)) as f32, (skin[1] / skin[2].max(1e-9)) as f32, (skin[2] / count) as f32],
+    })
+}
+
+pub fn distance(current: &Stats, reference: &Stats) -> f32 {
+    residuals(current, reference).iter().map(|v| v * v).sum::<f32>().sqrt()
 }
 
 /// Downsample to at most `max_w` pixels wide (box filter).
@@ -162,11 +201,34 @@ pub struct Match {
     pub after: f32,
 }
 
+impl Match {
+    pub fn effect(&self, base: &EffectInstance) -> EffectInstance {
+        set_params(
+            base,
+            &[
+                self.shadows[0],
+                self.shadows[1],
+                self.midtones[0],
+                self.midtones[1],
+                self.highlights[0],
+                self.highlights[1],
+                self.lightness[0] / 100.0,
+                self.lightness[1] / 100.0,
+                self.lightness[2] / 100.0,
+                self.saturation / 100.0 - 1.0,
+            ],
+        )
+    }
+}
+
 // unknowns: [sx, sy, mx, my, hx, hy, sl, ml, hl, sat] (wheel offsets in −1..1, lightness/100, sat−1)
 fn set_params(base: &EffectInstance, x: &[f32; 10]) -> EffectInstance {
     let mut e = base.clone();
     let mut put = |id: &str, v: ParamValue| {
         let prm = e.params.entry(id.to_string()).or_insert_with(|| filmcraft_project::Param::new(v.clone()));
+        // Apply Match replaces these parameters with static values. Its solver must evaluate the
+        // same grade that will be committed, rather than letting old wheel keyframes override it.
+        prm.keyframes.clear();
         prm.value = v;
     };
     put("wheel_shadows", ParamValue::Vec2(Vec2::new(x[0] as f64, x[1] as f64)));
@@ -182,32 +244,71 @@ fn set_params(base: &EffectInstance, x: &[f32; 10]) -> EffectInstance {
     e
 }
 
-fn graded_stats(img: &Image, base: &EffectInstance, x: &[f32; 10], skin_protect: bool) -> Stats {
+/// Statistics in a shared perceptual domain, retaining the actual working-light image.
+pub fn working_stats(img: &Image, skin_protect: bool, working: filmcraft_color::WorkingSpace) -> Stats {
+    working_stats_in_gamut(img, skin_protect, working, working.output_space().gamut())
+}
+
+pub fn working_stats_in_gamut(img: &Image, skin_protect: bool, working: filmcraft_color::WorkingSpace, gamut: filmcraft_color::Gamut) -> Stats {
+    if !working.is_hdr() && gamut == filmcraft_color::Gamut::Bt709 {
+        return stats(img, skin_protect);
+    }
+    // Oklab is defined on linear sRGB primaries. HDR working images are linear BT.2020 in
+    // 203-nit units: normalise statistics to nominal 1000-nit HDR white so tonal bands and the
+    // skin qualifier keep their perceptual meaning. Never tone-map or clip the grading input.
+    use filmcraft_color::spaces::{apply3, gamut_matrix, to_f32};
+    let matrix = to_f32(&gamut_matrix(gamut, filmcraft_color::Gamut::Bt709));
+    let gain = if working.is_hdr() { filmcraft_color::REFERENCE_WHITE_NITS as f32 / filmcraft_color::grade::DEFAULT_HDR_WHITE_NITS } else { 1.0 };
+    let mut linear709 = img.clone();
+    for p in linear709.px.as_chunks_mut::<4>().0 {
+        let rgb = apply3(&matrix, [p[0], p[1], p[2]]);
+        for k in 0..3 {
+            p[k] = rgb[k] * gain;
+        }
+    }
+    stats(&linear709, skin_protect)
+}
+
+fn graded_stats(img: &Image, base: &EffectInstance, x: &[f32; 10], skin_protect: bool, cx: &FxCtx) -> Stats {
     let mut g = img.clone();
+    apply(&mut g, &set_params(base, x), cx);
+    working_stats_in_gamut(&g, skin_protect, cx.working, cx.gamut)
+}
+
+/// Isolated Rec.709 match without a project LUT library. Editors should use
+/// [`solve_with_context`] with the selected clip's actual render context.
+pub fn solve(current: &Image, reference: &Image, base: &EffectInstance, skin_protect: bool) -> Match {
     let cx = FxCtx {
         t: Tick::ZERO,
-        px_scale: g.w as f32 / 1920.0,
+        px_scale: current.w as f32 / 1920.0,
         seconds: 0.0,
         timecode: "",
         clip_name: "",
         project: None,
         env: None,
         frame_rate: 24.0,
+        gamut: (filmcraft_color::WorkingSpace::Rec709).output_space().gamut(),
         working: filmcraft_color::WorkingSpace::Rec709,
     };
-    apply(&mut g, &set_params(base, x), &cx);
-    stats(&g, skin_protect)
+    solve_with_context(current, reference, base, skin_protect, &cx)
 }
 
 /// Solve the grade that matches `current` (the clip before its wheels) to `reference`. `base` is
 /// the clip's Color Grading instance (its other settings are kept; wheels and saturation are solved).
-pub fn solve(current: &Image, reference: &Image, base: &EffectInstance, skin_protect: bool) -> Match {
+pub fn solve_with_context(current: &Image, reference: &Image, base: &EffectInstance, skin_protect: bool, cx: &FxCtx) -> Match {
+    let refs = working_stats_in_gamut(&shrink(reference, 96), skin_protect, cx.working, cx.gamut);
+    solve_to_stats(current, &refs, base, skin_protect, cx)
+}
+
+/// Match an average of reference-shot statistics without blending unrelated frame pixels into
+/// a synthetic picture. Creative group changes do not participate in this balancing pass.
+pub fn solve_to_stats(current: &Image, refs: &Stats, base: &EffectInstance, skin_protect: bool, cx: &FxCtx) -> Match {
     let cur = shrink(current, 96);
-    let refs = stats(&shrink(reference, 96), skin_protect);
+    let cx = FxCtx { px_scale: cx.px_scale * cur.w as f32 / current.w.max(1) as f32, ..*cx };
     let mut x = [0f32; 10];
     let lambda_reg = 0.02f32;
     let cost = |x: &[f32; 10]| -> (Vec<f32>, f32) {
-        let r = residuals(&graded_stats(&cur, base, x, skin_protect), &refs);
+        let r = residuals(&graded_stats(&cur, base, x, skin_protect, &cx), refs);
         let c = r.iter().map(|v| v * v).sum::<f32>() + lambda_reg * lambda_reg * x.iter().map(|v| v * v).sum::<f32>();
         (r, c)
     };
@@ -265,14 +366,14 @@ pub fn solve(current: &Image, reference: &Image, base: &EffectInstance, skin_pro
     }
     if skin_protect {
         // limit the hue shift of the current frame's skin tones to 8°
-        let s0 = stats(&cur, true);
+        let s0 = working_stats_in_gamut(&cur, true, cx.working, cx.gamut);
         if s0.skin[2] > 0.002 {
             let hue = |s: &Stats| s.skin[1].atan2(s.skin[0]).to_degrees();
             let h0 = hue(&s0);
             let mut k = 1.0f32;
             for _ in 0..8 {
                 let xs: [f32; 10] = std::array::from_fn(|i| if i < 6 { x[i] * k } else { x[i] });
-                let s1 = graded_stats(&cur, base, &xs, true);
+                let s1 = graded_stats(&cur, base, &xs, true, &cx);
                 let mut d = (hue(&s1) - h0).abs();
                 if d > 180.0 {
                     d = 360.0 - d;
@@ -363,6 +464,7 @@ mod tests {
             project: None,
             env: None,
             frame_rate: 24.0,
+            gamut: (filmcraft_color::WorkingSpace::Rec709).output_space().gamut(),
             working: filmcraft_color::WorkingSpace::Rec709,
         };
         apply(&mut g, &set_params(base, &x), &cx);
@@ -380,6 +482,18 @@ mod tests {
         assert!(w[0] > 0.99 && w[2] == 0.0);
         assert!(skin_weight(oklab([0.55, 0.32, 0.22])) > 0.9);
         assert_eq!(skin_weight(oklab([0.2, 0.3, 0.8])), 0.0);
+    }
+
+    #[test]
+    fn grading_oklab_preserves_extended_rgb_from_wide_gamut() {
+        // Published XYZ→Oklab test vector (0, 1, 0), transformed to linear BT.709
+        // using FilmCraft's independent XYZ matrix. RGB clipping destroys this result.
+        use filmcraft_color::spaces::{inverse, mul_vec};
+        let rgb = mul_vec(&inverse(&filmcraft_color::Gamut::Bt709.to_xyz()), [0.0, 1.0, 0.0]).map(|v| v as f32);
+        let lab = oklab(rgb);
+        for (actual, expected) in lab.into_iter().zip([0.922, -0.671, 0.263]) {
+            assert!((actual - expected).abs() < 0.002, "{lab:?}");
+        }
     }
 
     #[test]

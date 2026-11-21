@@ -209,6 +209,8 @@ impl Default for AudioHardwarePrefs {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ColorPrefs {
+    /// Beginner Vibes is the default; the detailed panel edits the same underlying grade.
+    pub grading_advanced: bool,
     pub display_color_management: bool,
     pub extended_dynamic_range: bool,
     /// HDR Graphics White (nits): `100` | `203` | `300`.
@@ -217,7 +219,7 @@ pub struct ColorPrefs {
 
 impl Default for ColorPrefs {
     fn default() -> Self {
-        Self { display_color_management: false, extended_dynamic_range: false, hdr_graphics_white: "203".into() }
+        Self { grading_advanced: false, display_color_management: false, extended_dynamic_range: false, hdr_graphics_white: "203".into() }
     }
 }
 
