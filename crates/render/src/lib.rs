@@ -17,6 +17,7 @@ pub mod color_match;
 pub mod colorman;
 pub mod effects;
 pub mod flow;
+mod focus_recovery;
 pub mod gpufx;
 pub mod graphic_clip;
 pub mod graphics;

@@ -48,6 +48,35 @@ fn first_v1_clip(s: &Session) -> u64 {
     s.active_sequence().unwrap().video_tracks[0].items[0].id.0
 }
 
+#[test]
+fn focus_recovery_commands_are_undoable_persistent_and_range_checked() {
+    let mut s = demo();
+    let clip = first_v1_clip(&s);
+    let original = s.project.to_json();
+    let result = s.execute("effects.apply", json!({"clips":[clip],"effect":"Soft focus"})).unwrap();
+    let index = result["applied"][0]["index"].as_u64().unwrap();
+    assert_eq!(result["applied"][0]["effect"], "focus_recovery");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.project.to_json(), original);
+    s.execute("edit.redo", json!({})).unwrap();
+    for (param, value) in [("radius", 3.0), ("amount", 65.0), ("noise", 45.0), ("halo", 85.0)] {
+        s.execute("effects.setParam", json!({"clip":clip,"effect":index,"param":param,"value":value})).unwrap();
+    }
+    let stable = s.project.to_json();
+    for (param, value) in [("radius", -1.0), ("radius", 99.0), ("amount", 101.0), ("noise", -10.0), ("halo", 101.0)] {
+        assert!(s.execute("effects.setParam", json!({"clip":clip,"effect":index,"param":param,"value":value})).is_err());
+        assert_eq!(s.project.to_json(), stable);
+    }
+    let rendered = s.render_program(0.125).unwrap();
+    s.project = std::sync::Arc::new(filmcraft_project::Project::from_json(&stable).unwrap());
+    assert_eq!(s.render_program(0.125).unwrap().px, rendered.px);
+    let catalogue = s.execute("effects.list", json!({})).unwrap();
+    let entry = catalogue.as_array().unwrap().iter().find(|e| e["id"] == "focus_recovery").unwrap();
+    assert_eq!(entry["badges"]["accelerated"], false);
+    assert_eq!(entry["badges"]["float32"], true);
+    assert_eq!(entry["folder"], "Blur & Sharpen");
+}
+
 fn video_effects() -> Vec<&'static filmcraft_project::EffectDef> {
     // Internal stages (such as a calibrated group link) have their own creation commands/tests.
     effect_defs()
@@ -72,7 +101,7 @@ fn effects_list_reports_folders_and_badges() {
     assert_eq!(find("lens_flare")["folder"], "Lights & Glows");
     let n =
         arr.iter().filter(|e| e["kind"] == "Video" && e["category"][0] == "Video Effects" && e["folder"] != "Obsolete" && e["folder"] != Value::Null).count();
-    assert_eq!(n, 93, "Premiere 26's current Video Effects");
+    assert_eq!(n, 94, "the current video effects plus original Focus Recovery");
 }
 
 #[test]

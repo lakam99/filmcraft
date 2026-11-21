@@ -308,6 +308,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 // fx enable toggle
                 let fxr = Rect::from_center_size(pos2(r.min.x + 28.0, r.center().y), vec2(18.0, 14.0));
                 let fxresp = bui.interact(fxr, egui::Id::unique(("fxen", clip.0, idx)), Sense::click());
+                if e.effect == "focus_recovery" {
+                    app.auto.add("effectControls.focus_recovery.enabled", fxr, "Compare focus recovery");
+                }
                 bui.painter().text(fxr.center(), Align2::CENTER_CENTER, "fx", Tokens::semibold(10.5), if enabled { t.text } else { t.text_faint });
                 if !enabled {
                     bui.painter().line_segment([fxr.left_bottom(), fxr.right_top()], Stroke::new(1.0, t.text_faint));
@@ -363,6 +366,15 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 if !open {
                     continue;
+                }
+                if e.effect == "focus_recovery" {
+                    let (guide, response) = bui.allocate_exact_size(vec2(body.width(), ROW_H * 2.0), Sense::hover());
+                    row_label(bui, pos2(guide.min.x + 12.0, guide.min.y + ROW_H * 0.5), tl!("Recover soft detail. Start with Focus softness."),
+                        guide.width() - 24.0, Tokens::ui(11.0), t.text_dim);
+                    row_label(bui, pos2(guide.min.x + 12.0, guide.min.y + ROW_H * 1.5), tl!("Compare at Full resolution; keep edges natural."),
+                        guide.width() - 24.0, Tokens::ui(11.0), t.text_dim);
+                    response.on_hover_text(tl!("Increase Focus softness slowly. Reduce strength or increase Noise/Halo protection if skin gets rough or outlines appear. Missing detail cannot be reliably recreated. Iterative CPU recovery may need preview rendering."));
+                    app.auto.add("effectControls.focus_recovery.guide", guide, "Focus recovery guidance");
                 }
                 if crate::panels::audio_fx_editor::has_editor(&e.effect) {
                     custom_setup_row(app, bui, body, &lane, clip, idx, &e.effect);
@@ -733,6 +745,12 @@ pub(crate) fn param_row(
     );
     let id = egui::Id::unique(("pv", clip.0, idx, pkey));
     let set = param_value_widget(app, &mut vui, e, pd, &value, clip, idx, mask, pkey, id, t, actions);
+    if e.effect == "focus_recovery" {
+        let shown = vui.min_rect().intersect(vui.clip_rect());
+        if shown.is_positive() {
+            app.auto.add(&format!("effectControls.focus_recovery.{idx}.{pkey}.value"), shown, pd.label);
+        }
+    }
     if let Some(v) = set {
         actions.push(("effects.setParam".into(), with_mask(json!({"clip": clip.0, "effect": idx, "param": pd.id, "value": v}))));
     }
@@ -851,7 +869,11 @@ fn param_value_widget(
             let w = vui.available_width().min(130.0);
             let combo = craft_ui::ComboBox::from_id_salt(id).selected_text(opts.get(sel).map_or("", |o| crate::i18n::t(o))).width(w).show_ui(vui, |ui| {
                 for (i, o) in opts.iter().enumerate() {
-                    if ui.selectable_value(&mut sel, i, crate::i18n::t(o)).changed() {
+                    let option = ui.selectable_value(&mut sel, i, crate::i18n::t(o));
+                    if e.effect == "focus_recovery" {
+                        app.auto.add(&format!("effectControls.focus_recovery.{idx}.{pkey}.option.{i}"), option.rect, o);
+                    }
+                    if option.changed() {
                         set = Some(json!(i));
                     }
                 }

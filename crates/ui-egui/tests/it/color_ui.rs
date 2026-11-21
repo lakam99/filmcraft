@@ -137,6 +137,51 @@ fn select_first_clip(d: &mut Driver) -> u64 {
 }
 
 #[test]
+fn focus_recovery_panel_exposes_plain_controls_guidance_and_reset() {
+    let mut d = Driver::demo();
+    let clip = select_first_clip(&mut d);
+    let applied = d.exec("effects.apply", json!({"clips":[clip],"effect":"focus_recovery"}));
+    let index = applied["applied"][0]["index"].as_u64().unwrap();
+    d.ok("ui.panel.show", json!({"panel":"EffectControls"}));
+    d.frames(4);
+    for effect in ["motion", "opacity", "time_remap"] {
+        d.click(&format!("effectControls.effect.{effect}.twirl"));
+    }
+    assert!(d.element("effectControls.focus_recovery.guide").is_some());
+    for param in ["amount", "radius", "noise", "halo", "model", "quality"] {
+        assert!(d.element(&format!("effectControls.focus_recovery.{param}.reset")).is_some(), "{param} missing");
+    }
+    d.click(&format!("effectControls.focus_recovery.{index}.model.value"));
+    d.click(&format!("effectControls.focus_recovery.{index}.model.option.1"));
+    let effect = &d.harness.state().session.active_sequence().unwrap().find_item(filmcraft_project::ClipId(clip)).unwrap().1.effects[index as usize];
+    assert_eq!(effect.params["model"].value, filmcraft_project::ParamValue::Choice(1));
+    d.exec("effects.setParam", json!({"clip":clip,"effect":"focus_recovery","param":"radius","value":4.0}));
+    d.frames(2);
+    d.click("effectControls.focus_recovery.radius.reset");
+    let value = |d: &Driver| {
+        d.harness
+            .state()
+            .session
+            .active_sequence()
+            .unwrap()
+            .find_item(filmcraft_project::ClipId(clip))
+            .unwrap()
+            .1
+            .effects
+            .iter()
+            .find(|e| e.effect == "focus_recovery")
+            .unwrap()
+            .params["radius"]
+            .value
+            .clone()
+    };
+    assert_eq!(value(&d), filmcraft_project::ParamValue::Float(2.5));
+    d.exec("edit.undo", json!({}));
+    assert_eq!(value(&d), filmcraft_project::ParamValue::Float(4.0));
+    d.snapshot("focus-recovery-controls", None);
+}
+
+#[test]
 fn grading_vibes_is_the_default_and_shares_its_grade_with_advanced() {
     assert!(!Session::default().prefs.color.grading_advanced);
     let mut d = Driver::demo();

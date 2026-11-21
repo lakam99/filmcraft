@@ -131,6 +131,7 @@ pub fn apply(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
         return;
     }
     match e.effect.as_str() {
+        "focus_recovery" => crate::focus_recovery::apply(img, e, cx),
         "lumetri" => lumetri(img, e, cx),
         "median" => {
             let r = median_radius(f(e, "radius", cx), cx.px_scale, img.w.max(img.h));
