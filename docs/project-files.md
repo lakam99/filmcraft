@@ -11,9 +11,25 @@ media, and press **Save** (Ctrl+S / ⌘S) to write a real AAF to the same path. 
 command line, Recent Projects or by dropping it on the editor follows the same workflow.
 **File ▸ Import AAF** still adds the imported sequence to the current project.
 
-For a timeline already imported into a native project, choose **Save As** and an `.aaf` filename
-once; subsequent saves update that AAF. Save As and Save a Copy offer both `.aaf` and `.fcproj`.
-Saving a copy keeps the current document's path and unsaved state.
+For a timeline already imported into a project, activate its timeline tab and choose
+**Sequence ▸ Save Sequence to AAF…**. Select the imported AAF to replace it, or choose a new
+filename. This works with multiple independent sequences in the project, including imports
+made before this command existed; it does not require reimporting your edited timeline.
+The destination is chosen each time, and replacing an existing AAF keeps a new numbered backup.
+Only the chosen sequence and its nested sequences are written. The FilmCraft project path,
+other sequences, undo history and unsaved state remain intact. Use **Ctrl+S / ⌘S** to save
+the native project separately and retain all sequences. Selecting a destination with multiple
+compositions or an invalid AAF is refused; choose a new filename. A destination with unsupported
+imported effects or objects requires **Back Up and Replace AAF** confirmation: these objects are
+omitted from the replacement, while the original bytes remain in the numbered backup. Cancel
+and choose a new filename to leave that destination intact. A changed destination invalidates
+the confirmation; FilmCraft refuses to overwrite the intervening changes.
+Embedded destination audio stays embedded, while a new destination uses linked media unless
+the open document is an embedded AAF. Editable saves reject processing that AAF cannot retain;
+use File ▸ Export ▸ AAF with mix matching for a rendered transfer instead.
+
+Save As and Save a Copy still offer both `.aaf` and `.fcproj`. Saving a copy keeps the current
+document's path and unsaved state. Whole-document AAF Save As requires one top-level sequence.
 
 - The first overwrite preserves the previous file beside it as `<name> (before FilmCraft).aaf`,
   using a numbered name if necessary. Later saves in the same editing session keep that backup.

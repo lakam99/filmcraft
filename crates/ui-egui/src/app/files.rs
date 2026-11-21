@@ -10,6 +10,28 @@ impl FilmcraftApp {
 
     pub fn file_dialog(&mut self, id: &str, params: &Value) -> Result<Value, String> {
         match id {
+            "sequence.saveAaf" => {
+                filmcraft_engine::find_command(id).map_or(Ok(()), |c| (c.enabled)(&self.session))?;
+                let sequence = filmcraft_engine::export_tools::sequence_param(&self.session, params, id).map_err(|e| e.to_string())?;
+                let item = self.session.project.item(sequence).ok_or_else(|| "No active sequence".to_string())?;
+                let stem: String = item.name.chars().map(|c| if matches!(c, '/' | '\\') || c.is_control() { '-' } else { c }).collect();
+                let stem = if stem.trim().is_empty() { "Untitled".to_string() } else { stem };
+                let epoch = self.session.document_epoch;
+                // Keep the selected identity when a nonblocking picker is open; changing tabs
+                // must not cause the user's chosen AAF to receive a different sequence.
+                self.pick(FileDialog::save_as("Editable AAF sequence", &["aaf"], &format!("{stem}.aaf")), move |app, paths| {
+                    let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
+                    if app.session.document_epoch != epoch {
+                        return Err("The project changed while choosing the AAF destination; invoke Save Sequence to AAF again".into());
+                    }
+                    let result = app.session.execute("sequence.saveAaf", json!({"path":path,"sequence":sequence.0})).map_err(|e| e.to_string());
+                    match &result {
+                        Ok(value) => crate::menus::sequence_aaf_status(app, value),
+                        Err(error) => app.ui.status = error.clone(),
+                    }
+                    result
+                })
+            }
             "file.import" => {
                 let exts: Vec<&str> = filmcraft_media::VIDEO_EXTENSIONS
                     .iter()

@@ -68,6 +68,7 @@ fn meta(command: &str) -> Option<(&'static str, &'static str)> {
         "file.closeProject" => (tl!("Save Project"), "closeProject"),
         "app.quit" => (tl!("Save Project"), "quit"),
         "file.open" => (tl!("Save Project"), "openProject"),
+        "sequence.saveAaf" => (tl!("Replace AAF with Edited Sequence"), "saveSequenceAaf"),
         _ => return None,
     })
 }
@@ -114,6 +115,11 @@ fn rename_target(app: &FilmcraftApp) -> Option<Value> {
 
 /// Menu / shortcut entry points without params open a dialog. Returns None for other ids.
 pub fn route(app: &mut FilmcraftApp, id: &str, params: &Value) -> Option<Result<Value, String>> {
+    if id == "sequence.saveAaf" {
+        // Choose the destination first. Its known import warnings, if any, open this prompt
+        // through the save result; an empty menu invocation is not replacement consent.
+        return None;
+    }
     // Open Recent, the Home screen and a dropped project file ask before replacing unsaved
     // changes; File ▸ Open without a path picks the file first (see `ask_before_open`)
     if id == "file.open" {
@@ -425,6 +431,17 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
         let p = &mut d.params;
         let mut valid = true;
         match d.command.as_str() {
+            "sequence.saveAaf" => {
+                let message = "The selected AAF contains effects or objects FilmCraft could not import. They will be omitted from the replacement. Your edited clips and timing will be saved, and the original AAF will be kept in a numbered backup beside it. Cancel to choose a new filename instead.";
+                let r = ui.label(message);
+                push(&mut elems, format!("{pre}.warning"), &r, message);
+                ui.label(p["path"].as_str().unwrap_or_default());
+                if let Some(warnings) = d.info["warnings"].as_array() {
+                    for warning in warnings.iter().take(8).filter_map(Value::as_str) {
+                        ui.label(warning);
+                    }
+                }
+            }
             "edit.pasteAttributes" | "edit.removeAttributes" => {
                 let (v, a) = (d.info["video"].as_bool().unwrap_or(true), d.info["audio"].as_bool().unwrap_or(true));
                 // a ticked box means "remove", not "keep on" (#3789: an effect was unticked to turn it off)
@@ -732,8 +749,9 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             if r.clicked() {
                 action = Some("cancel");
             }
-            let r = ui.add_enabled(valid, egui::Button::new(tl!("OK")));
-            push(&mut elems, format!("{pre}.ok"), &r, "OK");
+            let label = if d.command == "sequence.saveAaf" { "Back Up and Replace AAF" } else { tl!("OK") };
+            let r = ui.add_enabled(valid, egui::Button::new(label));
+            push(&mut elems, format!("{pre}.ok"), &r, label);
             if r.clicked() {
                 action = Some("ok");
             }
@@ -747,7 +765,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     }
     if action.is_none()
         && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.pointer.any_down())
-        && !matches!(d.command.as_str(), "file.closeProject" | "app.quit" | "file.open")
+        && !matches!(d.command.as_str(), "file.closeProject" | "app.quit" | "file.open" | "sequence.saveAaf")
     {
         action = Some("ok");
     }
@@ -765,8 +783,11 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
         Some("ok") => {
             let params = finish(&d);
             match app.session.execute(&d.command, params) {
-                Ok(_) => {
+                Ok(value) => {
                     app.ui.clip_dialog = None;
+                    if d.command == "sequence.saveAaf" {
+                        crate::menus::sequence_aaf_status(app, &value);
+                    }
                     return;
                 }
                 Err(e) => d.error = e.to_string(),
@@ -961,6 +982,8 @@ pub(crate) mod tests {
 
     #[test]
     fn every_command_with_a_clip_dialog_can_be_bound() {
-        assert_dialog_commands_bindable("clip_dialogs::meta", |id| meta(id).is_some(), &[]);
+        // AAF replacement is a conditional confirmation after a file picker supplied the
+        // required destination, not a parameter-free clip editing dialog.
+        assert_dialog_commands_bindable("clip_dialogs::meta", |id| meta(id).is_some(), &["sequence.saveAaf"]);
     }
 }

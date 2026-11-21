@@ -30,7 +30,7 @@ impl Driver {
             save_to.as_ref().map(|d| d.join(suggested).to_string_lossy().into_owned())
         }));
         let mut builder = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000);
-        if std::env::var_os("FILMCRAFT_UI_SNAPSHOT_DIR").is_some() {
+        if std::env::var_os("FILMCRAFT_UI_SNAPSHOT_DIR").is_some() || std::env::var_os("FILMCRAFT_SEQUENCE_AAF_UI_SHOTS").is_some() {
             builder = builder.wgpu();
         }
         let harness = builder.build_eframe(move |_cc| app);
@@ -123,6 +123,173 @@ fn cancelling_the_save_panel_writes_nothing_and_reports_no_error() {
     }
     assert_eq!(asked.lock().unwrap().len(), SAVED.len());
     assert!(!d.harness.state().ui.status.contains("path"), "{}", d.harness.state().ui.status);
+}
+
+#[test]
+fn sequence_aaf_menu_saves_only_the_active_timeline_and_preserves_project_save() {
+    let dir = tmp("sequence-aaf");
+    let asked = Asked::default();
+    let mut s = Session::default();
+    s.execute("file.newSequence", json!({"name":"Championship"})).unwrap();
+    s.execute("file.newSequence", json!({"name":"Main sequence"})).unwrap();
+    s.execute("file.newSequence", json!({"name":"TGOU"})).unwrap();
+    let native = dir.join("All sequences.fcproj");
+    s.execute("file.saveAs", json!({"path":native})).unwrap();
+    s.edit("Keep unsaved work", |project, _| {
+        project.name = "Native project".into();
+        Ok(())
+    })
+    .unwrap();
+    let before = s.project.clone();
+    let mut d = Driver::new(s, Some(dir.clone()), asked.clone());
+    let menu = d.ok("ui.menu.list", json!({}));
+    let entry = menu.as_array().unwrap().iter().find(|i| i["id"] == "sequence.saveAaf").unwrap();
+    assert_eq!(entry["path"], json!(["Sequence"]));
+    assert_eq!(entry["enabled"], true);
+    d.ok("ui.click", json!({"id":"menu.Sequence"}));
+    d.frames(3);
+    assert!(!d.ok("ui.elements", json!({"prefix":"menu.sequence.saveAaf"})).as_array().unwrap().is_empty());
+    if let Some(folder) = std::env::var_os("FILMCRAFT_SEQUENCE_AAF_UI_SHOTS") {
+        std::fs::create_dir_all(&folder).unwrap();
+        d.harness.render().unwrap().save(std::path::PathBuf::from(folder).join("sequence-save-aaf-menu.png")).unwrap();
+    }
+    d.ok("ui.click", json!({"id":"menu.sequence.saveAaf"}));
+    d.frames(3);
+    assert_eq!(*asked.lock().unwrap(), vec![("Editable AAF sequence".into(), vec!["aaf".into()], "TGOU.aaf".into())]);
+    let bytes = std::fs::read(dir.join("TGOU.aaf")).unwrap();
+    let (imported, _, _) = filmcraft_interchange::aaf::import(&bytes, &Default::default()).unwrap();
+    assert_eq!(imported.sequences.len(), 1);
+    assert_eq!(imported.project.item(imported.sequences[0]).unwrap().name, "TGOU");
+    assert_eq!(*d.harness.state().session.project, *before);
+    assert!(d.harness.state().session.is_dirty());
+    assert_eq!(d.harness.state().session.path.as_deref(), native.to_str());
+    assert!(d.harness.state().ui.status.contains("TGOU.aaf"));
+    d.ok("ui.menu.invoke", json!({"id":"file.save"}));
+    assert!(!d.harness.state().session.is_dirty());
+    let mut restored = Session::default();
+    restored.execute("file.open", json!({"path":native})).unwrap();
+    assert_eq!(restored.project.sequences().count(), 3);
+}
+
+#[test]
+fn sequence_aaf_menu_cancel_and_no_sequence_do_not_change_the_project() {
+    let asked = Asked::default();
+    let s = session();
+    let before = s.project.clone();
+    let mut d = Driver::new(s, None, asked.clone());
+    assert_eq!(d.ok("ui.menu.invoke", json!({"id":"sequence.saveAaf"})), Value::Null);
+    assert_eq!(*d.harness.state().session.project, *before);
+    assert_eq!(asked.lock().unwrap().len(), 1);
+    let asked = Asked::default();
+    let mut d = Driver::new(Session::default(), Some(tmp("sequence-aaf-disabled")), asked.clone());
+    assert_eq!(d.call("ui.menu.invoke", json!({"id":"sequence.saveAaf"}))["ok"], false);
+    assert!(asked.lock().unwrap().is_empty());
+}
+
+#[test]
+fn sequence_aaf_picker_keeps_the_chosen_tab_and_refuses_a_replaced_project() {
+    for replace_project in [false, true] {
+        let dir = tmp(if replace_project { "aaf-picker-replace" } else { "aaf-picker-tab" });
+        let mut s = Session::default();
+        s.execute("file.newSequence", json!({"name":"First"})).unwrap();
+        let first = s.state.active_sequence;
+        s.execute("file.newSequence", json!({"name":"Chosen"})).unwrap();
+        let mut d = Driver::new(s, None, Asked::default());
+        let (tx, rx) = channel();
+        let mut rx = Some(rx);
+        d.harness.state_mut().hooks.run_dialog = Some(Box::new(move |_| rx.take().unwrap()));
+        d.ok("ui.menu.invoke", json!({"id":"sequence.saveAaf"}));
+        if replace_project {
+            d.harness.state_mut().session.execute("file.newProject", json!({"name":"Different project"})).unwrap();
+        } else {
+            d.harness.state_mut().session.state.active_sequence = first;
+        }
+        let output = dir.join("chosen.aaf");
+        tx.send(vec![output.to_string_lossy().into_owned()]).unwrap();
+        d.frames(4);
+        if replace_project {
+            assert!(!output.exists());
+            assert!(d.harness.state().ui.status.contains("project changed"));
+        } else {
+            let (imported, _, _) = filmcraft_interchange::aaf::import(&std::fs::read(output).unwrap(), &Default::default()).unwrap();
+            assert_eq!(imported.project.item(imported.sequences[0]).unwrap().name, "Chosen");
+            assert_eq!(d.harness.state().session.state.active_sequence, first);
+        }
+    }
+}
+
+#[test]
+fn foreign_aaf_replacement_explains_omitted_effects_and_requires_an_explicit_button() {
+    for replace in [false, true] {
+        let dir = tmp(if replace { "aaf-foreign-replace" } else { "aaf-foreign-cancel" });
+        let wav = dir.join("original.wav");
+        std::fs::write(&wav, filmcraft_interchange::wav::wav_file(&vec![0u8; 16_000], 1, 8000, 16)).unwrap();
+        let mut s = Session::default();
+        s.execute("file.newSequence", json!({"name":"TGOU","video":0,"audio":1})).unwrap();
+        let sequence = s.state.active_sequence.unwrap();
+        let item = s.execute("file.import", json!({"paths":[wav]})).unwrap()["items"][0].clone();
+        s.execute("timeline.place", json!({"item":item,"track":"A1","seconds":0,"video":false})).unwrap();
+        s.edit("Gain operation fixture", |project, _| {
+            project.sequence_mut(sequence).unwrap().audio_tracks[0].items[0].gain_db = -6.0;
+            Ok(())
+        })
+        .unwrap();
+        let (mut bytes, _) = filmcraft_interchange::aaf::export(&s.project, sequence, &Default::default()).unwrap();
+        // Our own generated AAF, with its standard audio-gain AUID changed to an unknown
+        // operation. This reproduces a foreign effect without shipping a third-party fixture.
+        let gain = [0x94, 0xa8, 0x2e, 0x9d, 0x68, 0x09, 0xd3, 0x11, 0x8a, 0x38, 0x00, 0x50, 0x04, 0x0e, 0xf7, 0xd2];
+        let offsets: Vec<_> = bytes.windows(gain.len()).enumerate().filter_map(|(i, value)| (value == gain).then_some(i)).collect();
+        assert!(!offsets.is_empty());
+        for offset in offsets {
+            bytes[offset] = 0x95;
+        }
+        let target = dir.join("TGOU.aaf");
+        std::fs::write(&target, &bytes).unwrap();
+        let (_, _, report) = filmcraft_interchange::aaf::import(&bytes, &Default::default()).unwrap();
+        assert!(report.has_warnings());
+        s.execute("file.importAaf", json!({"path":target})).unwrap();
+        let imported = s.state.active_sequence.unwrap();
+        let offset = filmcraft_time::FrameRate::FPS_24.tick_of(12);
+        s.edit("Align imported lav", |project, _| {
+            project.sequence_mut(imported).unwrap().audio_tracks[0].items[0].start = offset;
+            Ok(())
+        })
+        .unwrap();
+        let before = s.project.clone();
+        let mut d = Driver::new(s, Some(dir.clone()), Asked::default());
+        let prompt = d.ok("ui.menu.invoke", json!({"id":"sequence.saveAaf"}));
+        assert_eq!(prompt["needsConfirmation"], true);
+        d.frames(3);
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        assert!(d.harness.state().ui.clip_dialog.is_some());
+        assert!(!d.ok("ui.elements", json!({"prefix":"saveSequenceAaf.warning"})).as_array().unwrap().is_empty());
+        if let Some(folder) = std::env::var_os("FILMCRAFT_SEQUENCE_AAF_UI_SHOTS") {
+            std::fs::create_dir_all(&folder).unwrap();
+            d.harness.render().unwrap().save(std::path::PathBuf::from(folder).join("sequence-aaf-replace-warning.png")).unwrap();
+        }
+        d.harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        });
+        d.frames(2);
+        assert_eq!(std::fs::read(&target).unwrap(), bytes, "Enter must not confirm a lossy replacement");
+        d.ok("ui.click", json!({"id":if replace {"saveSequenceAaf.ok"} else {"saveSequenceAaf.cancel"}}));
+        d.frames(3);
+        assert!(d.harness.state().ui.clip_dialog.is_none());
+        assert_eq!(*d.harness.state().session.project, *before);
+        if replace {
+            assert_eq!(std::fs::read(dir.join("TGOU (before FilmCraft).aaf")).unwrap(), bytes);
+            let mut reopened = Session::default();
+            reopened.execute("file.open", json!({"path":target})).unwrap();
+            assert_eq!(reopened.active_sequence().unwrap().audio_tracks[0].items[0].start, offset);
+        } else {
+            assert_eq!(std::fs::read(&target).unwrap(), bytes);
+            assert!(!dir.join("TGOU (before FilmCraft).aaf").exists());
+        }
+    }
 }
 
 #[test]

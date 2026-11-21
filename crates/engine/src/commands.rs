@@ -2706,6 +2706,15 @@ fn build() -> Vec<CommandSpec> {
             s.state.open_sequences.insert(to, tab);
             Ok(json!({"index": to}))
         }),
+        cmd!(
+            "sequence.saveAaf",
+            "Save Sequence to AAF…",
+            ["Sequence"],
+            None,
+            r#"{"path":str,"sequence":id?,"replaceUnsupported":bool=false,"expectedTarget":u64?}"#,
+            has_seq,
+            |s, p| { crate::aaf_document::save_sequence(s, p) }
+        ),
         cmd!("sequence.addEdit", "Add Edit", ["Sequence"], Some("Cmd+K"), r#"{"time":ticks?}"#, has_seq, |s, p| {
             let t = time_p(s, p, "").unwrap_or(s.playhead());
             // Like Premiere: selected clips under the playhead are cut, and only they (#164);
@@ -5405,7 +5414,7 @@ fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
     }
     s.services.write_file(path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     if adopt {
-        s.aaf_document = Default::default();
+        crate::aaf_document::native_saved(s);
         s.path = Some(path.to_string());
         s.previews_follow_path();
         s.note_recent_project();

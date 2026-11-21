@@ -347,6 +347,10 @@ fn run(mut work: Work, progress: &Arc<Progress>) -> std::result::Result<Completi
     if progress.cancel.load(Ordering::Acquire) {
         return Err("cancelled".into());
     }
+    let expected = match &work.task {
+        Task::Interchange { params, .. } => Some(params.clone()),
+        _ => None,
+    };
     let mut stage = staging::Stage::prepare(&mut work.task)?;
     work.snapshot.stored_paths = work.pool.stored_snapshot();
     let mut child = client::Client::start(&work.executable, work.services.clone(), work.state)?;
@@ -357,7 +361,7 @@ fn run(mut work: Work, progress: &Arc<Progress>) -> std::result::Result<Completi
     }
     if let Some(stage) = &mut stage {
         // An editor Save may finish after another program changed its source AAF.
-        if let Task::Interchange { params, .. } = &work.task {
+        if let Some(params) = &expected {
             crate::aaf_document::check_expected(&*work.services, params).map_err(|error| error.to_string())?;
         }
         stage.publish(&mut completion)?;

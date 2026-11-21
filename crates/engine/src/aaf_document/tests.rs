@@ -141,6 +141,137 @@ fn aaf_save_refuses_to_discard_another_independent_sequence() {
 }
 
 #[test]
+fn sequence_save_replaces_an_imported_aaf_without_adopting_or_cleaning_the_native_project() {
+    let (_, path) = fixture("aaf-sequence-multiple", false);
+    let original = std::fs::read(&path).unwrap();
+    let mut s = Session::default();
+    s.execute("file.newSequence", json!({"name":"Championship"})).unwrap();
+    let other = s.state.active_sequence.unwrap();
+    s.execute("file.newSequence", json!({"name":"Main sequence"})).unwrap();
+    s.execute("file.importAaf", json!({"path":path})).unwrap();
+    let imported = s.state.active_sequence.unwrap();
+    assert_eq!(s.project.sequences().count(), 3);
+    let native = path.with_extension("fcproj");
+    s.execute("file.saveAs", json!({"path":native})).unwrap();
+    let native_before = std::fs::read(&native).unwrap();
+    let aligned = FrameRate::FPS_24.tick_of(12);
+    align_audio(&mut s, aligned);
+    s.edit("Unrelated sequence processing", |project, _| {
+        project.sequence_mut(other).unwrap().master_volume_db = -6.0;
+        Ok(())
+    })
+    .unwrap();
+    let before = s.project.clone();
+    let revision = s.revision;
+    let saved_revision = s.saved_revision;
+    let history = (s.history.undo.len(), s.history.redo.len());
+    let result = s.execute("sequence.saveAaf", json!({"path":path})).unwrap();
+    assert_eq!(result["sequence"], imported.0);
+    assert_eq!(std::fs::read(result["backup"].as_str().unwrap()).unwrap(), original);
+    assert!(Arc::ptr_eq(&before, &s.project));
+    assert_eq!(s.path.as_deref(), native.to_str());
+    assert_eq!(s.revision, revision);
+    assert_eq!(s.saved_revision, saved_revision);
+    assert_eq!((s.history.undo.len(), s.history.redo.len()), history);
+    assert!(s.is_dirty(), "saving a sequence must not mark other sequences saved");
+    assert_eq!(std::fs::read(&native).unwrap(), native_before);
+    let mut reopened = Session::default();
+    reopened.execute("file.open", json!({"path":path})).unwrap();
+    assert_eq!(reopened.project.sequences().count(), 1);
+    assert_eq!(reopened.active_sequence().unwrap().audio_tracks[0].items[0].start, aligned);
+    // Each explicit replace preserves the version selected, without reusing an old backup.
+    let previous = std::fs::read(&path).unwrap();
+    align_audio(&mut s, FrameRate::FPS_24.tick_of(24));
+    let next = s.execute("sequence.saveAaf", json!({"path":path})).unwrap();
+    assert_ne!(next["backup"], result["backup"]);
+    assert_eq!(std::fs::read(next["backup"].as_str().unwrap()).unwrap(), previous);
+    s.execute("file.save", json!({})).unwrap();
+    assert!(!s.is_dirty());
+    reopened.execute("file.open", json!({"path":native})).unwrap();
+    assert_eq!(reopened.project.sequences().count(), 3);
+    assert_eq!(reopened.project.sequence(imported).unwrap().audio_tracks[0].items[0].start, FrameRate::FPS_24.tick_of(24));
+}
+
+#[test]
+fn sequence_save_keeps_embedded_samples_and_rejects_unsafe_targets_and_parameters() {
+    let (mut s, path) = fixture("aaf-sequence-embedded", true);
+    let (_, before, _) = filmcraft_interchange::aaf::import(&std::fs::read(&path).unwrap(), &Default::default()).unwrap();
+    align_audio(&mut s, FrameRate::FPS_24.tick_of(6));
+    s.execute("sequence.saveAaf", json!({"path":path})).unwrap();
+    let (_, after, _) = filmcraft_interchange::aaf::import(&std::fs::read(&path).unwrap(), &Default::default()).unwrap();
+    assert_eq!(before[0].wav, after[0].wav);
+    let original = std::fs::read(&path).unwrap();
+    for params in [
+        json!({}),
+        json!({"path":path.with_extension("fcproj")}),
+        json!({"path":path,"sequence":-1}),
+        json!({"path":path,"sequence":"invalid"}),
+        json!({"path":path,"sequence":u64::MAX}),
+    ] {
+        assert!(s.execute("sequence.saveAaf", params).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+    let bad = path.with_file_name("invalid.aaf");
+    std::fs::write(&bad, b"Keep this unrelated file").unwrap();
+    assert!(s.execute("sequence.saveAaf", json!({"path":bad})).is_err());
+    assert_eq!(std::fs::read(&bad).unwrap(), b"Keep this unrelated file");
+    std::fs::write(&path, b"External edits").unwrap();
+    assert!(s.execute("sequence.saveAaf", json!({"path":path})).unwrap_err().to_string().contains("outside FilmCraft"));
+    assert_eq!(std::fs::read(path).unwrap(), b"External edits");
+}
+
+#[test]
+fn sequence_save_validates_nested_processing_and_never_overwrites_a_newly_occupied_destination() {
+    let (mut s, path) = fixture("aaf-sequence-nested", false);
+    let parent = s.state.active_sequence.unwrap();
+    s.execute("file.newSequence", json!({"name":"Nested processing"})).unwrap();
+    let nested = s.state.active_sequence.unwrap();
+    s.edit("Nest a sequence", |project, _| {
+        project.sequence_mut(nested).unwrap().master_volume_db = -6.0;
+        let mut clip = project.sequence(parent).unwrap().audio_tracks[0].items[0].clone();
+        clip.id = filmcraft_project::ClipId(project.alloc_id());
+        clip.item = nested;
+        project.sequence_mut(parent).unwrap().audio_tracks[0].items.push(clip);
+        Ok(())
+    })
+    .unwrap();
+    let output = path.with_file_name("nested.aaf");
+    assert!(s.execute("sequence.saveAaf", json!({"path":output,"sequence":parent.0})).unwrap_err().to_string().contains("mixer processing"));
+    assert!(!output.exists());
+    let params = json!({"documentAbsentPath":output});
+    check_expected(&*s.services, &params).unwrap();
+    std::fs::write(&output, b"Another application saved here").unwrap();
+    assert!(check_expected(&*s.services, &params).unwrap_err().to_string().contains("appeared"));
+    assert_eq!(std::fs::read(output).unwrap(), b"Another application saved here");
+}
+
+#[test]
+fn sequence_replacement_requires_confirmation_of_unsupported_content_and_an_unchanged_target() {
+    let (mut s, path) = fixture("aaf-sequence-confirm", false);
+    s.aaf_document.origin.as_mut().unwrap().warnings.push("Unknown imported effect".into());
+    align_audio(&mut s, FrameRate::FPS_24.tick_of(8));
+    let original = std::fs::read(&path).unwrap();
+    let before = s.project.clone();
+    let prompt = s.execute("sequence.saveAaf", json!({"path":path})).unwrap();
+    assert_eq!(prompt["needsConfirmation"], true);
+    assert_eq!(prompt["warnings"][0], "Unknown imported effect");
+    assert!(prompt["backup"].is_null());
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(Arc::ptr_eq(&before, &s.project));
+    let prompt_again = s.execute("sequence.saveAaf", json!({"path":path,"replaceUnsupported":true})).unwrap();
+    assert_eq!(prompt_again["needsConfirmation"], true, "a boolean alone must not confirm unknown target bytes");
+    let saved = s.execute("sequence.saveAaf", json!({"path":path,"replaceUnsupported":true,"expectedTarget":prompt["expectedTarget"]})).unwrap();
+    assert_eq!(std::fs::read(saved["backup"].as_str().unwrap()).unwrap(), original);
+    assert!(s.is_dirty());
+    let copy = path.with_file_name("changed.aaf");
+    std::fs::write(&copy, &original).unwrap();
+    let params = json!({"path":copy,"replaceUnsupported":true,"expectedTarget":fingerprint(&original)});
+    std::fs::write(&copy, b"A different AAF saved since the prompt").unwrap();
+    assert!(s.execute("sequence.saveAaf", params).unwrap_err().to_string().contains("after the replacement prompt"));
+    assert_eq!(std::fs::read(copy).unwrap(), b"A different AAF saved since the prompt");
+}
+
+#[test]
 fn background_completion_never_marks_a_new_document_or_new_edits_clean() {
     let (mut s, path) = fixture("aaf-document-completion", false);
     align_audio(&mut s, FrameRate::FPS_24.tick_of(8));
@@ -153,6 +284,7 @@ fn background_completion_never_marks_a_new_document_or_new_edits_clean() {
         adopt: true,
         embedded: false,
         backup: None,
+        sequence: None,
     };
     align_audio(&mut s, FrameRate::FPS_24.tick_of(10));
     complete(&mut s, &pending, &json!({"documentFingerprint":42}));
@@ -178,6 +310,7 @@ fn running_save_keeps_the_document_available_until_acknowledged() {
         adopt: true,
         embedded: false,
         backup: None,
+        sequence: None,
     });
     s.jobs.push(crate::Job { id: 1, label: "Save AAF".into(), progress: Arc::default(), result: Arc::default() });
     let project = s.project.clone();
@@ -187,6 +320,27 @@ fn running_save_keeps_the_document_available_until_acknowledged() {
     }
     assert_eq!(s.execute("file.saveAs", json!({"path":"pending.aaf"})).unwrap()["job"], 1);
     assert!(s.execute("file.saveAs", json!({"path":"another.aaf"})).is_err());
+}
+
+#[test]
+fn native_project_save_keeps_a_running_sequence_aaf_job_guarded() {
+    let (mut s, path) = fixture("aaf-sequence-native-pending", false);
+    s.execute("file.saveAs", json!({"path":path.with_extension("fcproj")})).unwrap();
+    s.aaf_document.pending.push(Pending {
+        job: 7,
+        epoch: s.document_epoch,
+        revision: s.revision,
+        previous_path: s.path.clone(),
+        path: path.to_string_lossy().into_owned(),
+        adopt: false,
+        embedded: false,
+        backup: None,
+        sequence: s.state.active_sequence,
+    });
+    s.jobs.push(crate::Job { id: 7, label: "Save sequence AAF".into(), progress: Arc::default(), result: Arc::default() });
+    s.execute("file.save", json!({})).unwrap();
+    assert!(saving(&s));
+    assert!(s.execute("file.newProject", json!({})).unwrap_err().to_string().contains("still running"));
 }
 
 #[test]
