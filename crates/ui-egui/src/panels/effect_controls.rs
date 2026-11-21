@@ -274,6 +274,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             for idx in order {
                 let e = &it.effects[idx];
                 let Some(def) = e.def() else { continue };
+                let grade_group = e.color_group.as_ref().and_then(|link| app.session.project.color_groups.get(&link.group));
+                let enabled = grade_group.map_or(e.enabled, |group| group.enabled);
                 // the first effect added from the library after the fixed ones gets a line on top
                 // (#2328); drawn on its edge, so no row moves
                 let first_added = if def.intrinsic {
@@ -306,15 +308,23 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 // fx enable toggle
                 let fxr = Rect::from_center_size(pos2(r.min.x + 28.0, r.center().y), vec2(18.0, 14.0));
                 let fxresp = bui.interact(fxr, egui::Id::unique(("fxen", clip.0, idx)), Sense::click());
-                bui.painter().text(fxr.center(), Align2::CENTER_CENTER, "fx", Tokens::semibold(10.5), if e.enabled { t.text } else { t.text_faint });
-                if !e.enabled {
+                bui.painter().text(fxr.center(), Align2::CENTER_CENTER, "fx", Tokens::semibold(10.5), if enabled { t.text } else { t.text_faint });
+                if !enabled {
                     bui.painter().line_segment([fxr.left_bottom(), fxr.right_top()], Stroke::new(1.0, t.text_faint));
                 }
                 if fxresp.clicked() {
                     actions.push(("effects.toggleEnabled".into(), json!({"clip": clip.0, "index": idx})));
                 }
                 // (the reset button sits at the row's right end)
-                row_label(bui, pos2(r.min.x + 42.0, r.center().y), crate::i18n::t(def.name), r.max.x - 26.0 - (r.min.x + 42.0), Tokens::ui(12.0), t.text);
+                let group_label = grade_group.map(|group| tlf!("Shared look · {name}", name = group.name));
+                row_label(
+                    bui,
+                    pos2(r.min.x + 42.0, r.center().y),
+                    group_label.as_deref().unwrap_or_else(|| crate::i18n::t(def.name)),
+                    r.max.x - 26.0 - (r.min.x + 42.0),
+                    Tokens::ui(12.0),
+                    t.text,
+                );
                 // reset button
                 let rr = Rect::from_center_size(pos2(r.max.x - 14.0, r.center().y), vec2(16.0, 16.0));
                 let rresp = bui.interact(rr, egui::Id::unique(("fxreset", clip.0, idx)), Sense::click()).on_hover_text(tl!("Reset Effect"));
@@ -335,7 +345,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let mut save_preset = false;
                 let fx_id = e.effect.clone();
                 resp.context_menu(|ui| {
-                    let sp = ui.button(tl!("Save Preset…"));
+                    let sp = ui.add_enabled(e.color_group.is_none(), egui::Button::new(tl!("Save Preset…"))).on_disabled_hover_text(tl!(
+                        "Shared looks are saved with the project. Export a .cube from the Color panel to share the creative look."
+                    ));
                     app.auto.add(&format!("effectControls.effect.{fx_id}.savePreset"), sp.rect, "Save Preset…");
                     if sp.clicked() {
                         save_preset = true;
@@ -1329,7 +1341,7 @@ pub(crate) fn run(app: &mut FilmcraftApp, ctx: &egui::Context, actions: Vec<(Str
     let begun = ctx.data(|d| d.get_temp::<Option<f64>>(key)).flatten();
     let mut wrote = false;
     for (cmd, mut p) in actions {
-        if cmd == "effects.setParam" && down {
+        if matches!(cmd.as_str(), "effects.setParam" | "lumetri.group.setParam" | "lumetri.group.setVibe") && down {
             if p.get("merge").is_none() {
                 p["merge"] = json!(true);
             }
@@ -2009,6 +2021,8 @@ mod frame_hold_tests {
     /// their In to their Out, each held on its In (`Some(hold_filters)`) or not held.
     fn app(hold: Option<bool>) -> FilmcraftApp {
         let mut s = filmcraft_engine::Session::default();
+        // This test inspects the detailed grading values rather than the beginner mood view.
+        s.prefs.color.grading_advanced = true;
         s.execute("file.openDemoProject", json!({})).unwrap();
         let v = s.active_sequence().unwrap().video_tracks[0].items[0].clone();
         // away from the In, where the held and the moving times meet

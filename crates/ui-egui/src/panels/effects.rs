@@ -73,7 +73,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 continue;
             }
-            let mut items: Vec<_> = defs.iter().filter(|d| d.category.first() == Some(&top)).filter(|d| matches_effect(d, filter)).collect();
+            // Group stages need calibrated member data and are created by the Color panel.
+            let mut items: Vec<_> =
+                defs.iter().filter(|d| d.id != "grading_group" && d.category.first() == Some(&top)).filter(|d| matches_effect(d, filter)).collect();
             // Premiere lists effect folders and effects alphabetically (obsolete ones last)
             if top == "Video Effects" || top == "Legacy" {
                 items.sort_by_key(|d| (d.category.get(1) == Some(&"Obsolete"), d.category.get(1).copied().unwrap_or(""), d.name.to_ascii_lowercase()));
@@ -299,7 +301,7 @@ fn apply_menu(app: &mut FilmcraftApp, resp: &egui::Response) -> bool {
 }
 
 /// A preset's thumbnail texture (rendered once per size, cached by name).
-fn preset_texture(app: &mut FilmcraftApp, ctx: &egui::Context, p: &filmcraft_render::lumetri_presets::LumetriPreset, w: usize) -> egui::TextureId {
+pub(super) fn preset_texture(app: &mut FilmcraftApp, ctx: &egui::Context, p: &filmcraft_render::lumetri_presets::LumetriPreset, w: usize) -> egui::TextureId {
     let name = format!("lumetri-preset-{}-{w}", p.name);
     if let Some((id, _)) = app.texture_existing(&name) {
         return id;

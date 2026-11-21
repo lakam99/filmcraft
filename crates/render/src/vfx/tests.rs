@@ -18,6 +18,7 @@ fn cx() -> FxCtx<'static> {
         project: None,
         env: None,
         frame_rate: 24.0,
+        gamut: (filmcraft_color::WorkingSpace::Rec709).output_space().gamut(),
         working: filmcraft_color::WorkingSpace::Rec709,
     }
 }

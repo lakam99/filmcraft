@@ -48,6 +48,99 @@ fn tmp(name: &str) -> String {
 }
 
 #[test]
+fn grading_failed_match_does_not_add_an_effect_or_change_undo_history() {
+    for inside_reference in [false, true] {
+        let mut s = demo();
+        let clip = pick_clip(&mut s);
+        assert!(!s.active_sequence().unwrap().find_item(clip).unwrap().1.effects.iter().any(|e| e.effect == "lumetri"));
+        s.edit_sequence("Prepare redo history", |q, _, _| {
+            q.settings.width = q.settings.width.saturating_add(2);
+            Ok(())
+        })
+        .unwrap();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.history.redo.len(), 1);
+        let before = s.project.clone();
+        let (undo, redo) = (s.history.undo.len(), s.history.redo.len());
+        let args = if inside_reference { json!({"clip":clip.0,"referenceTime":s.playhead().0}) } else { json!({"clip":clip.0}) };
+        assert!(s.execute("lumetri.applyMatch", args).is_err());
+        assert_eq!(s.project, before, "A refused match must leave the project unchanged");
+        assert_eq!((s.history.undo.len(), s.history.redo.len()), (undo, redo));
+    }
+}
+
+#[test]
+fn grading_match_adds_the_grade_in_one_undo_step() {
+    let mut s = demo();
+    let clip = pick_clip(&mut s);
+    let q = s.active_sequence().unwrap();
+    let other = q.video_tracks[0].items.last().unwrap();
+    let reference = other.start + filmcraft_time::Tick(other.duration.0 / 2);
+    let before = s.project.clone();
+    let count = s.history.undo.len();
+    s.execute("lumetri.applyMatch", json!({"clip":clip.0,"referenceTime":reference.0})).unwrap();
+    assert_eq!(s.history.undo.len(), count + 1, "Adding and configuring the grade must be one edit");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.project, before);
+}
+
+#[test]
+fn grading_match_respects_the_project_lut_and_hdr_working_space() {
+    use filmcraft_color::WorkingSpace;
+    use filmcraft_project::{ProjectLut, find_effect};
+    use filmcraft_time::{TICKS_PER_SECOND, Tick};
+    for working in WorkingSpace::ALL {
+        let mut s = demo();
+        let clip = pick_clip(&mut s);
+        let mut project = (*s.project).clone();
+        // Identical source frames, with the same existing exposure and imported LUT. Matching
+        // these shots must preserve the picture, including values above SDR white in HDR.
+        project.luts.push(ProjectLut {
+            id: "swap".into(),
+            name: "Swap".into(),
+            source_path: None,
+            format: "cube".into(),
+            text: Lut::from_cube(Lut3d::from_fn(2, |c| [c[2], c[1], c[0]])).to_cube().into(),
+        });
+        let q = project.sequence_mut(s.state.active_sequence.unwrap()).unwrap();
+        q.settings.width = 96;
+        q.settings.height = 54;
+        q.settings.color.working = working;
+        q.video_tracks.truncate(1);
+        q.audio_tracks.clear();
+        q.video_tracks[0].transitions.clear();
+        let mut first = q.find_item(clip).unwrap().1.clone();
+        first.start = Tick::ZERO;
+        first.duration = Tick(2 * TICKS_PER_SECOND);
+        first.scale_to_frame = true;
+        first.effects.clear();
+        let mut grade = find_effect("lumetri").unwrap().instance();
+        grade.params.get_mut("input_lut").unwrap().value = ParamValue::Text("lib:swap".into());
+        grade.params.get_mut("exposure").unwrap().value = ParamValue::Float(if working.is_hdr() { 3.0 } else { -0.5 });
+        let exposure = grade.params.get_mut("exposure").unwrap();
+        exposure.put_keyframe(Tick::ZERO, ParamValue::Float(-1.0));
+        exposure.put_keyframe(Tick(TICKS_PER_SECOND), exposure.value.clone());
+        first.effects.push(grade);
+        let mut second = first.clone();
+        second.id = ClipId(900000);
+        second.start = first.end();
+        q.video_tracks[0].items = vec![first, second];
+        s.project = std::sync::Arc::new(project);
+        s.set_playhead(Tick(TICKS_PER_SECOND));
+        let before = s.render_program_working(1.0).unwrap();
+        assert!(before.px.as_chunks::<4>().0.iter().any(|p| p[0] + p[1] + p[2] > 0.1), "The matching fixture must contain visible picture");
+        if working.is_hdr() {
+            assert!(before.px.as_chunks::<4>().0.iter().any(|p| p[..3].iter().any(|v| *v > 1.0)), "The HDR fixture must exceed SDR white");
+        }
+        let r = s.execute("lumetri.applyMatch", json!({"clip":clip.0,"referenceTime":3*TICKS_PER_SECOND,"faceDetection":false})).unwrap();
+        let after = s.render_program_working(1.0).unwrap();
+        let delta = before.px.iter().zip(&after.px).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(delta < 0.002, "{working:?}: matching an identical graded shot changed the image by {delta}; {r}");
+        assert!(r["distanceBefore"].as_f64().unwrap() < 0.002, "{working:?}: identical shots reported different: {r}");
+    }
+}
+
+#[test]
 fn import_lut_set_input_and_look_then_undo() {
     let mut s = demo();
     let clip = pick_clip(&mut s);
@@ -135,6 +228,7 @@ fn set_param_fills_in_parameters_missing_from_old_instances() {
 fn apply_match_grades_the_clip_towards_the_reference() {
     let mut s = demo();
     let clip = pick_clip(&mut s);
+    let original = s.project.clone();
     let q = s.active_sequence().unwrap();
     // reference: the middle of the last clip on V1 (a different shot)
     let other = q.video_tracks[0].items.iter().rfind(|i| i.id != clip).unwrap();
@@ -150,9 +244,7 @@ fn apply_match_grades_the_clip_towards_the_reference() {
     assert!(moved, "{r}");
     // one undo step
     s.execute("edit.undo", json!({})).unwrap();
-    let q = s.active_sequence().unwrap();
-    let e = q.find_item(clip).unwrap().1.effects.iter().find(|e| e.effect == "lumetri").unwrap();
-    assert_eq!(e.param("wheel_midtones").and_then(|p| p.value.as_vec2()).map(|v| v.x), Some(0.0));
+    assert_eq!(s.project, original, "one Undo restores the entire project, including removing the newly added grade");
     // a reference inside the clip itself is refused
     let inside = s.playhead();
     assert!(s.execute("lumetri.applyMatch", json!({"referenceTime": inside.0})).is_err());

@@ -3727,6 +3727,9 @@ fn build() -> Vec<CommandSpec> {
         cmd!("effects.apply", "Apply Effect", [], None, r#"{"clips":[id]?,"effect":"gaussian_blur|Gaussian Blur|…"}"#, has_seq, |s, p| {
             let name = str_p(p, "effect").ok_or_else(|| bad("effects.apply", "need `effect`"))?;
             let def = resolve_effect_name(s, p, name).ok_or_else(|| bad("effects.apply", format!("unknown effect `{name}`")))?;
+            if def.id == "grading_group" {
+                return Err(bad("effects.apply", "create a managed color group with `lumetri.group.create`"));
+            }
             if filmcraft_project::graphic::is_layer_id(def.id) {
                 return Err(bad("effects.apply", "graphic layers are added with graphics.newText / graphics.newShape"));
             }
@@ -3957,6 +3960,11 @@ fn build() -> Vec<CommandSpec> {
         cmd!("effects.toggleEnabled", "Toggle Effect", [], None, r#"{"clip":id,"index":n}"#, has_seq, |s, p| {
             let c = clip_p(p, "clip").ok_or_else(|| bad("effects.toggleEnabled", "need `clip`"))?;
             let idx = u64_p(p, "index").unwrap_or(0) as usize;
+            if let Some(group) =
+                s.active_sequence().and_then(|q| q.find_item(c)).and_then(|(_, i)| i.effects.get(idx)).and_then(|e| e.color_group.as_ref()).map(|g| g.group)
+            {
+                return s.execute("lumetri.group.setEnabled", json!({"group":group}));
+            }
             s.edit_sequence("Toggle Effect", |q, _, _| {
                 let (_, it) = q.find_item_mut(c).ok_or(filmcraft_edit::EditError::NoItem(c))?;
                 if let Some(e) = it.effects.get_mut(idx) {
@@ -3969,6 +3977,14 @@ fn build() -> Vec<CommandSpec> {
         cmd!("effects.reset", "Reset Effect", [], None, r#"{"clip":id,"index":n}"#, has_seq, |s, p| {
             let c = clip_p(p, "clip").ok_or_else(|| bad("effects.reset", "need `clip`"))?;
             let idx = u64_p(p, "index").unwrap_or(0) as usize;
+            if let Some(group) =
+                s.active_sequence().and_then(|q| q.find_item(c)).and_then(|(_, i)| i.effects.get(idx)).and_then(|e| e.color_group.as_ref()).map(|g| g.group)
+            {
+                return s.execute(
+                    "lumetri.group.setVibe",
+                    json!({"group":group,"style":"natural","strength":100.0,"brightness":0.0,"warmth":0.0,"color":0.0,"drama":0.0,"softness":0.0}),
+                );
+            }
             let frame = s.active_sequence().map(|q| (q.settings.width, q.settings.height)).unwrap_or((1920, 1080));
             let source = s.active_sequence().and_then(|q| q.find_item(c)).and_then(|(_, i)| s.project.source_size(i.item)).unwrap_or(frame);
             let ph = s.playhead();
@@ -4245,6 +4261,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::multicam::commands());
     v.extend(crate::essential_sound::commands());
     v.extend(crate::color::commands());
+    v.extend(crate::grading_groups::commands());
     v.extend(crate::graphics::commands());
     v.extend(crate::graphic_templates::commands());
     v.extend(crate::shortcuts::commands());
@@ -4507,7 +4524,7 @@ pub(crate) fn json_to_param(template: &ParamValue, v: &Value) -> Option<ParamVal
 }
 
 /// Encode the accepted parameter value in the JSON shape returned to command callers.
-fn param_value_to_json(value: &ParamValue) -> Value {
+pub(crate) fn param_value_to_json(value: &ParamValue) -> Value {
     match value {
         ParamValue::Float(value) => json!(value),
         ParamValue::Vec2(value) => json!([value.x, value.y]),
@@ -4829,7 +4846,7 @@ fn nest(s: &mut Session, p: &Value) -> Result<Value> {
     r.map(|(n, ids)| json!({"sequence": n.0, "clips": ids.iter().map(|c| c.0).collect::<Vec<_>>()}))
 }
 
-/// `effects.list`: every effect definition with its Effects-panel folder (optionally filtered by
+/// `effects.list`: user-facing effect definitions with their Effects-panel folder (optionally filtered by
 /// kind or folder prefix); `detail` adds each parameter's label, type, default and choices.
 fn list_effects(p: &Value) -> Value {
     let kind = str_p(p, "kind");
@@ -4837,6 +4854,7 @@ fn list_effects(p: &Value) -> Value {
     let detail = p.get("detail").and_then(Value::as_bool).unwrap_or(false);
     let out = filmcraft_project::effect_defs()
         .iter()
+        .filter(|d| d.category.first() != Some(&"Internal"))
         .filter(|d| kind.is_none_or(|k| format!("{:?}", d.kind).eq_ignore_ascii_case(k)))
         .filter(|d| folder.is_none_or(|f| d.category.join("/").starts_with(f)))
         .map(|d| {

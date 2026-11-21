@@ -38,6 +38,55 @@ fn enable(session: &mut Session) {
     session.backend.enable(PathBuf::from(env!("CARGO_BIN_EXE_filmcraft")));
 }
 
+#[test]
+fn grading_group_backend_commits_atomically_and_respects_cancellation_and_new_edits() {
+    let mut session = Session::default();
+    session.execute("file.newSequence", json!({"width":128,"height":72,"fps":24,"audio":0})).unwrap();
+    let item = session.execute("file.newColorMatte", json!({"seconds":2,"color":"#6080a0"})).unwrap()["item"].as_u64().unwrap();
+    session.execute("timeline.place", json!({"item":item,"track":"V1","seconds":0,"audio":false})).unwrap();
+    let clip = session.active_sequence().unwrap().video_tracks[0].items[0].id;
+    enable(&mut session);
+    let before = session.project.clone();
+    let undo = session.history.undo.len();
+    let start = Instant::now();
+    let ack = session.execute("lumetri.group.create", json!({"clips":[clip.0],"vibe":"warm-cozy"})).unwrap();
+    assert!(start.elapsed() < Duration::from_millis(200), "matching submission blocked the frontend");
+    let done = finish(&mut session, ack["job"].as_u64().unwrap(), Duration::from_secs(60));
+    assert!(done["result"]["error"].is_null(), "{done}");
+    let pid = done["backend"]["workerPid"].as_u64().unwrap();
+    assert_ne!(pid, u64::from(std::process::id()));
+    let group = done["backend"]["output"]["group"].as_u64().unwrap();
+    assert!(session.project.color_groups.contains_key(&group), "finished must mean committed, not merely calculated");
+    assert!(!session.backend.color_matching_state(session.document_epoch).0);
+    assert!(session.backend.color_matching_state(session.document_epoch).1.is_none());
+    assert_eq!(Arc::strong_count(&before), 2, "completed matching must release its project snapshot; only this test and Undo retain it");
+    assert_eq!(session.history.undo.len(), undo + 1);
+    session.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(session.project, before);
+
+    let ack = session.execute("lumetri.group.create", json!({"clips":[clip.0]})).unwrap();
+    let id = ack["job"].as_u64().unwrap();
+    session.jobs.iter().find(|job| job.id == id).unwrap().progress.cancel.store(true, Ordering::Release);
+    let done = finish(&mut session, id, Duration::from_secs(60));
+    assert!(done["result"]["error"].as_str().is_some(), "{done}");
+    assert_eq!(session.project, before, "cancelled matching must not edit the project");
+
+    let ack = session.execute("lumetri.group.create", json!({"clips":[clip.0]})).unwrap();
+    // Edit directly before pumping pending worker results, so this conflict has no timing race.
+    session
+        .edit("A concurrent project edit", |project, _| {
+            project.name = "Preserved user edit".into();
+            Ok(())
+        })
+        .unwrap();
+    let edited = session.project.clone();
+    let done = finish(&mut session, ack["job"].as_u64().unwrap(), Duration::from_secs(60));
+    assert!(done["result"]["error"].as_str().is_some_and(|e| e.contains("project changed")), "{done}");
+    assert_eq!(session.project, edited, "stale matching must preserve current edits");
+    assert!(session.backend.color_matching_state(session.document_epoch).1.is_some());
+    assert_eq!(session.backend.color_matching_state(session.document_epoch.wrapping_add(1)), (false, None));
+}
+
 fn job(session: &mut Session, id: u64) -> Value {
     session.execute("jobs.list", json!({})).unwrap().as_array().unwrap().iter().find(|j| j["id"] == id).unwrap().clone()
 }

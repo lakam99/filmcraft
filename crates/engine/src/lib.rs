@@ -22,6 +22,7 @@ pub mod demo;
 pub mod doc_path;
 pub mod essential_sound;
 pub mod export_tools;
+pub mod grading_groups;
 pub mod graphic_templates;
 pub mod graphics;
 pub mod interchange;
@@ -722,6 +723,8 @@ impl Session {
     /// Apply worker notifications (call regularly, e.g. once per UI frame). Also applies the
     /// results of finished proxy / ingest jobs.
     pub fn poll_persistence(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        backend::poll(self);
         linked_compositions::poll(self);
         proxies::poll(self);
         masks::poll(self);
@@ -795,6 +798,10 @@ impl Session {
 
     /// Run a command by id.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.exec_depth == 0 {
+            backend::poll(self);
+        }
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         // headless sessions (CLI, MCP, control channel) have no UI frame loop calling
         // `poll_persistence`: apply background mask tracking before each command (#3302)
@@ -987,6 +994,7 @@ impl Session {
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
+        p.check_color_groups().map_err(EngineError::Other)?;
         self.refuse_self_nesting(&p)?;
         self.drop_orphan_transitions(&mut p);
         let old = std::mem::replace(&mut self.project, Arc::new(p));
@@ -1014,6 +1022,7 @@ impl Session {
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
+        p.check_color_groups().map_err(EngineError::Other)?;
         self.refuse_self_nesting(&p)?;
         self.drop_orphan_transitions(&mut p);
         self.project = Arc::new(p);

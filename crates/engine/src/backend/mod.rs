@@ -58,6 +58,7 @@ pub(crate) enum Task {
     Interchange { omf: bool, params: Value, media_dir: Option<String> },
     Media { sequence: ItemId, settings: Box<ExportSettings> },
     Preview { mode: Option<crate::previews::RenderMode>, params: Value, directory: PathBuf },
+    ColorGroup { operation: crate::grading_groups::Operation },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -87,6 +88,7 @@ struct Completion {
 pub(crate) struct State {
     pid: AtomicU32,
     output: Mutex<Option<Value>>,
+    pending_color: Mutex<Option<(crate::grading_groups::Plan, Report)>>,
 }
 
 struct Tracked {
@@ -97,6 +99,8 @@ struct Tracked {
     sequence: Option<ItemId>,
     destination: Option<String>,
     preview: bool,
+    color: bool,
+    color_base: Option<Arc<Project>>,
 }
 
 /// Opt-in by native hosts that support `--backend-worker`. Disabled in engine unit tests,
@@ -127,6 +131,18 @@ impl Runtime {
 
     pub fn executable(&self) -> Option<&std::path::Path> {
         self.executable.as_deref()
+    }
+
+    /// Current-document status for the Color panel. A failed match stays visible until a new
+    /// attempt succeeds, and a job from another open document never disables its controls.
+    pub fn color_matching_state(&self, epoch: u64) -> (bool, Option<String>) {
+        let matching = |t: &&Tracked| t.color && t.document_epoch == epoch;
+        let running = self.jobs.values().filter(matching).any(|t| !t.progress.finished.load(Ordering::Acquire));
+        let latest = self.jobs.iter().filter(|(_, t)| t.color && t.document_epoch == epoch).max_by_key(|(id, _)| **id).map(|(_, t)| t);
+        let error = latest
+            .filter(|t| !running && t.progress.finished.load(Ordering::Acquire))
+            .and_then(|t| t.progress.error.lock().unwrap_or_else(PoisonError::into_inner).clone());
+        (running, error)
     }
 
     /// Preview completion may update its content cache, but must not start playback in a
@@ -180,6 +196,58 @@ pub(crate) fn start_preview(s: &mut Session, mode: Option<crate::previews::Rende
     Ok(json!({"job":id, "poll":"jobs.list", "cancel":"jobs.cancel", "background":true}))
 }
 
+pub(crate) fn start_color_group(s: &mut Session, operation: crate::grading_groups::Operation) -> Result<Value> {
+    let id = start(s, s.project.clone(), Task::ColorGroup { operation }, "Matching color group".into())?;
+    Ok(
+        json!({"job":id,"poll":"jobs.list","cancel":"jobs.cancel","background":true,"status":"Matching clips; the shared look will be ready when this job finishes"}),
+    )
+}
+
+/// Commit a computed plan on the owning session, never in a rendering worker. A stale document,
+/// cancelled job or failed calculation cannot overwrite edits made while matching was running.
+pub(crate) fn poll(s: &mut Session) {
+    for tracked in s.backend.jobs.values_mut().filter(|t| t.progress.finished.load(Ordering::Acquire)) {
+        // Completed jobs keep their small reports, never whole historical project snapshots.
+        tracked.color_base = None;
+    }
+    let ready = s
+        .backend
+        .jobs
+        .iter_mut()
+        .filter_map(|(id, t)| {
+            let pending = t.state.pending_color.lock().unwrap_or_else(PoisonError::into_inner).take()?;
+            Some((*id, t.document_epoch, t.color_base.take(), t.progress.clone(), t.state.clone(), pending))
+        })
+        .collect::<Vec<_>>();
+    for (id, epoch, base, progress, state, (plan, report)) in ready {
+        let outcome = if progress.cancel.load(Ordering::Acquire) {
+            Err("cancelled".to_string())
+        } else if epoch != s.document_epoch || !base.as_ref().is_some_and(|base| Arc::ptr_eq(base, &s.project)) {
+            Err("The project changed while color matching was running. Your edits are preserved; run Match again.".into())
+        } else {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::grading_groups::apply_plan(s, plan)))
+                .map_err(|_| "Color matching could not be applied; your project is unchanged (see the crash log).".to_string())
+                .and_then(|result| result.map_err(|e| e.to_string()))
+        };
+        let result = match outcome {
+            Ok(output) => {
+                *state.output.lock().unwrap_or_else(PoisonError::into_inner) = Some(output);
+                *progress.status.lock().unwrap_or_else(PoisonError::into_inner) = "Color group ready".into();
+                Ok(report)
+            }
+            Err(error) => {
+                *progress.error.lock().unwrap_or_else(PoisonError::into_inner) = Some(error.clone());
+                *progress.status.lock().unwrap_or_else(PoisonError::into_inner) = error.clone();
+                Err(error)
+            }
+        };
+        if let Some(job) = s.jobs.iter().find(|j| j.id == id) {
+            *job.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
+        }
+        progress.finished.store(true, Ordering::Release);
+    }
+}
+
 fn start(s: &mut Session, project: Arc<Project>, task: Task, label: String) -> Result<u64> {
     if s.exec_depth > 1 {
         return Err(EngineError::Other("background renders cannot run inside an atomic editing batch; start the render after the batch".into()));
@@ -187,7 +255,7 @@ fn start(s: &mut Session, project: Arc<Project>, task: Task, label: String) -> R
     let destination = match &task {
         Task::Interchange { params, .. } => params["path"].as_str(),
         Task::Media { settings, .. } => Some(settings.path.as_str()),
-        Task::Preview { .. } => None,
+        Task::Preview { .. } | Task::ColorGroup { .. } => None,
     }
     .map(|path| {
         let path = std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path)).to_string_lossy().replace('\\', "/");
@@ -211,6 +279,8 @@ fn start(s: &mut Session, project: Arc<Project>, task: Task, label: String) -> R
         .clone()
         .ok_or_else(|| EngineError::Other(s.backend.failure.clone().unwrap_or_else(|| "the native backend is unavailable".into())))?;
     let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0).checked_add(1).ok_or_else(|| EngineError::Other("job identity limit reached".into()))?;
+    let color = matches!(task, Task::ColorGroup { .. });
+    let color_base = color.then(|| project.clone());
     let snapshot = Snapshot::capture(s, project);
     let state: Arc<State> = Arc::default();
     let tracked_state = state.clone();
@@ -219,10 +289,20 @@ fn start(s: &mut Session, project: Arc<Project>, task: Task, label: String) -> R
     let work = Work { executable, snapshot, task, pool: s.media.clone(), services: s.services.clone(), previews: s.previews.clone(), state: state.clone() };
     let (progress, result) = (job.progress.clone(), job.result.clone());
     let run = crate::export_tools::guard_job(progress.clone(), result.clone(), move || {
-        let outcome = run(work, &progress).map(|done| {
+        let outcome = run(work, &progress).and_then(|done| {
+            if color {
+                let plan = serde_json::from_value(done.output).map_err(|e| format!("invalid color matching result: {e}"))?;
+                *progress.status.lock().unwrap_or_else(PoisonError::into_inner) = "Applying color match".into();
+                *state.pending_color.lock().unwrap_or_else(PoisonError::into_inner) = Some((plan, done.report));
+                return Ok(None);
+            }
             *state.output.lock().unwrap_or_else(PoisonError::into_inner) = Some(done.output);
-            done.report
+            Ok(Some(done.report))
         });
+        if matches!(outcome, Ok(None)) {
+            return;
+        }
+        let outcome = outcome.and_then(|report| report.ok_or_else(|| "missing backend report".to_string()));
         if let Err(error) = &outcome {
             *progress.error.lock().unwrap_or_else(PoisonError::into_inner) = Some(error.clone());
             *progress.status.lock().unwrap_or_else(PoisonError::into_inner) = error.clone();
@@ -244,6 +324,8 @@ fn start(s: &mut Session, project: Arc<Project>, task: Task, label: String) -> R
             sequence: s.state.active_sequence,
             destination,
             preview,
+            color,
+            color_base,
         },
     );
     s.jobs.push(job);

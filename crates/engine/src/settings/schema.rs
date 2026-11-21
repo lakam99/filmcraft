@@ -376,6 +376,7 @@ pub(super) static CATEGORIES: &[Category] = &[
         id: "color",
         title: "Color",
         rows: &[
+            b("color.gradingAdvanced", "Use advanced color grading controls", true),
             Row::Group(
                 "Display Color Settings",
                 &[

@@ -557,6 +557,9 @@ pub fn parse_file_detailed(bytes: &[u8]) -> std::result::Result<crate::prfpset::
         return Err(format!("preset file version {} is newer than this build reads (1)", f.version));
     }
     for p in &f.presets {
+        if p.effects.iter().any(|e| e.effect == "grading_group" || e.color_group.is_some()) {
+            return Err("grading group links belong to their project; share the creative look with `lumetri.group.exportCube`".into());
+        }
         if p.effects.iter().any(|e| e.def().is_none()) {
             return Err(format!("preset `{}` uses an effect this build doesn't have", p.name));
         }
@@ -587,6 +590,7 @@ pub(crate) fn effect_instance(id: &str) -> EffectInstance {
         post_fader: false,
         essential: false,
         layer: None,
+        color_group: None,
     })
 }
 
@@ -912,6 +916,9 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
     };
     if idx.is_empty() {
         return Err(bad("presets.save", "no effects to save (pass `effects`)"));
+    }
+    if idx.iter().filter_map(|index| it.effects.get(*index)).any(|effect| effect.color_group.is_some()) {
+        return Err(bad("presets.save", "grading groups are saved with the project; export their shared look with `lumetri.group.exportCube`"));
     }
     let mode = match str_p(p, "keyframes") {
         None => Some(KeyframeMode::Scale),

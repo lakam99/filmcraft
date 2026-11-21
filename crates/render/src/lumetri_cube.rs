@@ -70,6 +70,25 @@ pub fn sample_lumetri(
     size: usize,
     title: &str,
 ) -> Result<CubeSample, String> {
+    sample_lumetri_with_strength(effects, project, t, frame_rate, pipe, size, title, 1.0)
+}
+
+/// Sample the shared creative look at its linear-light blend strength. Member-specific
+/// automatic matching is deliberately not part of a reusable creative-look LUT.
+#[allow(clippy::too_many_arguments)]
+pub fn sample_lumetri_with_strength(
+    effects: &[&EffectInstance],
+    project: Option<&Project>,
+    t: Tick,
+    frame_rate: f64,
+    pipe: &ColorPipeline,
+    size: usize,
+    title: &str,
+    strength: f32,
+) -> Result<CubeSample, String> {
+    if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+        return Err("look strength must be between 0 and 1".into());
+    }
     if !pipe.is_plain() {
         return Err("a .cube can be exported from a Rec. 709 sequence without wide gamut; the sequence's color settings use another pipeline".into());
     }
@@ -101,17 +120,20 @@ pub fn sample_lumetri(
         project,
         env: None,
         frame_rate: if frame_rate.is_finite() && frame_rate > 0.0 { frame_rate } else { 24.0 },
+        gamut: pipe.working_gamut(),
         working: pipe.working,
     };
     for e in &graded {
         effects::apply(&mut img, e, &cx);
     }
     let mut data = Vec::with_capacity(size * size * size);
-    for p in img.px.as_chunks::<4>().0 {
+    for (i, p) in img.px.as_chunks::<4>().0.iter().enumerate() {
         if !p.iter().all(|v| v.is_finite()) {
             return Err("the grade gives a value that is not a number".into());
         }
-        data.push(enc([p[0], p[1], p[2]]).map(|v| v.clamp(0.0, 1.0)));
+        let original = dec([(i % size) as f32 / n, ((i / size) % size) as f32 / n, (i / (size * size)) as f32 / n]);
+        let blended = std::array::from_fn(|channel| original[channel] + strength * (p[channel] - original[channel]));
+        data.push(enc(blended).map(|v| v.clamp(0.0, 1.0)));
     }
     Ok(CubeSample { lut: Lut3d { title: title.to_string(), size, domain_min: [0.0; 3], domain_max: [1.0; 3], data }, left_out })
 }
@@ -162,6 +184,7 @@ mod tests {
             project: None,
             env: None,
             frame_rate: 24.0,
+            gamut: ColorPipeline::REC709.working_gamut(),
             working: ColorPipeline::REC709.working,
         };
         let mut worst = 0.0f32;
@@ -176,6 +199,27 @@ mod tests {
         assert!(worst < 3.0 / 255.0, "worst error {worst}");
         // and it is a real grade: the table is not the identity
         assert!((s.lut.apply([0.5, 0.5, 0.5])[0] - 0.5).abs() > 0.02);
+    }
+
+    #[test]
+    fn grading_shared_look_strength_blends_in_linear_light() {
+        let e = lumetri(&[("exposure", ParamValue::Float(1.0))]);
+        let sample = |strength| sample_lumetri_with_strength(&[&e], None, Tick::ZERO, 24.0, &ColorPipeline::REC709, 9, "shared", strength).unwrap();
+        let none = sample(0.0);
+        let half = sample(0.5);
+        let full = sample(1.0);
+        for (i, ((none, half), full)) in none.lut.data.iter().zip(&half.lut.data).zip(&full.lut.data).enumerate() {
+            // Avoid clipped lattice points when comparing decoded output values.
+            if i % 9 < 5 && (i / 9) % 9 < 5 && i / 81 < 5 {
+                let a = dec(*none);
+                let b = dec(*half);
+                let c = dec(*full);
+                for k in 0..3 {
+                    assert!((b[k] - (a[k] + c[k]) * 0.5).abs() < 1e-5);
+                }
+            }
+        }
+        assert!(sample_lumetri_with_strength(&[&e], None, Tick::ZERO, 24.0, &ColorPipeline::REC709, 9, "bad", f32::NAN).is_err());
     }
 
     #[test]

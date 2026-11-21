@@ -116,6 +116,7 @@ impl FxEnv for ItemEnv<'_> {
             project: Some(self.project),
             env: None,
             frame_rate: self.seq.settings.frame_rate.as_f64(),
+            gamut: self.seq.settings.color.working_gamut(),
             working: self.seq.settings.color.working,
         };
         for e in &self.item.effects {

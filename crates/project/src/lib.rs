@@ -76,6 +76,8 @@ pub use track::{
     AudioChannels, FieldOptions, FieldProcessing, Marker, MarkerKind, TimeInterpolation, Track, TrackItem, TrackKind, Transition, TransitionAlign,
 };
 pub use view::{MAX_LUT_TEXT_BYTES, ProjectLut, ProjectView, SequenceView};
+pub mod grading;
+pub use grading::{ColorGradeGroup, GradeGroupLink, GradeReference, MAX_GRADING_GROUP_MEMBERS, MAX_GRADING_GROUPS, VibeControls};
 id_type!(ItemId);
 id_type!(BinId);
 id_type!(TrackId);
@@ -100,6 +102,10 @@ pub struct Project {
     /// embedded, so projects render without the original files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub luts: Vec<ProjectLut>,
+    /// Shared creative looks; member-specific automatic balance is stored on timeline effects.
+    /// Schema v18. Ids use the project's common monotonic identity source.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub color_groups: BTreeMap<u64, std::sync::Arc<ColorGradeGroup>>,
     /// Transcripts of media items (Text panel ▸ Transcript), keyed by the media item; word times
     /// are media time. Shared (`Arc`) so undo snapshots don't copy them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -144,6 +150,7 @@ impl Project {
             items: BTreeMap::new(),
             next_id: 1,
             luts: Vec::new(),
+            color_groups: BTreeMap::new(),
             transcripts: BTreeMap::new(),
             search_bins: Vec::new(),
             source_graphics: BTreeMap::new(),
@@ -176,6 +183,7 @@ impl Project {
             }
         }
         self.search_bins.iter().for_each(|b| see(b.id.0));
+        self.color_groups.keys().copied().for_each(&mut see);
         // deleting an item leaves these entries behind: a new item taking that id would inherit them
         self.transcripts.keys().chain(self.source_graphics.keys()).chain(self.narrations.keys()).for_each(|i| see(i.0));
         // `lut.import` names LUTs `lut<id>`
@@ -199,6 +207,7 @@ impl Project {
                             see(c.id.0);
                             see(c.item.0);
                             c.link.into_iter().chain(c.group).for_each(&mut see);
+                            c.effects.iter().filter_map(|e| e.color_group.as_ref()).for_each(|g| see(g.group));
                             c.markers.iter().for_each(|mk| see(mk.id.0));
                         }
                         for tr in &t.transitions {

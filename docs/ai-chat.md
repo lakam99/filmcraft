@@ -9,6 +9,11 @@ in one call. Current project IDs, selection and command availability are still r
 from the editor. Starting a new chat clears its learned reference. This uses the
 existing chat settings and requires no MCP configuration.
 
+For scene matching and everyday moods, the assistant uses saved color groups rather than
+copying individual grades between clips. Ask it to match selected shots and describe the mood;
+it can adjust the whole look later while keeping each member's automatic balance. See
+[Color by feeling](color-vibes.md) for the controls, matching limits and command examples.
+
 ## Batches and saved history
 
 Bulk requests use batches of up to 64 discovered editor commands per AI tool call,

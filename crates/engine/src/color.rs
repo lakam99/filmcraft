@@ -204,8 +204,9 @@ fn export_cube(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"clip": clip.0, "path": path, "size": size, "bytes": text.len(), "leftOut": left_out}))
 }
 
-/// The target clip and the index of its Color Grading effect (applying Color Grading when missing).
-pub(crate) fn lumetri_clip(s: &mut Session, p: &Value, cmd: &str) -> Result<(ClipId, usize)> {
+/// Resolve without editing: commands that can fail during rendering must not leave a new grade
+/// (or an undo entry) behind when their validation fails.
+fn lumetri_target(s: &Session, p: &Value, cmd: &str) -> Result<(ClipId, Option<usize>)> {
     let seq = s.active_sequence().ok_or_else(|| bad(cmd, "no active sequence"))?;
     let video = |c: &ClipId| seq.find_item(*c).is_some_and(|(t, _)| seq.track(t).is_some_and(|t| t.kind == TrackKind::Video));
     let has = |c: &ClipId| seq.find_item(*c).is_some_and(|(_, it)| it.effects.iter().any(|e| e.effect == "lumetri"));
@@ -217,9 +218,17 @@ pub(crate) fn lumetri_clip(s: &mut Session, p: &Value, cmd: &str) -> Result<(Cli
             sel.iter().copied().find(has).or(sel.first().copied()).ok_or_else(|| bad(cmd, "select a video clip"))?
         }
     };
-    if !has(&clip) {
-        s.execute("effects.apply", json!({"clips": [clip.0], "effect": "lumetri"}))?;
+    let idx = seq.find_item(clip).and_then(|(_, it)| it.effects.iter().position(|e| e.effect == "lumetri"));
+    Ok((clip, idx))
+}
+
+/// The target clip and the index of its Color Grading effect (applying Color Grading when missing).
+pub(crate) fn lumetri_clip(s: &mut Session, p: &Value, cmd: &str) -> Result<(ClipId, usize)> {
+    let (clip, idx) = lumetri_target(s, p, cmd)?;
+    if let Some(idx) = idx {
+        return Ok((clip, idx));
     }
+    s.execute("effects.apply", json!({"clips": [clip.0], "effect": "lumetri"}))?;
     let seq = s.active_sequence().ok_or_else(|| bad(cmd, "no active sequence"))?;
     let idx = seq.find_item(clip).and_then(|(_, it)| it.effects.iter().position(|e| e.effect == "lumetri")).ok_or_else(|| bad(cmd, "no Color Grading"))?;
     Ok((clip, idx))
@@ -485,7 +494,7 @@ fn preset_thumbnails(s: &mut Session, p: &Value) -> Result<Value> {
 /// clip at the playhead to the sequence frame at the reference time. Sets the three wheels, their
 /// lightness and Basic saturation in one undo step.
 fn apply_match(s: &mut Session, p: &Value) -> Result<Value> {
-    let (clip, idx) = lumetri_clip(s, p, "lumetri.applyMatch")?;
+    let (clip, idx) = lumetri_target(s, p, "lumetri.applyMatch")?;
     let seq_id = s.state.active_sequence.ok_or_else(|| bad("lumetri.applyMatch", "no active sequence"))?;
     let reference_t = time_p(s, p, "reference").ok_or_else(|| bad("lumetri.applyMatch", "need `referenceTime`, `referenceFrame` or `referenceTimecode`"))?;
     let skin = bool_p(p, "faceDetection").unwrap_or(true);
@@ -495,18 +504,34 @@ fn apply_match(s: &mut Session, p: &Value) -> Result<Value> {
     if it.range().contains(reference_t) {
         return Err(bad("lumetri.applyMatch", "the reference frame is inside the clip being matched; pick a frame from another shot"));
     }
-    let base = it.effects[idx].clone();
+    let base = idx
+        .and_then(|idx| it.effects.get(idx))
+        .cloned()
+        .or_else(|| filmcraft_project::find_effect("lumetri").map(|d| d.instance()))
+        .ok_or_else(|| bad("lumetri.applyMatch", "Color Grading is unavailable"))?;
     // the current shot as Color Grading sees it: the clip with its Color Grading switched off
     let mut probe = (*s.project).clone();
-    if let Some((_, pi)) = probe.sequence_mut(seq_id).and_then(|q| q.find_item_mut(clip)) {
-        pi.effects[idx].enabled = false;
+    if let Some(e) = probe.sequence_mut(seq_id).and_then(|q| q.find_item_mut(clip)).and_then(|(_, pi)| idx.and_then(|idx| pi.effects.get_mut(idx))) {
+        e.enabled = false;
     }
     let provider = s.media.provider(s.project.clone(), s.services.clone());
     let opts = filmcraft_render::RenderOptions { scale: 0.25, working_output: true, ..Default::default() };
     let current =
         filmcraft_render::render_clip(&probe, seq_id, clip, t, opts, &provider).ok_or_else(|| bad("lumetri.applyMatch", "the clip has no picture"))?;
     let reference = filmcraft_render::render_sequence(&s.project, seq_id, reference_t, opts, &provider);
-    let m = filmcraft_render::color_match::solve(&current, &reference, &base, skin);
+    let cx = filmcraft_render::effects::FxCtx {
+        t: it.effect_time_at(t),
+        px_scale: opts.scale,
+        seconds: (t - it.start).seconds(),
+        timecode: "",
+        clip_name: &it.name,
+        project: Some(&s.project),
+        env: None,
+        frame_rate: q.settings.frame_rate.as_f64(),
+        gamut: q.settings.color.working_gamut(),
+        working: q.settings.color.working,
+    };
+    let m = filmcraft_render::color_match::solve_with_context(&current, &reference, &base, skin, &cx);
     let v2 = |a: [f32; 2]| ParamValue::Vec2(filmcraft_geom::Vec2::new(a[0] as f64, a[1] as f64));
     let values = [
         ("wheel_shadows", v2(m.shadows)),
@@ -517,9 +542,16 @@ fn apply_match(s: &mut Session, p: &Value) -> Result<Value> {
         ("wheel_highlights_l", ParamValue::Float(m.lightness[2] as f64)),
         ("saturation", ParamValue::Float(m.saturation as f64)),
         ("wheels_on", ParamValue::Bool(true)),
+        ("basic_on", ParamValue::Bool(true)),
     ];
     s.edit_sequence("Apply Match", |q, _, _| {
         let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
+        let idx = if let Some(idx) = idx {
+            idx
+        } else {
+            it.effects.push(base.clone());
+            it.effects.len().saturating_sub(1)
+        };
         let e = it.effects.get_mut(idx).ok_or_else(|| bad("lumetri.applyMatch", "no Color Grading"))?;
         for (k, v) in &values {
             let prm = e.params.entry(k.to_string()).or_insert_with(|| filmcraft_project::Param::new(v.clone()));

@@ -41,7 +41,7 @@ impl Stage {
                 )
             }
             Task::Media { settings, .. } => (settings.path.as_str(), None),
-            Task::Preview { .. } => return Ok(None),
+            Task::Preview { .. } | Task::ColorGroup { .. } => return Ok(None),
         };
         let destination = std::path::absolute(path).map_err(|e| e.to_string())?;
         let name = destination.file_name().ok_or("export path needs a file name")?.to_owned();
@@ -62,7 +62,7 @@ impl Stage {
                 *media_dir = stage.media.as_ref().map(|p| p.to_string_lossy().into_owned());
             }
             Task::Media { settings, .. } => settings.path = staged_path,
-            Task::Preview { .. } => {}
+            Task::Preview { .. } | Task::ColorGroup { .. } => {}
         }
         Ok(Some(stage))
     }

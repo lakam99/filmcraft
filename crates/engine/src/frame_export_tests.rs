@@ -22,6 +22,32 @@ fn session() -> (Session, ItemId) {
 }
 
 #[test]
+fn grading_saved_project_and_exported_png_preserve_the_preview() {
+    let (mut s, _) = session();
+    let clip = s.active_sequence().unwrap().video_tracks[0].items[0].id;
+    s.execute("effects.apply", json!({"clips":[clip.0],"effect":"lumetri"})).unwrap();
+    for (param, value) in [
+        ("exposure", json!(0.4)),
+        ("temperature", json!(25.0)),
+        ("wheel_midtones", json!([0.08, 0.12])),
+        ("curve_red", json!([[0.0, 0.0], [0.5, 0.6], [1.0, 1.0]])),
+        ("vignette_amount", json!(-1.5)),
+    ] {
+        s.execute("effects.setParam", json!({"clip":clip.0,"effect":"lumetri","param":param,"value":value})).unwrap();
+    }
+    s.set_playhead(FrameRate::FPS_24.tick_of(35));
+    let expected = s.render_program(1.0).unwrap().to_rgba8();
+    let project = serde_json::to_string(&*s.project).unwrap();
+    s.project = Arc::new(serde_json::from_str(&project).unwrap());
+    assert_eq!(s.render_program(1.0).unwrap().to_rgba8(), expected, "Reopening must retain the grade");
+    let path = std::env::temp_dir().join(format!("filmcraft-grading-export-{}.png", std::process::id()));
+    s.execute("file.exportFrame", json!({"target":"program","path":path.to_string_lossy()})).unwrap();
+    let png = image::open(&path).unwrap().to_rgba8();
+    assert_eq!(png.into_raw(), expected, "Exported pixels must match the graded Program monitor");
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn frame_export_selects_the_correct_monitor_time_and_original_media() {
     let (mut s, item) = session();
     let dir = std::env::temp_dir().join(format!("fc-frame-original-{}", std::process::id()));
