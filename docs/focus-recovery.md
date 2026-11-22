@@ -1,5 +1,23 @@
 # Recovering soft focus
 
+Focus Recovery's Lens defocus model processes convolution taps across contiguous rows, retaining
+the reference calculation's addition order, border reflection and quality settings. Repeated
+input pictures can reuse the complete restoration: this helps slowed or held footage without
+changing the timeline frame rate, retiming or the picture.
+
+Reuse compares every input pixel bit (including alpha), frame dimensions and all evaluated
+restoration parameters. Strength keyframes, a changed radius or quality, colour primaries,
+preview scale and changed upstream pixels therefore cannot return an old result. Masks are
+applied after the restored effect output. The cache stays in memory, capped at 128 MiB and four
+entries per rendering process, counting both input and output floats. Frames too large to fit
+are processed normally. A busy cache is bypassed; rendering workers never wait on another
+worker's effect calculation. Failed or cancelled calculations are not stored.
+
+`perf.stats` reports `effects.focusRecoveryCache` hits, misses, bypasses and memory usage for
+the process answering the query. Native background rendering processes own separate caches;
+the counters in the window's process do not aggregate those workers. While a cache is busy,
+its entry and byte counts are `null` rather than blocking the query.
+
 Select a video clip, search Effects for **Focus Recovery**, and apply it. It lives in
 **Video Effects > Blur & Sharpen**. Start at the defaults and judge the face or other subject
 at **Full** playback resolution and 100% monitor zoom. Lower-resolution playback cannot show

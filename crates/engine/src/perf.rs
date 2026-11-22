@@ -66,6 +66,7 @@ pub fn stats(s: &Session) -> Value {
     json!({
         "decode": decode_json(),
         "export": export_json(),
+        "effects": {"scope": "thisProcess", "focusRecoveryCache": filmcraft_render::focus_recovery_cache_stats()},
         "media": {"openSources": s.media.open_sources()},
         "jobs": {"total": s.jobs.len(), "running": running},
     })
@@ -115,6 +116,10 @@ mod tests {
             assert!(v["export"]["stages"][k].is_number(), "export.stages.{k} in {v}");
         }
         assert!(v["media"]["openSources"].is_number());
+        assert_eq!(v["effects"]["scope"], "thisProcess");
+        for k in ["hits", "misses", "bypasses", "limitBytes"] {
+            assert!(v["effects"]["focusRecoveryCache"][k].is_number(), "focusRecoveryCache.{k} in {v}");
+        }
         assert_eq!(v["jobs"]["running"], json!(0));
         assert_eq!(s.history.undo.len(), undo, "a query adds no undo step");
     }
