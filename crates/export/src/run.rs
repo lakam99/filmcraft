@@ -2,8 +2,8 @@ use super::format::{ExportSettings, Format};
 use super::output::{AudioWriter, Out, SharedBuf, write_output};
 use super::still_encode::encode_still_with;
 use super::{
-    Arc, ExportError, Exporter, FrameRate, IntoParallelIterator, ItemId, Ordering, ParallelIterator, PoisonError, Progress, Project, Report, Result,
-    SourceProvider, Step, Tick, TimeRange, Write, aac_out, audio_out, mp3_out, pcm, pipeline, stepped,
+    Arc, ExportError, Exporter, FrameRate, ItemId, Ordering, PoisonError, Progress, Project, Report, Result, SourceProvider, Step, Tick, TimeRange, Write,
+    aac_out, audio_out, mp3_out, pcm, pipeline, stepped,
 };
 
 /// The range to export (settings → In/Out → whole sequence).
@@ -187,7 +187,7 @@ fn export_here(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, s
                 }
                 let end = (f + batch).min(f1);
                 if let Some(enc) = gif.as_mut() {
-                    let frames: Vec<Vec<u8>> = (f..end).into_par_iter().map(|fi| pipe.frame(fi, sources).0).collect();
+                    let frames: Vec<Vec<u8>> = pipe.map_frames(f..end, |fi| pipe.frame(fi, sources).0);
                     for (fi, mut rgba) in (f..end).zip(frames) {
                         // GIF89a has one transparent palette index, not partial alpha. Decide
                         // coverage before quantization and keep the straight colour of visible pixels.
@@ -205,21 +205,11 @@ fn export_here(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, s
                         enc.encode_frame(image::Frame::from_parts(img, 0, 0, delay)).map_err(|e| ExportError::Encode(e.to_string()))?;
                     }
                 } else {
-                    let written: Vec<Result<u64>> = (f..end)
-                        .into_par_iter()
-                        .map(|fi| {
-                            let data = encode_still_with(
-                                settings.format,
-                                pipe.frame(fi, sources).0,
-                                w,
-                                h,
-                                settings.alpha,
-                                settings.quality,
-                                settings.exr_compression,
-                            )?;
-                            write_output(settings, &pcm::image_sequence_path(&settings.path, (fi - f0) as u64, count), data)
-                        })
-                        .collect();
+                    let written: Vec<Result<u64>> = pipe.map_frames(f..end, |fi| {
+                        let data =
+                            encode_still_with(settings.format, pipe.frame(fi, sources).0, w, h, settings.alpha, settings.quality, settings.exr_compression)?;
+                        write_output(settings, &pcm::image_sequence_path(&settings.path, (fi - f0) as u64, count), data)
+                    });
                     for r in written {
                         total += r?;
                     }

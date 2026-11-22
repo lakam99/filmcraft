@@ -13,6 +13,13 @@ entries per rendering process, counting both input and output floats. Frames too
 are processed normally. A busy cache is bypassed; rendering workers never wait on another
 worker's effect calculation. Failed or cancelled calculations are not stored.
 
+Export and preview batches containing enabled Focus Recovery process their frames in order,
+leaving the Rayon pool available for parallel work within each restoration. This lets later
+copies of a picture reuse a completed result instead of simultaneously missing the cache.
+Batches without active Focus Recovery keep their frame parallelism. Nested compositions are
+conservatively ordered when their visible parent contains Focus Recovery; nesting checks have
+depth and work limits.
+
 `perf.stats` reports `effects.focusRecoveryCache` hits, misses, bypasses and memory usage for
 the process answering the query. Native background rendering processes own separate caches;
 the counters in the window's process do not aggregate those workers. While a cache is busy,
