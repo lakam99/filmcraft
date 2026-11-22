@@ -15,9 +15,16 @@ pub mod blend;
 pub mod color_groups;
 pub mod color_match;
 pub mod colorman;
+mod effect_cache;
 pub mod effects;
 pub mod flow;
 mod focus_recovery;
+pub use effect_cache::EffectCacheStats;
+
+/// Pure Focus Recovery frame reuse in this process (native render workers have their own caches).
+pub fn focus_recovery_cache_stats() -> EffectCacheStats {
+    focus_recovery::cache_stats()
+}
 pub mod gpufx;
 pub mod graphic_clip;
 pub mod graphics;
