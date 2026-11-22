@@ -1,7 +1,8 @@
 //! Product adapter for the shared Craft AI Chat plugin. No transport, vault or chat UI is copied here.
 mod tools;
 use crate::FilmcraftApp;
-use craft_ai_chat_egui::{CredentialProfile, Host, HostInfo, Panel, Preferences, ToolCall};
+use craft_ai_chat_egui::client::Panel;
+use craft_ai_chat_egui::{CredentialProfile, Host, HostInfo, Preferences, ToolCall};
 use serde_json::{Value, json};
 
 #[derive(Default)]
