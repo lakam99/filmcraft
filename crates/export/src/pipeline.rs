@@ -174,6 +174,35 @@ impl Drop for Pipeline {
 }
 
 impl Pipeline {
+    /// Focus Recovery already parallelizes inside each image. Running those frames in
+    /// order lets a completed restoration serve repeated pictures, instead of every
+    /// frame bypassing a cache busy in a suspended outer Rayon task. Other batches
+    /// retain frame parallelism; no render worker waits for the effect cache.
+    pub(crate) fn map_frames<T: Send>(&self, frames: std::ops::Range<i64>, render: impl Fn(i64) -> T + Send + Sync) -> Vec<T> {
+        if self.ordered_focus_frames(frames.start, frames.end) { frames.map(render).collect() } else { frames.into_par_iter().map(render).collect() }
+    }
+
+    fn ordered_focus_frames(&self, first: i64, end: i64) -> bool {
+        use filmcraft_time::TimeRange;
+        if end <= first {
+            return false;
+        }
+        let Some(seq) = self.project.sequence(self.seq) else { return false };
+        let start = self.rate.tick_of(first);
+        let range = TimeRange::new(start, self.rate.tick_of(end) - start);
+        let mut remaining = 4096;
+        seq.video_tracks.iter().filter(|track| track.enabled).any(|track| {
+            track.items.iter().filter(|clip| clip.range().overlaps(&range)).any(|clip| clip_uses_focus(&self.project, clip, 0, &mut remaining))
+                || track.transitions.iter().filter(|transition| transition.range().overlaps(&range)).any(|transition| {
+                    [transition.from, transition.to]
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|id| track.item(id))
+                        .any(|clip| clip_uses_focus(&self.project, clip, 0, &mut remaining))
+                })
+        })
+    }
+
     /// Bound outer frame tasks before spawning them, not inside a Rayon job. A renderer can
     /// invoke nested parallel decoding/conversion; those joins may steal another frame task.
     /// With at most one active batch and no more tasks than the initial renderer capacity,
@@ -373,6 +402,26 @@ impl Pipeline {
         filmcraft_render::graphics::burn_text(&mut layer, text, family, centre, px, 0.6);
         composite(img, &layer, 0, 0, op);
     }
+}
+
+/// Nested clips are conservatively ordered for their parent's visible range. Bound
+/// both depth and work: a cyclic or huge nesting graph must not stall an export.
+fn clip_uses_focus(project: &Project, clip: &filmcraft_project::TrackItem, depth: usize, remaining: &mut usize) -> bool {
+    if !clip.enabled {
+        return false;
+    }
+    if depth >= 32 || *remaining == 0 {
+        return true;
+    }
+    *remaining -= 1;
+    clip.effects.iter().any(|effect| effect.enabled && effect.effect == "focus_recovery")
+        || project.sequence(clip.item).is_some_and(|seq| {
+            seq.video_tracks
+                .iter()
+                .filter(|track| track.enabled)
+                .flat_map(|track| &track.items)
+                .any(|clip| clip_uses_focus(project, clip, depth + 1, remaining))
+        })
 }
 
 /// Top-left of a `bw`×`bh` box placed in a `w`×`h` frame (3 % margin) plus `offset`.
@@ -576,5 +625,79 @@ mod overlay_budget_tests {
         let out = resample(&src, 6000, 1);
         assert_eq!((out.w, out.h), (6000, 1));
         assert!(out.px.iter().all(|v| (v - 0.5).abs() < 1e-4));
+    }
+}
+
+#[cfg(test)]
+mod focus_scheduling_tests {
+    use super::*;
+    use filmcraft_time::Tick;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    fn focus_project() -> (Project, ItemId) {
+        let (project, seq, _) = crate::tests::project();
+        let mut project = (*project).clone();
+        project.sequence_mut(seq).unwrap().video_tracks[0].items[0].effects.push(filmcraft_project::find_effect("focus_recovery").unwrap().instance());
+        (project, seq)
+    }
+
+    fn pipeline(project: Project, seq: ItemId) -> Pipeline {
+        Pipeline::new(Arc::new(project), seq, &ExportSettings { gpu_rendering: GpuRendering::Off, ..Default::default() }, false).unwrap()
+    }
+
+    #[test]
+    fn focus_batches_finish_each_frame_before_starting_the_next() {
+        let (project, seq) = focus_project();
+        let pipe = pipeline(project, seq);
+        assert!(pipe.ordered_focus_frames(0, 16));
+        let next = AtomicI64::new(0);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let frames = pool.install(|| {
+            pipe.map_frames(0..16, |frame| {
+                assert_eq!(next.fetch_add(1, Ordering::Relaxed), frame);
+                // Inner image work can still use the pool without starting another frame.
+                (0..32).into_par_iter().sum::<i64>() + frame
+            })
+        });
+        assert_eq!(frames, (0..16).map(|frame| 496 + frame).collect::<Vec<_>>());
+        assert!(!pipe.ordered_focus_frames(24, 40));
+        assert!(!pipe.ordered_focus_frames(8, 8));
+    }
+
+    #[test]
+    fn inactive_focus_keeps_other_batches_parallel() {
+        let (mut project, seq) = focus_project();
+        project.sequence_mut(seq).unwrap().video_tracks[0].items[0].effects.last_mut().unwrap().enabled = false;
+        assert!(!pipeline(project.clone(), seq).ordered_focus_frames(0, 16));
+        project.sequence_mut(seq).unwrap().video_tracks[0].items[0].effects.last_mut().unwrap().enabled = true;
+        project.sequence_mut(seq).unwrap().video_tracks[0].items[0].enabled = false;
+        assert!(!pipeline(project.clone(), seq).ordered_focus_frames(0, 16));
+        project.sequence_mut(seq).unwrap().video_tracks[0].items[0].enabled = true;
+        project.sequence_mut(seq).unwrap().video_tracks[0].enabled = false;
+        assert!(!pipeline(project, seq).ordered_focus_frames(0, 16));
+        let (project, seq, _) = crate::tests::project();
+        assert!(!pipeline((*project).clone(), seq).ordered_focus_frames(0, 16));
+    }
+
+    #[test]
+    fn nesting_and_cycles_are_bounded_and_conservatively_ordered() {
+        let (mut project, child) = focus_project();
+        let settings = project.sequence(child).unwrap().settings.clone();
+        let parent = project.new_sequence("parent", settings.clone(), 1, 0, None);
+        let clip = project
+            .make_track_item(
+                child,
+                filmcraft_project::TrackKind::Video,
+                Tick::ZERO,
+                filmcraft_time::TimeRange::new(Tick::ZERO, settings.frame_rate.tick_of(24)),
+                settings.frame_rate,
+            )
+            .unwrap();
+        project.sequence_mut(parent).unwrap().video_tracks[0].items.push(clip);
+        assert!(pipeline(project.clone(), parent).ordered_focus_frames(0, 16));
+        project.sequence_mut(child).unwrap().video_tracks[0].items[0].effects.clear();
+        assert!(!pipeline(project.clone(), parent).ordered_focus_frames(0, 16));
+        project.sequence_mut(child).unwrap().video_tracks[0].items[0].item = parent;
+        assert!(pipeline(project, parent).ordered_focus_frames(0, 16));
     }
 }
