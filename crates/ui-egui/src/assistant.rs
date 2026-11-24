@@ -1,4 +1,5 @@
 //! Product adapter for the shared Craft AI Chat plugin. No transport, vault or chat UI is copied here.
+mod preview;
 mod tools;
 use crate::FilmcraftApp;
 use craft_ai_chat_egui::client::Panel;

@@ -14,6 +14,18 @@ copying individual grades between clips. Ask it to match selected shots and desc
 it can adjust the whole look later while keeping each member's automatic balance. See
 [Color by feeling](color-vibes.md) for the controls, matching limits and command examples.
 
+## Video frames
+
+Automatic Program/Source attachments and the `video_frame` tool share the same capture path.
+Captures pin the requested frame without seeking either monitor and remain valid while playback
+advances or its resolution changes. A project edit during capture asks for a fresh frame.
+
+AI previews preserve aspect ratio and are capped at 1280 pixels per edge, one million pixels,
+and a 4 MiB PNG. Source decoders may return larger frames than requested; capture preparation
+resizes those frames to the preview budget. Desktop resizing and encoding run in bounded
+background work so preparing attachments does not block the editor. Cached display pixels and
+the project's media are unchanged.
+
 ## Batches and saved history
 
 Bulk requests use batches of up to 64 discovered editor commands per AI tool call,
