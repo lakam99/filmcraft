@@ -14,6 +14,10 @@ use web_time::Instant;
 use super::{Request, Response, Snapshot, client::Client, protocol, services, worker};
 use crate::{MediaPool, Services, Session};
 
+/// Interactive rendering processes share a bounded CPU budget, leaving capacity
+/// for the frontend and audio. Keep this count and the per-process budget together.
+pub const WORKER_COUNT: usize = 2;
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub executable: PathBuf,
@@ -48,6 +52,10 @@ pub struct FrameRequest {
     pub time: Tick,
     pub scale: f32,
     pub draft: bool,
+    #[serde(default)]
+    pub catch_up: Option<Tick>,
+    #[serde(default)]
+    pub background: bool,
     pub gpu: bool,
     pub preview_directory: Option<PathBuf>,
     pub preview_generation: u64,
@@ -61,6 +69,7 @@ pub struct Frame {
     pub rgba: Vec<u8>,
     pub preview: bool,
     pub loading: bool,
+    pub source_ns: u64,
 }
 
 pub struct Renderer {
@@ -71,11 +80,26 @@ pub struct Renderer {
     source_generation: u64,
     failed_at: Option<Instant>,
     gpu_failed: bool,
+    source_time: Duration,
 }
 
 impl Renderer {
     pub fn new(config: Config) -> Self {
-        Self { config, client: None, project: Weak::new(), preview_generation: 0, source_generation: 0, failed_at: None, gpu_failed: false }
+        Self {
+            config,
+            client: None,
+            project: Weak::new(),
+            preview_generation: 0,
+            source_generation: 0,
+            failed_at: None,
+            gpu_failed: false,
+            source_time: Duration::ZERO,
+        }
+    }
+
+    /// Source work of the last drained reply, including superseded frames.
+    pub fn source_time(&self) -> Duration {
+        self.source_time
     }
 
     /// Called only on a frame coordinator thread. The UI only requests cached frames.
@@ -88,6 +112,8 @@ impl Renderer {
         cancel: &AtomicBool,
         stop: &AtomicBool,
     ) -> Result<Frame, String> {
+        self.source_time = Duration::ZERO;
+        let started = Instant::now();
         if cancel.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
             return Err("cancelled".into());
         }
@@ -118,6 +144,7 @@ impl Renderer {
             let client = self.client.as_mut().ok_or("preview backend unavailable")?;
             client.request(Request::Frame { snapshot, request }, &[])?;
             let frame = client.frame(stop)?;
+            self.source_time = Duration::from_nanos(frame.source_ns).min(started.elapsed());
             self.project = Arc::downgrade(project);
             self.preview_generation = preview_generation;
             self.source_generation = source_generation;
@@ -200,10 +227,18 @@ pub fn serve_stdio(factory: filmcraft_export::FrameRendererFactory) -> Result<()
         }))
         .unwrap_or_else(|_| Err("preview renderer failed; retrying without GPU rendering".into()));
         let (message, data) = match result {
-            Ok(frame) => {
-                (Response::Frame { width: frame.width, height: frame.height, preview: frame.preview, loading: frame.loading, error: None }, frame.rgba)
-            }
-            Err(error) => (Response::Frame { width: 0, height: 0, preview: false, loading: false, error: Some(error) }, Vec::new()),
+            Ok(frame) => (
+                Response::Frame {
+                    width: frame.width,
+                    height: frame.height,
+                    preview: frame.preview,
+                    loading: frame.loading,
+                    source_ns: frame.source_ns,
+                    error: None,
+                },
+                frame.rgba,
+            ),
+            Err(error) => (Response::Frame { width: 0, height: 0, preview: false, loading: false, source_ns: 0, error: Some(error) }, Vec::new()),
         };
         protocol::send(&mut *output.lock().unwrap_or_else(PoisonError::into_inner), &message, &data).map_err(|e| e.to_string())?;
     }
@@ -230,14 +265,16 @@ fn render(s: &Session, request: &FrameRequest, gpu: Option<&mut (dyn filmcraft_e
         }
     }
     let _ = filmcraft_media::pending::take();
-    let provider = s.media.provider(s.project.clone(), s.services.clone());
+    let started = Instant::now();
+    let clock = super::source_timing::Clock::default();
+    let provider = super::source_timing::Provider { inner: s.media.provider(s.project.clone(), s.services.clone()), clock: clock.clone() };
     let opts = filmcraft_render::RenderOptions { scale: request.scale, captions: true, ..Default::default() };
     let mut preview = false;
-    let image = filmcraft_media::cancel::with_draft(request.draft, || match request.target {
+    let image = request_context(request, || match request.target {
         Target::Sequence(id) | Target::SequenceLive(id) => {
             if matches!(request.target, Target::Sequence(_))
                 && let Some(q) = s.project.sequence(id)
-                && let Some(frame) = s.previews.frame(&s.media, &s.project, id, q.settings.frame_rate.frame_at(request.time), request.scale)
+                && let Some(frame) = clock.measure(|| s.previews.frame(&s.media, &s.project, id, q.settings.frame_rate.frame_at(request.time), request.scale))
             {
                 preview = true;
                 let image = filmcraft_render::Image { w: frame.width as usize, h: frame.height as usize, px: frame.to_linear_f32() };
@@ -282,5 +319,43 @@ fn render(s: &Session, request: &FrameRequest, gpu: Option<&mut (dyn filmcraft_e
         rgba: image.over_black_with_alpha_rgba8(),
         preview,
         loading: filmcraft_media::pending::take(),
+        source_ns: u64::try_from(clock.elapsed().min(started.elapsed()).as_nanos()).unwrap_or(u64::MAX),
     })
+}
+
+/// Decoder hints are thread-local and must be explicitly restored in the child.
+fn request_context<R>(request: &FrameRequest, render: impl FnOnce() -> R) -> R {
+    filmcraft_media::cancel::with_catch_up(request.catch_up, || {
+        filmcraft_media::cancel::with_background(request.background, || filmcraft_media::cancel::with_draft(request.draft, render))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn worker_request_preserves_and_scopes_decoder_hints() {
+        let request = FrameRequest {
+            target: Target::Item(ItemId(1)),
+            time: Tick::ZERO,
+            scale: 0.0625,
+            draft: true,
+            catch_up: Some(Tick(123)),
+            background: true,
+            gpu: false,
+            preview_directory: None,
+            preview_generation: 0,
+            source_generation: 0,
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        let decoded: FrameRequest = serde_json::from_value(encoded).unwrap();
+        request_context(&decoded, || {
+            assert_eq!(filmcraft_media::cancel::catch_up(), Some(Tick(123)));
+            assert!(filmcraft_media::cancel::background());
+            assert!(filmcraft_media::cancel::draft());
+        });
+        assert_eq!(filmcraft_media::cancel::catch_up(), None);
+        assert!(!filmcraft_media::cancel::background());
+        assert!(!filmcraft_media::cancel::draft());
+    }
 }

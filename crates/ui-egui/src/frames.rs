@@ -133,6 +133,41 @@ fn straight_srgb(a: u8, v: u8) -> u8 {
     table.get(usize::from(a) * 256 + usize::from(v)).copied().unwrap_or(v)
 }
 
+/// A slow Full-resolution result must not train the model used after switching to
+/// Sixteenth, another sequence, a changed grade, or a different decoding quality.
+#[derive(Default)]
+struct RenderCost {
+    key: Option<(Target, u32, bool, u64)>,
+    seconds: f64,
+    latency: f64,
+}
+impl RenderCost {
+    fn class(key: FrameKey) -> (Target, u32, bool, u64) {
+        (key.target, key.size, key.draft, key.revision)
+    }
+    fn select(&mut self, key: FrameKey) {
+        let class = Self::class(key);
+        if self.key != Some(class) {
+            self.key = Some(class);
+            self.seconds = 0.0;
+            self.latency = 0.0;
+        }
+    }
+    fn observe(&mut self, key: FrameKey, cost: f64, latency: f64, cancelled: bool) {
+        // Only the selected playback format can affect its prediction. In-flight
+        // work from a superseded format may finish after the next one is selected.
+        if self.key != Some(Self::class(key)) || !cost.is_finite() || cost < 0.0 || !latency.is_finite() || latency < cost {
+            return;
+        }
+        if !cancelled || cost > self.seconds {
+            self.seconds = if self.seconds == 0.0 { cost } else { self.seconds * 0.8 + cost * 0.2 };
+        }
+        if !cancelled || latency > self.latency {
+            self.latency = if self.latency == 0.0 { latency } else { self.latency * 0.8 + latency * 0.2 };
+        }
+    }
+}
+
 struct Job {
     key: FrameKey,
     queued: Instant,
@@ -167,7 +202,7 @@ struct Shared {
     /// Running estimate (s) of the per-frame work of playback jobs that is not fetching source
     /// frames: compositing, CPU effects. Frames cannot be ready sooner than this after they are
     /// started, and the workers can finish at most `workers / cost` of them per second.
-    render_cost: Mutex<f64>,
+    render_cost: Mutex<RenderCost>,
     workers: usize,
     /// Always-on counters for `perf.stats`.
     stats: Mutex<FrameStats>,
@@ -482,6 +517,14 @@ pub fn playback_plan(render_cost: f64, fps: f64, workers: usize) -> (i64, i64) {
     (frames_per_job.ceil() as i64, load.ceil() as i64)
 }
 
+/// Source work cannot be eliminated by dropping more output frames, but its
+/// latency still has to fit before the display deadline. Keep it in the lead,
+/// separately from the effect-throughput estimate that decides the stride.
+fn latency_plan(render_cost: f64, latency: f64, fps: f64, workers: usize) -> (i64, i64) {
+    let (lead, stride) = playback_plan(render_cost, fps, workers);
+    (lead.max((latency * fps * 1.15).ceil() as i64).max(1), stride.max(1))
+}
+
 impl FrameServer {
     /// Settings ▸ Memory ▸ frame cache budget (bytes); evicts down to it right away.
     pub fn set_cache_budget(&self, bytes: usize) {
@@ -516,7 +559,7 @@ impl FrameServer {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let backend = filmcraft_engine::backend::frames::Config::for_session(session);
-            let workers = if backend.is_some() { 2 } else { Self::default_workers() };
+            let workers = if backend.is_some() { filmcraft_engine::backend::frames::WORKER_COUNT } else { Self::default_workers() };
             Self::build(session.media.clone(), session.services.clone(), session.previews.clone(), workers, backend)
         }
         #[cfg(target_arch = "wasm32")]
@@ -568,7 +611,7 @@ impl FrameServer {
             in_flight: Mutex::new(Vec::new()),
             profiling: AtomicBool::new(false),
             records: Mutex::new(Vec::new()),
-            render_cost: Mutex::new(0.0),
+            render_cost: Mutex::new(RenderCost::default()),
             workers: workers.max(1),
             stats: Mutex::new(FrameStats::default()),
             stop: AtomicBool::new(false),
@@ -754,7 +797,56 @@ impl FrameServer {
         let dir = if speed < 0.0 { -1 } else { 1 };
         let step = speed.abs().max(1.0) as i64;
         let fps = rate.as_f64() * speed.abs().max(1.0) / step as f64;
-        let (lead, stride) = if preroll { (1, 1) } else { playback_plan(self.render_cost(), fps, self.shared.workers) };
+        let (cost, latency) = {
+            let mut model = self.shared.render_cost.lock().unwrap_or_else(PoisonError::into_inner);
+            model.select(key);
+            (model.seconds, model.latency)
+        };
+        let (lead, stride) = if preroll { (1, 1) } else { latency_plan(cost, latency, fps, self.shared.workers) };
+        // Anchor the stride to the timeline. Re-anchoring it at the moving playhead
+        // fills every skipped frame over successive refreshes and overloads the queue.
+        let spacing = stride.saturating_mul(step).max(1);
+        let phase = key.frame.rem_euclid(step);
+        let first = key.frame.saturating_add(lead.saturating_mul(dir).saturating_mul(step));
+        let offset = (first.rem_euclid(spacing) - phase).rem_euclid(spacing);
+        let first = if dir > 0 && offset != 0 {
+            first.saturating_add(spacing - offset)
+        } else if dir < 0 {
+            first.saturating_sub(offset)
+        } else {
+            first
+        };
+        // During preroll the clock has not started: only the frames that gate start,
+        // not a run that walks the rest of a LongGOP and evicts the playhead pictures.
+        let ahead = if preroll { (PREROLL_FRAMES - 1).max(0) } else { prefetch_depth(speed) };
+        let (target, rev, cur) = (key.target, key.revision, key.frame);
+        let span = i128::from(lead) * i128::from(step) + i128::from(ahead + 1) * i128::from(spacing) + 26;
+        let distance = |k: &FrameKey| (i128::from(k.frame) - i128::from(cur)) * i128::from(dir);
+        let ahead_of = |k: &FrameKey| distance(k) >= 0 && distance(k) < span;
+        let minimum = if lead > 1 { i128::from(lead) * i128::from(step) } else { 0 };
+        // Queued work must still have time to finish. Running work is left alone
+        // while ahead, including permitted older revisions (#1673): restarting it
+        // as values are dragged would prevent any picture from becoming ready.
+        // Trim before queuing new work so idle workers cannot take obsolete jobs.
+        self.retain_jobs(
+            |k| {
+                k.target != target
+                    || (k.size == key.size
+                        && k.draft == key.draft
+                        && k.revision == rev
+                        && ahead_of(k)
+                        && distance(k) >= minimum
+                        && k.frame.rem_euclid(spacing) == phase)
+            },
+            |k| {
+                k.target != target
+                    || (k.size == key.size
+                        && k.draft == key.draft
+                        && k.revision.saturating_add(PLAYING_REVISION_LAG) >= rev
+                        && k.revision <= rev
+                        && ahead_of(k))
+            },
+        );
         if lead <= 1 {
             // the frame due now; once the clock runs, the frames before it are late
             self.request_job(FrameRequest {
@@ -767,11 +859,8 @@ impl FrameServer {
                 catch_up: (!preroll && dir > 0).then_some(Tick::ZERO),
             });
         }
-        // During preroll the clock has not started: only the frames that gate start, not a
-        // prefetch run that walks the rest of a LongGOP and evicts the playhead pictures.
-        let ahead = if preroll { (PREROLL_FRAMES - 1).max(0) } else { prefetch_depth(speed) };
         for i in 0..ahead {
-            let f = key.frame + (lead + i * stride) * dir * step;
+            let f = first.saturating_add(i.saturating_mul(spacing).saturating_mul(dir));
             if f >= 0 {
                 // forward play: frames before the playhead are late (reverse play skips nothing)
                 let late = (!preroll && dir > 0).then(|| rate.tick_of(f) - rate.tick_of(key.frame));
@@ -786,16 +875,6 @@ impl FrameServer {
                 });
             }
         }
-        let (target, rev, cur) = (key.target, key.revision, key.frame);
-        let span = (lead + ahead * stride) * step + 26;
-        let ahead_of = |k: &FrameKey| (k.frame - cur) * dir >= 0 && (k.frame - cur).abs() < span;
-        // Queued jobs of an older revision are dropped, but one already rendering a frame still
-        // ahead is left to finish (#1673): a value dragged during playback asks for a new
-        // revision on every pass, and cancelling those jobs each time left nothing ever ready.
-        self.retain_jobs(
-            |k| k.target != target || (k.revision == rev && ahead_of(k)),
-            |k| k.target != target || (k.revision.saturating_add(PLAYING_REVISION_LAG) >= rev && k.revision <= rev && ahead_of(k)),
-        );
     }
 
     /// Whether playback can start at `key`: the next [`PREROLL_FRAMES`] frames (up to `last`)
@@ -807,7 +886,11 @@ impl FrameServer {
 
     /// The current per-frame render cost estimate (s), see [`playback_plan`].
     pub fn render_cost(&self) -> f64 {
-        *self.shared.render_cost.lock().unwrap_or_else(PoisonError::into_inner)
+        self.shared.render_cost.lock().unwrap_or_else(PoisonError::into_inner).seconds
+    }
+    /// End-to-end frame latency, including source acquisition, decoding and transport.
+    pub fn render_latency(&self) -> f64 {
+        self.shared.render_cost.lock().unwrap_or_else(PoisonError::into_inner).latency
     }
 
     /// Drop queued jobs that fail `keep` (e.g. stale revisions or frames far from the playhead).
@@ -1087,12 +1170,18 @@ fn run_job(
                             time: job.time,
                             scale: job.scale,
                             draft: job.key.draft,
+                            catch_up: job.catch_up,
+                            background: is_background(job),
                             gpu: !matches!(target, RemoteTarget::SequenceLive(_)),
                             preview_directory: previews.dir(),
                             preview_generation: previews.generation.load(Ordering::Relaxed),
                             source_generation: pool.generation(),
                         };
-                        return match backend.render(&job.project, pool, services, request, &job.cancel, &sh.stop) {
+                        let result = backend.render(&job.project, pool, services, request, &job.cancel, &sh.stop);
+                        // Thread-local source timers live in the renderer process. Include its
+                        // measurement even when a superseded reply is discarded below.
+                        SOURCE_TIME.with(|time| time.set((backend.source_time(), Duration::ZERO)));
+                        return match result {
                             Ok(frame) => {
                                 {
                                     let mut stats = sh.stats.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1157,11 +1246,10 @@ fn run_job(
         // Work beyond fetching source frames (decoding is sequential per source and is
         // not saved by skipping frames, so it is left out of the estimate). A cancelled job
         // only tells that the work takes at least this long.
-        let cost = started.elapsed().saturating_sub(SOURCE_TIME.with(|s| s.get()).0).as_secs_f64();
+        let elapsed = started.elapsed();
+        let cost = elapsed.saturating_sub(SOURCE_TIME.with(|s| s.get()).0).as_secs_f64();
         let mut c = sh.render_cost.lock().unwrap_or_else(PoisonError::into_inner);
-        if !cancelled || cost > *c {
-            *c = if *c == 0.0 { cost } else { *c * 0.8 + cost * 0.2 };
-        }
+        c.observe(job.key, cost, elapsed.as_secs_f64(), cancelled);
     }
     {
         let job_wall = started.elapsed();
@@ -1344,6 +1432,106 @@ mod tests {
         assert_eq!(rev, [(10, 5), (10, 4), (11, 5), (11, 4), (12, 5), (12, 4)]);
         // no revision before the first
         assert_eq!(recent_keys(FrameKey { revision: 0, ..key }, 1, 0, 64).count(), 1);
+    }
+
+    #[test]
+    fn lowering_resolution_restarts_prediction_and_rejects_stale_cost_samples() {
+        let half = FrameKey { target: Target::Sequence(ItemId(1)), frame: 100, size: 500, revision: 4, draft: false };
+        let small = FrameKey { size: 62, ..half };
+        let mut model = super::RenderCost::default();
+        model.select(half);
+        model.observe(half, 0.8, 0.9, false);
+        assert!(playback_plan(model.seconds, 60.0, 2).1 > 1);
+        model.select(small);
+        model.observe(half, 9.0, 9.1, true);
+        assert_eq!(playback_plan(model.seconds, 60.0, 2), (1, 1));
+        model.observe(FrameKey { frame: 101, ..small }, 0.002, 0.03, false);
+        assert_eq!(model.seconds, 0.002);
+        let changed_grade = FrameKey { revision: 5, ..small };
+        model.select(changed_grade);
+        model.observe(small, 2.0, 2.1, false);
+        assert_eq!(model.seconds, 0.0);
+        model.observe(changed_grade, 0.1, 0.12, false);
+        model.select(FrameKey { draft: true, ..changed_grade });
+        assert_eq!(model.seconds, 0.0);
+    }
+
+    #[test]
+    fn decoder_latency_adds_lead_without_dropping_output_frames() {
+        // Two workers can sustain a frame every 16.7 ms while each frame takes
+        // 30 ms end-to-end. Starting only one frame early misses every deadline.
+        assert_eq!(super::latency_plan(0.002, 0.030, 60.0, 2), (3, 1));
+        // A seek does not mean that its source decoding can be avoided by
+        // dropping most of the graded output frames.
+        assert_eq!(super::latency_plan(0.002, 0.180, 60.0, 2), (13, 1));
+        let (lead, stride) = super::latency_plan(0.5, 0.55, 24.0, 6);
+        assert!(lead >= 15);
+        assert_eq!(stride, 3);
+    }
+
+    #[test]
+    fn overload_keeps_a_stable_stride_and_drops_queued_work_that_will_be_late() {
+        use super::FrameServer;
+        use std::sync::atomic::Ordering;
+        for direction in [1, -1] {
+            let session = filmcraft_engine::Session::default();
+            let frames = FrameServer::new(session.media.clone(), session.services.clone(), session.previews.clone(), 2);
+            frames.shared.stop.store(true, Ordering::Relaxed);
+            frames.shared.cv.notify_all();
+            let key = FrameKey { target: Target::Sequence(ItemId(1)), frame: 200, size: 62, revision: 0, draft: false };
+            {
+                let mut model = frames.shared.render_cost.lock().unwrap();
+                model.select(key);
+                model.observe(key, 0.2, 0.22, false);
+            }
+            let rate = filmcraft_time::FrameRate::FPS_60;
+            let (lead, stride) = super::latency_plan(0.2, 0.22, 60.0, 2);
+            for advance in 0..60 {
+                let current = FrameKey { frame: key.frame + direction * advance, ..key };
+                frames.schedule_playback(current, rate, 0.0625, &session.project, direction as f64, false);
+                let queue = frames.shared.queue.lock().unwrap();
+                assert!(queue.len() <= super::prefetch_depth(1.0) as usize, "shifting the stride creates jobs for skipped frames");
+                for job in queue.iter() {
+                    assert_eq!(job.key.frame.rem_euclid(stride), 0, "every refresh must use the same stride phase");
+                    assert!((job.key.frame - current.frame) * direction >= lead, "do not start queued work too late to display");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolution_switch_removes_old_work_without_cancelling_another_view() {
+        use super::FrameServer;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let session = filmcraft_engine::Session::default();
+        let frames = FrameServer::new(session.media.clone(), session.services.clone(), session.previews.clone(), 1);
+        // Keep this scheduling test deterministic: no actual renderer consumes the queue.
+        frames.shared.stop.store(true, Ordering::Relaxed);
+        frames.shared.cv.notify_all();
+        let rate = filmcraft_time::FrameRate::FPS_24;
+        let old = FrameKey { target: Target::Sequence(ItemId(1)), frame: 100, size: 500, revision: 2, draft: false };
+        let small = FrameKey { size: 62, ..old };
+        let other = FrameKey { target: Target::Item(ItemId(2)), size: 160, ..old };
+        frames.request(old, rate.tick_of(old.frame), 0.5, &session.project, 1);
+        frames.request(other, rate.tick_of(other.frame), 0.1, &session.project, 1);
+        let stale = Arc::new(AtomicBool::new(false));
+        let unrelated = Arc::new(AtomicBool::new(false));
+        let prior_revision = Arc::new(AtomicBool::new(false));
+        frames.shared.in_flight.lock().unwrap().extend([
+            (FrameKey { frame: 101, ..old }, stale.clone(), true),
+            (other, unrelated.clone(), false),
+            (FrameKey { frame: 101, revision: 1, ..small }, prior_revision.clone(), true),
+        ]);
+        frames.schedule_playback(small, rate, 0.0625, &session.project, 1.0, false);
+        let queue = frames.shared.queue.lock().unwrap();
+        assert!(queue.iter().all(|job| job.key.target != old.target || job.key.size == small.size));
+        assert!(queue.iter().any(|job| job.key == other));
+        assert!(stale.load(Ordering::Relaxed));
+        assert!(!unrelated.load(Ordering::Relaxed));
+        assert!(!prior_revision.load(Ordering::Relaxed), "keep an in-flight frame at the permitted prior revision");
     }
 
     #[test]

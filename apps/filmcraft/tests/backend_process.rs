@@ -463,6 +463,8 @@ fn monitor_backend_is_persistent_and_updates_its_project_snapshot() {
         time: filmcraft_time::Tick::ZERO,
         scale: 1.0,
         draft: false,
+        catch_up: None,
+        background: false,
         gpu: false,
         preview_directory: None,
         preview_generation: 0,
@@ -520,6 +522,8 @@ fn superseded_frame_keeps_its_worker_and_source_cache_alive() {
         time: filmcraft_time::Tick::ZERO,
         scale: 1.0,
         draft: false,
+        catch_up: None,
+        background: false,
         gpu: false,
         preview_directory: None,
         preview_generation: 0,
@@ -555,4 +559,52 @@ fn superseded_frame_keeps_its_worker_and_source_cache_alive() {
     assert_eq!(next.worker_pid, first.worker_pid, "discarding a stale frame must preserve the decoder process");
     assert_eq!((next.width, next.height), (4, 4));
     assert!(next.rgba[2] > next.rgba[0] + 60, "source cache was poisoned by cancellation");
+}
+
+#[test]
+fn native_preview_reports_source_wait_separately_from_effect_cost() {
+    use filmcraft_ui_egui::frames::{FrameKey, FrameServer, Target};
+    let directory = Directory::new();
+    let mut bitmap = vec![0u8; 102];
+    bitmap[..2].copy_from_slice(b"BM");
+    bitmap[2..6].copy_from_slice(&102u32.to_le_bytes());
+    bitmap[10..14].copy_from_slice(&54u32.to_le_bytes());
+    bitmap[14..18].copy_from_slice(&40u32.to_le_bytes());
+    bitmap[18..22].copy_from_slice(&4i32.to_le_bytes());
+    bitmap[22..26].copy_from_slice(&4i32.to_le_bytes());
+    bitmap[26..28].copy_from_slice(&1u16.to_le_bytes());
+    bitmap[28..30].copy_from_slice(&24u16.to_le_bytes());
+    for pixel in bitmap[54..].as_chunks_mut::<3>().0 {
+        pixel.copy_from_slice(&[192, 64, 32]);
+    }
+    let host = Arc::new(Host {
+        path: directory.path("source-timing.bmp").to_string_lossy().into_owned(),
+        bytes: bitmap,
+        entered: AtomicBool::new(false),
+        reads: AtomicU64::new(0),
+        blocked: Mutex::new(false),
+        wake: Condvar::new(),
+    });
+    let _release = Release(host.clone());
+    let mut session = Session::new(host.clone());
+    let image = filmcraft_engine::commands::import_bytes(&mut session, &host.path, host.bytes.clone().into(), None).unwrap();
+    enable(&mut session);
+    *host.blocked.lock().unwrap() = true;
+    let frames = FrameServer::for_session(&session);
+    let key = FrameKey { target: Target::Item(image), frame: 0, size: 4, revision: session.revision, draft: false };
+    frames.request(key, filmcraft_time::Tick::ZERO, 1.0, &session.project, 0);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !host.entered.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "native preview never reached the source broker");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    host.release();
+    while !frames.is_ready(&key) || frames.stats().jobs == 0 {
+        assert!(Instant::now() < deadline, "native preview did not complete");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let stats = frames.stats();
+    assert!(stats.source_ms >= 80.0, "source wait was charged to effects rendering: {stats:?}");
+    assert!(stats.source_ms <= stats.job_ms, "source timing exceeds total work");
 }

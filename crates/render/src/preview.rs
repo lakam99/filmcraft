@@ -314,6 +314,17 @@ fn hash_item(h: &mut Fnv128, project: &Project, it: &TrackItem, origin: Tick, ki
         c.name.clear();
     }
     h.json(&c);
+    if kind == TrackKind::Video {
+        for effect in it.effects.iter().filter(|effect| effect.effect == "grading_group") {
+            if let Some(link) = &effect.color_group {
+                // Members store only the group identity and their calibration. The
+                // shared look lives on the project; omitting it reuses stale rendered
+                // pictures after a group edit. Names and solver metadata are not pixels.
+                let look = project.color_groups.get(&link.group).map(|group| (group.enabled, group.working, group.gamut, &group.look, group.look_strength));
+                h.json(&("shared_grade", link.group, look));
+            }
+        }
+    }
     hash_source(h, project, it.item, kind, depth);
 }
 

@@ -5,6 +5,7 @@ mod client;
 pub mod frames;
 mod protocol;
 mod services;
+mod source_timing;
 mod staging;
 mod worker;
 
@@ -71,11 +72,30 @@ enum Request {
 
 #[derive(Serialize, Deserialize)]
 enum Response {
-    Ready { pid: u32 },
-    Progress { done: u64, total: u64, status: String },
-    Io { id: u64, request: services::IoRequest },
-    Finished { result: std::result::Result<Completion, String> },
-    Frame { width: usize, height: usize, preview: bool, loading: bool, error: Option<String> },
+    Ready {
+        pid: u32,
+    },
+    Progress {
+        done: u64,
+        total: u64,
+        status: String,
+    },
+    Io {
+        id: u64,
+        request: services::IoRequest,
+    },
+    Finished {
+        result: std::result::Result<Completion, String>,
+    },
+    Frame {
+        width: usize,
+        height: usize,
+        preview: bool,
+        loading: bool,
+        #[serde(default)]
+        source_ns: u64,
+        error: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
