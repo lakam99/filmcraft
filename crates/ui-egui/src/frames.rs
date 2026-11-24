@@ -46,6 +46,9 @@ pub enum Target {
 /// decoders are small and are not kept (`filmcraft_media::cancel::with_background`).
 pub const BACKGROUND_PRIO: u32 = 40;
 
+/// One-shot AI captures keep their requested time while ordinary playback advances.
+pub(crate) const AI_CAPTURE_BIT: u32 = 0x8000_0000;
+
 /// Whether a job is a thumbnail: a single item at a background priority. Sequence frames are never
 /// background, whatever their priority (the scopes ask for the program frame at 40 while playing,
 /// and must not turn the program's decoders into small ones).
@@ -830,7 +833,8 @@ impl FrameServer {
         // Trim before queuing new work so idle workers cannot take obsolete jobs.
         self.retain_jobs(
             |k| {
-                k.target != target
+                k.size & AI_CAPTURE_BIT != 0
+                    || k.target != target
                     || (k.size == key.size
                         && k.draft == key.draft
                         && k.revision == rev
@@ -839,7 +843,8 @@ impl FrameServer {
                         && k.frame.rem_euclid(spacing) == phase)
             },
             |k| {
-                k.target != target
+                k.size & AI_CAPTURE_BIT != 0
+                    || k.target != target
                     || (k.size == key.size
                         && k.draft == key.draft
                         && k.revision.saturating_add(PLAYING_REVISION_LAG) >= rev
@@ -1532,6 +1537,28 @@ mod tests {
         assert!(stale.load(Ordering::Relaxed));
         assert!(!unrelated.load(Ordering::Relaxed));
         assert!(!prior_revision.load(Ordering::Relaxed), "keep an in-flight frame at the permitted prior revision");
+    }
+
+    #[test]
+    fn playback_preserves_pinned_capture_jobs_when_time_and_resolution_change() {
+        use super::{AI_CAPTURE_BIT, FrameServer};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        for target in [Target::Sequence(ItemId(1)), Target::Item(ItemId(2))] {
+            let session = filmcraft_engine::Session::default();
+            let frames = FrameServer::new(session.media.clone(), session.services.clone(), session.previews.clone(), 1);
+            frames.shared.stop.store(true, Ordering::Relaxed);
+            frames.shared.cv.notify_all();
+            let capture = FrameKey { target, frame: 100, size: AI_CAPTURE_BIT | 666, revision: 0, draft: false };
+            frames.request(capture, filmcraft_time::FrameRate::FPS_24.tick_of(capture.frame), 0.666, &session.project, 1);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            frames.shared.in_flight.lock().unwrap().push((FrameKey { frame: 99, ..capture }, cancelled.clone(), false));
+            frames.schedule_playback(FrameKey { frame: 110, size: 62, ..capture }, filmcraft_time::FrameRate::FPS_24, 0.0625, &session.project, 1.0, false);
+            assert!(frames.shared.queue.lock().unwrap().iter().any(|job| job.key == capture));
+            assert!(!cancelled.load(Ordering::Relaxed), "playback cleanup must not cancel a pinned capture behind its playhead");
+        }
     }
 
     #[test]

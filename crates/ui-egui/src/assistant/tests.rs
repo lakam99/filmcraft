@@ -282,6 +282,89 @@ fn rendered_program_and_source_frames_are_attached_without_seeking() {
 }
 
 #[test]
+fn large_source_frames_attach_automatically_and_through_the_capture_tool() {
+    use filmcraft_media::MediaSource;
+    use filmcraft_media::generators::GeneratorSource;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Hardware decoders may return a coarser decode size than the requested hint.
+    struct FullSizeSource(GeneratorSource);
+    impl MediaSource for FullSizeSource {
+        fn info(&self) -> &filmcraft_media::MediaInfo {
+            self.0.info()
+        }
+        fn video_frame(&self, request: filmcraft_media::FrameRequest) -> filmcraft_media::Result<Arc<filmcraft_frame::VideoFrame>> {
+            self.0.video_frame(filmcraft_media::FrameRequest { scale: 1.0, ..request })
+        }
+        fn audio(&self, start: i64, frames: usize, rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+            self.0.audio(start, frames, rate)
+        }
+    }
+    let check = |parts: &Value| {
+        let parts = parts.as_array().unwrap();
+        let metadata: Value = serde_json::from_str(parts[0]["text"].as_str().unwrap()).unwrap();
+        let (width, height) = (metadata["width"].as_u64().unwrap(), metadata["height"].as_u64().unwrap());
+        assert!(width > 0 && height > 0 && width <= 1280 && height <= 1280);
+        assert!(width * height <= 1_000_000);
+        assert!(parts[1]["image_url"].as_str().unwrap().starts_with("data:image/png;base64,iVBOR"));
+    };
+    for (width, height) in [(1920, 1080), (3840, 2160), (1080, 1920), (1600, 1600)] {
+        let mut app = FilmcraftApp::new(Session::default());
+        app.session.execute("file.newSequence", json!({"width":width,"height":height,"fps":24})).unwrap();
+        let generator = || {
+            GeneratorSource::new(
+                filmcraft_media::Generator::ColorMatte { color: [0.2, 0.4, 0.7, 1.0] },
+                width,
+                height,
+                filmcraft_time::FrameRate::FPS_24,
+                filmcraft_time::Tick::from_seconds_f64(5.0),
+            )
+        };
+        let source = filmcraft_engine::demo::add_generator(
+            Arc::make_mut(&mut app.session.project),
+            &app.session.media,
+            generator(),
+            "Full-size decode",
+            filmcraft_project::Label::Iris,
+            None,
+        );
+        app.session.media.insert(source, Arc::new(FullSizeSource(generator())));
+        app.session.execute("timeline.place", json!({"item":source.0,"track":"V1","seconds":0,"audio":false})).unwrap();
+        app.session.execute("source.open", json!({"item":source.0})).unwrap();
+        app.session.set_playhead(filmcraft_time::Tick::from_seconds_f64(0.5));
+        app.session.state.source_playhead = filmcraft_time::Tick::from_seconds_f64(1.25);
+        let (program_time, source_time) = (app.session.playhead(), app.session.state.source_playhead);
+        let mut pending = None;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let manual = loop {
+            if let Some(frame) = tools::frame(&app, "Source", &mut pending).unwrap() {
+                break frame;
+            }
+            assert!(Instant::now() < deadline, "source capture never completed");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        check(&manual);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        *app.assistant.panel.prompt_mut() = "Inspect both frames".into();
+        begin_with(&mut app, &egui::Context::default(), move |body| {
+            let parts = body["input"][0]["content"].as_array().unwrap();
+            assert_eq!(parts.iter().filter(|part| part["type"] == "input_image").count(), 2);
+            for pair in parts.windows(2).filter(|pair| pair[1]["type"] == "input_image") {
+                check(&Value::Array(pair.to_vec()));
+            }
+            seen.fetch_add(1, Ordering::Relaxed);
+            Ok(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Both frames are attached."}]}]}))
+        })
+        .unwrap();
+        turn(&mut app);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(app.assistant.panel.message(), "Ready");
+        assert_eq!((app.session.playhead(), app.session.state.source_playhead), (program_time, source_time));
+    }
+}
+
+#[test]
 fn chat_window_has_registered_controls_without_exposing_the_key() {
     use egui_kittest::Harness;
     let mut app = FilmcraftApp::new(Session::default());

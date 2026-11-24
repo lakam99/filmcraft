@@ -1,7 +1,7 @@
+use super::preview;
 use crate::frames::{FrameKey, Target};
 use crate::{ControlRequest, FilmcraftApp, control};
 use serde_json::{Value, json};
-use std::io::Cursor;
 pub(super) enum Tool {
     Editor(ControlRequest),
     Frame { monitor: String, snapshot: Option<Snapshot> },
@@ -62,6 +62,8 @@ pub(super) struct Snapshot {
     key: FrameKey,
     time: filmcraft_time::Tick,
     scale: f32,
+    #[cfg(not(target_arch = "wasm32"))]
+    encoding: Option<preview::Pending>,
 }
 
 pub(crate) struct Pending {
@@ -87,7 +89,13 @@ pub(super) fn start(call: &craft_ai_chat_egui::ToolCall) -> Result<Pending, Stri
 }
 pub(super) fn poll(app: &mut FilmcraftApp, ctx: &egui::Context, pending: &mut Pending) -> Result<Option<Value>, String> {
     let response = match &mut pending.tool {
-        Tool::Frame { monitor, snapshot } => return frame(app, monitor, snapshot),
+        Tool::Frame { monitor, snapshot } => {
+            let result = frame(app, monitor, snapshot);
+            if matches!(&result, Ok(None)) {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+            return result;
+        }
         Tool::Job(wait) => return wait.poll(app),
         Tool::Editor(req) => match pending.control_reply.try_recv() {
             Ok(value) => Some(value),
@@ -143,9 +151,11 @@ fn snapshot(app: &FilmcraftApp, monitor: &str) -> Result<Snapshot, String> {
         _ => app.session.revision,
     };
     Ok(Snapshot {
-        key: FrameKey { target, frame: rate.frame_at(time), size: 0x8000_0000 | (scale * 1000.0) as u32, revision, draft: false },
+        key: FrameKey { target, frame: rate.frame_at(time), size: crate::frames::AI_CAPTURE_BIT | (scale * 1000.0) as u32, revision, draft: false },
         time: rate.tick_of(rate.frame_at(time)),
         scale,
+        #[cfg(not(target_arch = "wasm32"))]
+        encoding: None,
     })
 }
 
@@ -154,7 +164,7 @@ pub(super) fn frame(app: &FilmcraftApp, monitor: &str, pending: &mut Option<Snap
     if pending.is_none() {
         *pending = Some(snapshot(app, monitor)?);
     }
-    let Some(snapshot) = pending.as_ref() else {
+    let Some(snapshot) = pending.as_mut() else {
         return Err("Cannot prepare the video frame".into());
     };
     let revision = match snapshot.key.target {
@@ -164,34 +174,30 @@ pub(super) fn frame(app: &FilmcraftApp, monitor: &str, pending: &mut Option<Snap
     if snapshot.key.revision != revision {
         return Err("The video changed while its frame was rendering. Request another frame.".into());
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(encoding) = &snapshot.encoding {
+        return encoding.poll().map(|encoded| encoded.map(|encoded| frame_content(snapshot, monitor, encoded)));
+    }
     let Some(rgba) = app.frames.get(&snapshot.key) else {
         app.frames.request(snapshot.key, snapshot.time, snapshot.scale, &app.session.project, 1);
         return Ok(None);
     };
-    if rgba.w == 0 || rgba.h == 0 || rgba.w > 1280 || rgba.h > 1280 {
-        return Err("The preview exceeds the AI image size limit".into());
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        snapshot.encoding = preview::Pending::start(rgba)?;
+        Ok(None)
     }
-    if rgba.px.len() != rgba.w.saturating_mul(rgba.h).saturating_mul(4) {
-        return Err("Invalid preview pixel buffer".into());
+    #[cfg(target_arch = "wasm32")]
+    {
+        Ok(Some(frame_content(snapshot, monitor, preview::encode(&rgba)?)))
     }
-    let mut pixels = rgba.px.clone();
-    // FrameServer stores colour over black; opaque PNGs must preserve that appearance.
-    for [_, _, _, alpha] in pixels.as_chunks_mut::<4>().0 {
-        *alpha = 255;
-    }
-    let Some(image) = image::RgbaImage::from_raw(rgba.w as u32, rgba.h as u32, pixels) else {
-        return Err("Invalid preview pixel buffer".into());
-    };
-    let mut png = Cursor::new(Vec::new());
-    image.write_to(&mut png, image::ImageFormat::Png).map_err(|_| "Cannot encode the preview frame")?;
-    let png = png.into_inner();
-    if png.len() > 4 * 1024 * 1024 {
-        return Err("Preview PNG exceeds the AI image size limit".into());
-    }
-    Ok(Some(json!([
-        {"type":"input_text","text":json!({"monitor":monitor,"ticks":snapshot.time.0,"frame":snapshot.key.frame,"width":rgba.w,"height":rgba.h}).to_string()},
-        {"type":"input_image","image_url":format!("data:image/png;base64,{}", crate::control::base64(&png)),"detail":"auto"}
-    ])))
+}
+
+fn frame_content(snapshot: &Snapshot, monitor: &str, encoded: preview::Encoded) -> Value {
+    json!([
+        {"type":"input_text","text":json!({"monitor":monitor,"ticks":snapshot.time.0,"frame":snapshot.key.frame,"width":encoded.width,"height":encoded.height}).to_string()},
+        {"type":"input_image","image_url":encoded.url,"detail":"auto"}
+    ])
 }
 
 #[cfg(test)]
