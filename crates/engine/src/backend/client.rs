@@ -63,8 +63,9 @@ impl Client {
         }
         command.arg(argument).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         // Leave CPU capacity for input, audio and presentation, including rayon codec pools.
-        let threads = std::thread::available_parallelism().map(|n| n.get().saturating_sub(2).clamp(1, 8)).unwrap_or(2);
-        command.env("RAYON_NUM_THREADS", if argument == super::FRAME_WORKER_ARGUMENT { 2 } else { threads }.to_string());
+        let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+        let threads = if argument == super::FRAME_WORKER_ARGUMENT { frame_threads(logical) } else { logical.saturating_sub(2).clamp(1, 8) };
+        command.env("RAYON_NUM_THREADS", threads.to_string());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -194,14 +195,14 @@ impl Client {
             }
             match self.replies.recv_timeout(Duration::from_millis(10)) {
                 Ok(Ok((Response::Ready { pid }, _))) if pid == self.child.id() => {}
-                Ok(Ok((Response::Frame { width, height, preview, loading, error }, data))) => {
+                Ok(Ok((Response::Frame { width, height, preview, loading, source_ns, error }, data))) => {
                     if let Some(error) = error {
                         return Err(error);
                     }
                     if width == 0 || height == 0 || width.checked_mul(height).and_then(|n| n.checked_mul(4)) != Some(data.len()) {
                         return Err("invalid backend frame size".into());
                     }
-                    return Ok(frames::Frame { worker_pid: self.child.id(), width, height, rgba: data, preview, loading });
+                    return Ok(frames::Frame { worker_pid: self.child.id(), width, height, rgba: data, preview, loading, source_ns });
                 }
                 Ok(Ok(_)) => return Err("unexpected preview backend response".into()),
                 Ok(Err(error)) => return Err(error),
@@ -223,9 +224,29 @@ impl Drop for Client {
     }
 }
 
+fn frame_threads(logical: usize) -> usize {
+    // Two threads per process left most cores idle during CPU grading. Share
+    // the available budget across renderers, reserve two logical CPUs, and cap
+    // each pool so large machines do not create excessive parallel work.
+    (logical.saturating_sub(2) / super::frames::WORKER_COUNT).clamp(1, 6)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_renderers_share_the_cpu_budget_and_leave_frontend_capacity() {
+        assert_eq!(frame_threads(0), 1);
+        assert_eq!(frame_threads(2), 1);
+        assert_eq!(frame_threads(4), 1);
+        assert_eq!(frame_threads(8), 3);
+        assert_eq!(frame_threads(16), 6);
+        assert_eq!(frame_threads(256), 6);
+        for logical in 4..256 {
+            assert!(frame_threads(logical) * super::super::frames::WORKER_COUNT <= logical - 2);
+        }
+    }
 
     #[test]
     fn abandoned_io_keeps_its_slot_until_it_really_exits() {

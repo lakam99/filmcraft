@@ -1127,3 +1127,40 @@ Test: `crates/ui-egui/tests/it/scrub_stop_ui.rs` — a press that only moves the
 stream, and a press while playing still stops the transport. `apps/filmcraft` (`audio::tests`) —
 the device default rate needs no configuration search.
 
+## Native playback scheduling
+
+Native monitor renderers report source acquisition and decoding separately from
+effects and composition. `perf.stats.frames.decodeMs` includes the renderer's
+source work. `renderCostMs` estimates the remaining work, while
+`latencyEstimateMs` includes the complete frame request and transport.
+
+Playback uses total latency to start frames early enough, and effects throughput
+to decide whether output frames must be skipped. A slow source seek should not
+be interpreted as expensive grading, nor should decoding be omitted from the
+display deadline. Decoder catch-up, draft and background hints travel with the
+request to the rendering process.
+
+Under load, skipped output frames stay on a stable timeline grid across display
+refreshes. Queued jobs that cannot finish before their deadline are removed
+before workers can start them; a running frame still ahead of the playhead is
+allowed to finish.
+
+Rendered preview hashes include the shared look of each clip's grading group,
+including nested sequences. Changing that look invalidates affected picture
+previews; names, analysis metadata, unrelated groups and audio previews keep
+their existing cache entries.
+
+Changing resolution, decoding quality, sequence or project revision resets the
+matching prediction. Queued frames of an obsolete resolution are removed and
+their running results are discarded after draining, preserving decoder caches.
+An old expensive frame cannot train the prediction for the new resolution.
+
+The two interactive render processes share the available logical CPU budget,
+reserving two logical CPUs where possible and limiting each Rayon pool to six
+threads. This avoids a fixed two-thread limit leaving most cores idle during CPU grading while
+retaining capacity for editor input and audio.
+
+These changes preserve the rendering algorithms and effect settings. Effects
+whose processing exceeds real-time capacity still benefit from **Render Effects
+In to Out** and the existing preview-file playback path.
+

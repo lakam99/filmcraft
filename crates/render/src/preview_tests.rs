@@ -139,6 +139,72 @@ fn editing_one_clip_invalidates_only_its_segments() {
 }
 
 #[test]
+fn shared_grading_edits_invalidate_member_and_nested_previews_only() {
+    use filmcraft_color::{Gamut, WorkingSpace};
+    use filmcraft_project::{ColorGradeGroup, GradeGroupLink, GradeReference};
+    use std::sync::Arc;
+
+    let (mut p, matte, ocean, seq) = setup();
+    let member = place(&mut p, seq, 0, ocean, 0, 48);
+    place(&mut p, seq, 0, matte, 48, 48);
+    place_kind(&mut p, seq, TrackKind::Audio, ocean, 0, 96);
+    let group_id = p.next_id;
+    p.next_id += 1;
+    p.color_groups.insert(
+        group_id,
+        Arc::new(ColorGradeGroup {
+            name: "Shared look".into(),
+            enabled: true,
+            working: WorkingSpace::Rec709,
+            gamut: Gamut::Bt709,
+            protect_skin: true,
+            reference: GradeReference { log_rgb: [0.0; 3], bands: [[0.0; 4]; 3], chroma: 0.0, skin: [0.0; 3] },
+            look: find_effect("lumetri").unwrap().instance(),
+            look_strength: 1.0,
+            vibe: None,
+        }),
+    );
+    add_fx(&mut p, seq, member, "grading_group");
+    p.sequence_mut(seq).unwrap().find_item_mut(member).unwrap().1.effect_mut("grading_group").unwrap().color_group =
+        Some(Box::new(GradeGroupLink { group: group_id, gain_rgb: [1.0; 3], balance: Default::default(), distance_before: 0.0, distance_after: 0.0 }));
+    let settings = p.sequence(seq).unwrap().settings.clone();
+    let outer = p.new_sequence("Nested picture", settings, 1, 1, None);
+    place(&mut p, outer, 0, seq, 0, 96);
+    let before = video_segments(&p, seq);
+    let nested = video_segments(&p, outer);
+    let audio = audio_hashes(&p, seq);
+
+    // Shared state is resolved from the project, not embedded in each member.
+    for mutation in 0..5 {
+        let mut edited = p.clone();
+        let group = Arc::make_mut(edited.color_groups.get_mut(&group_id).unwrap());
+        match mutation {
+            0 => group.look.params.get_mut("exposure").unwrap().value = ParamValue::Float(1.0),
+            1 => group.look_strength = 0.5,
+            2 => group.enabled = false,
+            3 => group.gamut = Gamut::Bt2020,
+            _ => {
+                group.gamut = Gamut::Bt2020;
+                group.working = WorkingSpace::Rec2100Pq;
+            }
+        }
+        group.check().unwrap();
+        let after = video_segments(&edited, seq);
+        assert_ne!(by_frame(&before, 10), by_frame(&after, 10), "shared grading mutation {mutation}");
+        assert_eq!(by_frame(&before, 60), by_frame(&after, 60), "unrelated clip keeps its preview");
+        assert_ne!(by_frame(&nested, 10), by_frame(&video_segments(&edited, outer), 10), "nested member also changes");
+        assert_eq!(audio_hashes(&edited, seq), audio, "picture grading does not change sound");
+    }
+    let group = Arc::make_mut(p.color_groups.get_mut(&group_id).unwrap());
+    group.name = "Renamed group".into();
+    group.reference.chroma = 0.25;
+    let unused_id = p.next_id;
+    p.next_id += 1;
+    p.color_groups.insert(unused_id, p.color_groups.get(&group_id).unwrap().clone());
+    assert_eq!(video_segments(&p, seq), before, "names, analysis metadata and unused groups do not change pixels");
+}
+
+#[test]
 fn renaming_relabelling_and_moving_keep_hashes() {
     let (mut p, matte, ocean, seq) = setup();
     let a = place(&mut p, seq, 0, ocean, 0, 48);
